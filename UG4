@@ -1,0 +1,909 @@
+-- Blackhole script — updated per your requirements
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+
+local localPlayer = Players.LocalPlayer
+
+-- state
+local blackHoleActive = false
+local toggleState = false
+local targetPlayer = nil
+local switchDelay = 0.13
+
+-- processedParts: maps part -> attachmentIndex (number)
+local processedParts = {}
+local initiallyAnchoredParts = {}
+local anchoredOnce = false
+local unanchorTimerRunning = false
+local unanchorCoroutine
+
+local noclipConnection
+
+-- single attachment fallback
+local Attachment1 = nil
+
+-- attachments management
+local attachmentsFolder = nil
+local attachments = {} -- { {Part=part, Attachment=attach, mode="free"|"player", targetPlayer=player}, ... }
+local attachmentsMode = "single" -- "single", "multi", "paa"
+local commandConnection = nil
+local playerAttachIndex = {} -- player.UserId -> index (for PAA)
+
+-- scanner control
+local selectiveScannerRunning = false
+local selectiveScanInterval = 0.25
+
+-- tuning
+local anchorHoldDuration = 1 -- seconds (changed per request)
+local knockOffDistance = 100 -- studs threshold
+
+-- Setup initial Attachment similar to before
+local function setupPlayer()
+    local Folder = Instance.new("Folder", Workspace)
+    local Part = Instance.new("Part", Folder)
+    Part.Anchored = true
+    Part.CanCollide = false
+    Part.Transparency = 1
+    local Attachment = Instance.new("Attachment", Part)
+    return Attachment, Folder
+end
+
+Attachment1, attachmentsFolder = setupPlayer()
+
+-- utility
+local function clearAttachmentsFolder()
+    if attachmentsFolder and attachmentsFolder.Parent then
+        attachmentsFolder:Destroy()
+    end
+    attachmentsFolder = nil
+    attachments = {}
+    playerAttachIndex = {}
+end
+
+local function isNPC(character)
+    if not character or not character:IsA("Model") then return false end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid and not Players:GetPlayerFromCharacter(character) then
+        return true
+    end
+    return false
+end
+
+local function setCharacterCollision(character, canCollide)
+    if not character then return end
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = canCollide
+        end
+    end
+end
+
+local function enableLocalPlayerNoclip(enable)
+    if enable then
+        if noclipConnection then
+            noclipConnection:Disconnect()
+            noclipConnection = nil
+        end
+        noclipConnection = RunService.Stepped:Connect(function()
+            local character = localPlayer.Character
+            if character and character:FindFirstChild("HumanoidRootPart") then
+                for _, part in ipairs(character:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        if part.Name == "HumanoidRootPart" then
+                            part.CanCollide = false
+                        else
+                            part.CanCollide = true
+                        end
+                    end
+                end
+            end
+        end)
+    else
+        if noclipConnection then
+            noclipConnection:Disconnect()
+            noclipConnection = nil
+        end
+        local character = localPlayer.Character
+        if character then
+            setCharacterCollision(character, true)
+        end
+    end
+end
+
+-- Helper: count processed parts assigned to a specific attachment index
+local function getAttachmentLoad(index)
+    local c = 0
+    for _, v in pairs(processedParts) do
+        if v == index then c = c + 1 end
+    end
+    return c
+end
+
+-- Helper: choose the least-loaded attachment index (optionally restrict to mode == "player")
+local function getLeastLoadedAttachmentIndex(restrictPlayerMode)
+    if #attachments == 0 then
+        return 1
+    end
+    local bestI, bestLoad = 1, math.huge
+    for i, a in ipairs(attachments) do
+        if a and a.Attachment then
+            if restrictPlayerMode then
+                if a.mode ~= "player" then
+                    -- skip
+                else
+                    local load = getAttachmentLoad(i)
+                    if load < bestLoad then
+                        bestLoad = load
+                        bestI = i
+                    end
+                end
+            else
+                local load = getAttachmentLoad(i)
+                if load < bestLoad then
+                    bestLoad = load
+                    bestI = i
+                end
+            end
+        end
+    end
+    return bestI
+end
+
+-- Modified ForcePart: assign AlignPosition.Attachment1 depending on attachments mode and least load
+local function ForcePart(v)
+    if not v or not v:IsA("BasePart") then return end
+    if processedParts[v] then return end
+    if v.Anchored then return end
+    if v.Name == "Handle" then return end
+    if v:IsDescendantOf(localPlayer.Character) then return end
+
+    if not (
+        (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+        or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+    ) then
+        return
+    end
+
+    -- choose assignment strategy
+    local assignIndex = 1
+    if attachmentsMode == "paa" then
+        -- attachments are per-player; choose the least-loaded attachment among those with mode == "player"
+        assignIndex = getLeastLoadedAttachmentIndex(true)
+    elseif #attachments > 0 then
+        -- pick least-loaded attachment overall (keeps load balanced)
+        assignIndex = getLeastLoadedAttachmentIndex(false)
+    end
+
+    -- fallback if chosen attachment missing
+    if not attachments[assignIndex] or not attachments[assignIndex].Attachment then
+        if Attachment1 then
+            processedParts[v] = 1
+        else
+            -- ensure fallback is present
+            local char = localPlayer.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                if Attachment1 then Attachment1:Destroy() end
+                Attachment1 = Instance.new("Attachment", char.HumanoidRootPart)
+            end
+            processedParts[v] = 1
+        end
+    else
+        processedParts[v] = assignIndex
+    end
+
+    -- cleanup existing physics instances
+    for _, x in next, v:GetChildren() do
+        if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+            or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+            or x:IsA("RocketPropulsion") then
+            x:Destroy()
+        end
+    end
+    if v:FindFirstChild("Attachment") then v:FindFirstChild("Attachment"):Destroy() end
+    if v:FindFirstChild("AlignPosition") then v:FindFirstChild("AlignPosition"):Destroy() end
+    if v:FindFirstChild("Torque") then v:FindFirstChild("Torque"):Destroy() end
+
+    v.CanCollide = false
+
+    local Torque = Instance.new("Torque", v)
+    Torque.Torque = Vector3.new(1e6, 1e6, 1e6)
+    local AlignPosition = Instance.new("AlignPosition", v)
+    local Attachment2 = Instance.new("Attachment", v)
+    Torque.Attachment0 = Attachment2
+    AlignPosition.MaxForce = math.huge
+    AlignPosition.MaxVelocity = math.huge
+    AlignPosition.Responsiveness = 500
+    AlignPosition.Attachment0 = Attachment2
+
+    if attachments[processedParts[v]] and attachments[processedParts[v]].Attachment then
+        AlignPosition.Attachment1 = attachments[processedParts[v]].Attachment
+    else
+        AlignPosition.Attachment1 = Attachment1
+        processedParts[v] = 1
+    end
+end
+
+local function clearProcessedParts()
+    for part, _ in pairs(processedParts) do
+        if part and part.Parent then
+            for _, x in next, part:GetChildren() do
+                if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+                    or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+                    or x:IsA("RocketPropulsion") then
+                    x:Destroy()
+                end
+            end
+            if part:FindFirstChild("Attachment") then part:FindFirstChild("Attachment"):Destroy() end
+            if part:FindFirstChild("AlignPosition") then part:FindFirstChild("AlignPosition"):Destroy() end
+            if part:FindFirstChild("Torque") then part:FindFirstChild("Torque"):Destroy() end
+            part.CanCollide = true
+            if not initiallyAnchoredParts[part] then
+                part.Anchored = false
+            else
+                part.Anchored = true
+            end
+        end
+    end
+    processedParts = {}
+    initiallyAnchoredParts = {}
+    anchoredOnce = false
+end
+
+local function disableCollisionsForCharacterButNotWorldCollision(character)
+    if not character then return end
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = true
+        end
+    end
+end
+
+-- anchor + short hold then unanchor + ForcePart
+local function anchorAndDelayedUnanchorParts()
+    if unanchorTimerRunning then return end
+    unanchorTimerRunning = true
+
+    local candidateParts = {}
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart")
+            and not v.Anchored
+            and v.Name ~= "Handle"
+            and not v:IsDescendantOf(localPlayer.Character)
+            and (
+                (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+                or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+            ) then
+            table.insert(candidateParts, v)
+        end
+    end
+
+    initiallyAnchoredParts = {}
+    for _, part in ipairs(candidateParts) do
+        initiallyAnchoredParts[part] = false
+        part.Anchored = true
+        part.CanCollide = false
+    end
+
+    -- collisions for NPCs
+    for _, npcCandidate in ipairs(Workspace:GetChildren()) do
+        if isNPC(npcCandidate) then
+            disableCollisionsForCharacterButNotWorldCollision(npcCandidate)
+        end
+    end
+
+    local character = localPlayer.Character
+    if character then
+        setCharacterCollision(character, true)
+    end
+
+    enableLocalPlayerNoclip(true)
+
+    local startTime = tick()
+    while blackHoleActive and tick() - startTime < anchorHoldDuration do
+        wait(0.05)
+    end
+
+    for _, part in ipairs(candidateParts) do
+        if part and part.Parent and initiallyAnchoredParts[part] == false then
+            part.Anchored = false
+            ForcePart(part)
+        end
+    end
+
+    -- after initial unanchor, keep scanner running to pick more parts (selective scanner handles it)
+    unanchorTimerRunning = false
+    anchoredOnce = true
+end
+
+local descendantAddedConn
+
+local function processWorkspaceParts()
+    if descendantAddedConn then
+        descendantAddedConn:Disconnect()
+        descendantAddedConn = nil
+    end
+
+    if blackHoleActive then
+        if not unanchorTimerRunning and not anchoredOnce then
+            unanchorCoroutine = coroutine.create(anchorAndDelayedUnanchorParts)
+            coroutine.resume(unanchorCoroutine)
+        end
+
+        descendantAddedConn = Workspace.DescendantAdded:Connect(function(v)
+            if blackHoleActive then
+                if v:IsA("BasePart") and not v.Anchored and not processedParts[v] then
+                    -- small delay so newly-created parts have a chance to be fully parented/positioned
+                    -- but don't wait too long — we still force them quickly to player attachments
+                    spawn(function()
+                        wait(0.02)
+                        if blackHoleActive and v and v.Parent and not processedParts[v] then
+                            ForcePart(v)
+                        end
+                    end)
+                end
+            end
+        end)
+    end
+end
+
+local function getRandomPlayer()
+    local players = Players:GetPlayers()
+    local validPlayers = {}
+    for _, player in pairs(players) do
+        if player ~= localPlayer and (not player:FindFirstChild("Whitelisted") or not player.Whitelisted.Value) then
+            table.insert(validPlayers, player)
+        end
+    end
+    if #validPlayers > 0 then
+        return validPlayers[math.random(1, #validPlayers)]
+    end
+    return nil
+end
+
+local function getSelectedPlayers()
+    local players = Players:GetPlayers()
+    local selectedPlayers = {}
+    for _, player in pairs(players) do
+        if player ~= localPlayer and player:FindFirstChild("Selected") and player.Selected.Value then
+            table.insert(selectedPlayers, player)
+        end
+    end
+    return selectedPlayers
+end
+
+-- attachments helpers
+local function rebalanceProcessedParts()
+    if #attachments <= 1 then return end
+    -- gather processed parts
+    local list = {}
+    for part, _ in pairs(processedParts) do
+        if part and part.Parent then table.insert(list, part) end
+    end
+    -- distribute evenly across attachments
+    local idx = 1
+    for _, p in ipairs(list) do
+        if p and p.Parent and p:FindFirstChild("AlignPosition") then
+            local align = p:FindFirstChild("AlignPosition")
+            if attachments[idx] and attachments[idx].Attachment then
+                align.Attachment1 = attachments[idx].Attachment
+                processedParts[p] = idx
+            end
+            idx = idx + 1
+            if idx > #attachments then idx = 1 end
+        end
+    end
+end
+
+local function createAttachments(count)
+    clearAttachmentsFolder()
+    attachmentsFolder = Instance.new("Folder", Workspace)
+    attachmentsFolder.Name = "ÆS_Attachments_" .. tostring(tick())
+
+    attachments = {}
+    count = math.max(1, math.floor(count or 1))
+
+    if count == 1 then
+        local char = localPlayer.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            local newAttachment = Instance.new("Attachment", char.HumanoidRootPart)
+            if Attachment1 then Attachment1:Destroy() end
+            Attachment1 = newAttachment
+            attachmentsMode = "single"
+            attachments[1] = { Part = nil, Attachment = Attachment1, mode = "single", targetPlayer = nil }
+            return
+        end
+    end
+
+    for i = 1, count do
+        local part = Instance.new("Part", attachmentsFolder)
+        part.Anchored = true
+        part.CanCollide = false
+        part.Transparency = 1
+        part.Size = Vector3.new(1,1,1)
+        part.Name = "AttachmentPart_" .. i
+        local pos = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character.HumanoidRootPart.Position or Vector3.new(0,10,0)
+        part.CFrame = CFrame.new(pos + Vector3.new(0, i * 2, 0))
+        local attach = Instance.new("Attachment", part)
+        attachments[i] = { Part = part, Attachment = attach, mode = "free", targetPlayer = nil }
+    end
+
+    if Attachment1 and Attachment1.Parent and Attachment1.Parent:IsDescendantOf(Workspace) then
+        -- keep
+    else
+        local char = localPlayer.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            if Attachment1 then Attachment1:Destroy() end
+            Attachment1 = Instance.new("Attachment", char.HumanoidRootPart)
+        end
+    end
+
+    attachmentsMode = "multi"
+
+    -- rebalance existing processed parts to these attachments
+    spawn(function()
+        wait(0.05)
+        rebalanceProcessedParts()
+    end)
+end
+
+local function deleteExtraAttachments()
+    clearAttachmentsFolder()
+    local char = localPlayer.Character
+    if char and char:FindFirstChild("HumanoidRootPart") then
+        if Attachment1 then Attachment1:Destroy() end
+        Attachment1 = Instance.new("Attachment", char.HumanoidRootPart)
+    end
+    attachmentsMode = "single"
+    clearProcessedParts()
+end
+
+local function assignExistingCandidatePartsToAttachments()
+    if #attachments <= 1 then return end
+    local candidates = {}
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart")
+            and not v.Anchored
+            and v.Name ~= "Handle"
+            and not v:IsDescendantOf(localPlayer.Character)
+            and (
+                (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+                or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+            ) then
+            table.insert(candidates, v)
+        end
+    end
+
+    for _, p in ipairs(candidates) do
+        if not processedParts[p] then
+            -- assign to least-loaded to keep balance
+            local idx = getLeastLoadedAttachmentIndex(false)
+            processedParts[p] = idx
+            ForcePart(p)
+        end
+    end
+end
+
+local function monitorCollectedParts()
+    spawn(function()
+        while blackHoleActive do
+            for part, attachIndex in pairs(processedParts) do
+                if not part or not part.Parent then
+                    processedParts[part] = nil
+                else
+                    if not attachments[attachIndex] or not attachments[attachIndex].Attachment then
+                        processedParts[part] = nil
+                    else
+                        local attachmentPos = attachments[attachIndex] and attachments[attachIndex].Part and attachments[attachIndex].Part.Position or (Attachment1 and Attachment1.WorldPosition)
+                        if attachmentPos then
+                            local distance = (part.Position - attachmentPos).Magnitude
+                            if distance > knockOffDistance then
+                                for _, x in next, part:GetChildren() do
+                                    if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+                                        or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+                                        or x:IsA("RocketPropulsion") then
+                                        x:Destroy()
+                                    end
+                                end
+                                if part:FindFirstChild("Attachment") then part:FindFirstChild("Attachment"):Destroy() end
+                                if part:FindFirstChild("AlignPosition") then part:FindFirstChild("AlignPosition"):Destroy() end
+                                if part:FindFirstChild("Torque") then part:FindFirstChild("Torque"):Destroy() end
+                                part.CanCollide = true
+                                processedParts[part] = nil
+                            end
+                        end
+                    end
+                end
+            end
+            wait(0.5)
+        end
+    end)
+end
+
+-- PAA helpers
+local function enablePAA()
+    -- create one attachment per other player
+    local players = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= localPlayer then table.insert(players, p) end
+    end
+    local count = math.max(1, #players)
+    createAttachments(count)
+    attachmentsMode = "paa"
+
+    for i, p in ipairs(players) do
+        if attachments[i] then
+            attachments[i].mode = "player"
+            attachments[i].targetPlayer = p
+            playerAttachIndex[p.UserId] = i
+        end
+    end
+
+    -- if players change, onPlayerAddedForPAA/onPlayerRemovingForPAA handle it
+end
+
+local function onPlayerAddedForPAA(player)
+    if attachmentsMode ~= "paa" then return end
+    -- add new attachment for new player
+    local idx = #attachments + 1
+    local part = Instance.new("Part", attachmentsFolder)
+    part.Anchored = true
+    part.CanCollide = false
+    part.Transparency = 1
+    part.Size = Vector3.new(1,1,1)
+    part.Name = "AttachmentPart_PAA_" .. idx
+    local pos = player.Character and player.Character:FindFirstChild("HumanoidRootPart") and player.Character.HumanoidRootPart.Position or Vector3.new(0,10,0)
+    part.CFrame = CFrame.new(pos)
+    local attach = Instance.new("Attachment", part)
+    attachments[idx] = { Part = part, Attachment = attach, mode = "player", targetPlayer = player }
+    playerAttachIndex[player.UserId] = idx
+
+    -- rebalance processed parts
+    spawn(function()
+        wait(0.05)
+        rebalanceProcessedParts()
+    end)
+end
+
+local function onPlayerRemovingForPAA(player)
+    if attachmentsMode ~= "paa" then return end
+    local idx = playerAttachIndex[player.UserId]
+    if idx and attachments[idx] then
+        if attachments[idx].Part and attachments[idx].Part.Parent then
+            attachments[idx].Part:Destroy()
+        end
+        attachments[idx] = nil
+        playerAttachIndex[player.UserId] = nil
+
+        -- compact and re-map attachments
+        local newList = {}
+        for _, v in ipairs(attachments) do
+            if v then table.insert(newList, v) end
+        end
+        attachments = newList
+        playerAttachIndex = {}
+        for i, v in ipairs(attachments) do
+            if v.mode == "player" and v.targetPlayer then
+                playerAttachIndex[v.targetPlayer.UserId] = i
+            end
+        end
+
+        spawn(function()
+            wait(0.05)
+            rebalanceProcessedParts()
+        end)
+    end
+end
+
+-- update attachments positions
+local function updateAttachmentsPositions()
+    if attachmentsMode == "single" then
+        return
+    elseif attachmentsMode == "multi" then
+        local players = Players:GetPlayers()
+        local validPlayers = {}
+        for _, p in ipairs(players) do
+            if p ~= localPlayer and (not p:FindFirstChild("Whitelisted") or not p.Whitelisted.Value) then
+                table.insert(validPlayers, p)
+            end
+        end
+
+        if #validPlayers >= #attachments then
+            for i = 1, #attachments do
+                local p = validPlayers[((i - 1) % #validPlayers) + 1]
+                if p and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                    attachments[i].Part.CFrame = CFrame.new(p.Character.HumanoidRootPart.Position)
+                end
+            end
+        else
+            local basePos = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character.HumanoidRootPart.Position or Vector3.new(0,10,0)
+            for i = 1, #attachments do
+                local off = Vector3.new( (i * 3) % 7, 0, math.floor(i/2) )
+                attachments[i].Part.CFrame = CFrame.new(basePos + off)
+            end
+        end
+    elseif attachmentsMode == "paa" then
+        for i, a in ipairs(attachments) do
+            if a and a.mode == "player" and a.targetPlayer and a.targetPlayer.Character and a.targetPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                a.Part.CFrame = CFrame.new(a.targetPlayer.Character.HumanoidRootPart.Position)
+            end
+        end
+    end
+end
+
+-- selective scanner
+local function startSelectiveScanner()
+    if selectiveScannerRunning then return end
+    selectiveScannerRunning = true
+    spawn(function()
+        while blackHoleActive and selectiveScannerRunning do
+            for _, v in ipairs(Workspace:GetDescendants()) do
+                if not blackHoleActive then break end
+                if v:IsA("BasePart")
+                    and not v.Anchored
+                    and v.Name ~= "Handle"
+                    and not v:IsDescendantOf(localPlayer.Character)
+                    and not processedParts[v]
+                    and (
+                        (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+                        or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+                    ) then
+                    -- small spawn to avoid blocking
+                    spawn(function()
+                        wait(0.01)
+                        if blackHoleActive and v and v.Parent and not processedParts[v] then
+                            ForcePart(v)
+                        end
+                    end)
+                end
+            end
+            wait(selectiveScanInterval)
+        end
+        selectiveScannerRunning = false
+    end)
+end
+
+local function stopSelectiveScanner()
+    selectiveScannerRunning = false
+end
+
+-- toggle blackhole
+local function toggleBlackHole()
+    blackHoleActive = toggleState
+    if blackHoleActive then
+        local char = localPlayer.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            local newAttachment = Instance.new("Attachment", char.HumanoidRootPart)
+            if Attachment1 then Attachment1:Destroy() end
+            Attachment1 = newAttachment
+            if #attachments == 0 then
+                attachments = { { Part = nil, Attachment = Attachment1, mode = "single", targetPlayer = nil } }
+                attachmentsMode = "single"
+            end
+        end
+
+        anchoredOnce = false
+        processWorkspaceParts()
+        monitorCollectedParts()
+        startSelectiveScanner()
+
+        spawn(function()
+            while blackHoleActive do
+                if attachmentsMode == "single" or #attachments == 0 then
+                    targetPlayer = getRandomPlayer()
+                    if targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                        if Attachment1 then
+                            Attachment1.WorldCFrame = CFrame.new(targetPlayer.Character.HumanoidRootPart.Position)
+                        end
+                    end
+                else
+                    updateAttachmentsPositions()
+                end
+                wait(switchDelay)
+            end
+        end)
+    else
+        blackHoleActive = false
+        enableLocalPlayerNoclip(false)
+        stopSelectiveScanner()
+        if unanchorTimerRunning and unanchorCoroutine then
+            unanchorTimerRunning = false
+            for part, anchored in pairs(initiallyAnchoredParts) do
+                if part and part.Parent and anchored == false then
+                    part.Anchored = false
+                    ForcePart(part)
+                end
+            end
+        end
+        clearProcessedParts()
+    end
+end
+
+local function toggleTargetSelected()
+    blackHoleActive = toggleState
+    if blackHoleActive then
+        local newAttachment = Instance.new("Attachment", localPlayer.Character.HumanoidRootPart)
+        if Attachment1 then Attachment1:Destroy() end
+        Attachment1 = newAttachment
+        anchoredOnce = false
+        processWorkspaceParts()
+        monitorCollectedParts()
+        startSelectiveScanner()
+        spawn(function()
+            while blackHoleActive do
+                local selectedPlayers = getSelectedPlayers()
+                if #selectedPlayers > 0 then
+                    targetPlayer = selectedPlayers[math.random(1, #selectedPlayers)]
+                else
+                    targetPlayer = nil
+                end
+                if targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                    Attachment1.WorldCFrame = CFrame.new(targetPlayer.Character.HumanoidRootPart.Position)
+                end
+                wait(switchDelay)
+            end
+        end)
+    else
+        blackHoleActive = false
+        enableLocalPlayerNoclip(false)
+        stopSelectiveScanner()
+        if unanchorTimerRunning and unanchorCoroutine then
+            unanchorTimerRunning = false
+            for part, anchored in pairs(initiallyAnchoredParts) do
+                if part and part.Parent and anchored == false then
+                    part.Anchored = false
+                    ForcePart(part)
+                end
+            end
+        end
+        clearProcessedParts()
+    end
+end
+
+-- handle when a player's character spawns (ensures attachments map and PAA mapping remain valid)
+local function onPlayerCharacterAdded(player, character)
+    -- ensure PAA mapping if in PAA mode
+    if attachmentsMode == "paa" and playerAttachIndex[player.UserId] then
+        local idx = playerAttachIndex[player.UserId]
+        if attachments[idx] then
+            attachments[idx].targetPlayer = player
+            -- immediately update the attachment position if possible
+            if character and character:FindFirstChild("HumanoidRootPart") and attachments[idx].Part then
+                attachments[idx].Part.CFrame = CFrame.new(character.HumanoidRootPart.Position)
+            end
+            -- rebalance to maintain fairness (small delay)
+            spawn(function()
+                wait(0.03)
+                rebalanceProcessedParts()
+            end)
+        end
+    end
+end
+
+-- connect players and their character events for detection
+local function bindPlayerCharacterEvents(player)
+    -- safe-connect CharacterAdded
+    player.CharacterAdded:Connect(function(char)
+        onPlayerCharacterAdded(player, char)
+    end)
+    -- if character already exists (e.g., joining mid-game) call handler
+    if player.Character and player.Character.Parent then
+        onPlayerCharacterAdded(player, player.Character)
+    end
+end
+
+-- initial binding for existing players
+for _, p in ipairs(Players:GetPlayers()) do
+    bindPlayerCharacterEvents(p)
+end
+-- bind for future players
+Players.PlayerAdded:Connect(function(pl)
+    bindPlayerCharacterEvents(pl)
+end)
+
+-- PAA player join/leave live updates
+Players.PlayerAdded:Connect(function(pl)
+    if attachmentsMode == "paa" then
+        onPlayerAddedForPAA(pl)
+    end
+end)
+Players.PlayerRemoving:Connect(function(pl)
+    if attachmentsMode == "paa" then
+        onPlayerRemovingForPAA(pl)
+    end
+end)
+
+-- UI library and toggles (keeps your interface, adapted)
+local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/miroeramaa/TurtleLib/main/TurtleUiLib.lua"))()
+local window = library:Window("made by ÆS productions")
+
+window:Toggle("Unanchored Target All", false, function(Value)
+    toggleState = Value
+    blackHoleActive = Value
+    toggleBlackHole()
+end)
+
+window:Toggle("Target Selected Players", false, function(Value)
+    toggleState = Value
+    blackHoleActive = Value
+    toggleTargetSelected()
+end)
+
+window:Button("Load Player List Script", function()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/Jlchris1/Udklol/refs/heads/main/Playerlistv6"))()
+end)
+
+window:Button("telekinesis/fix target", function()
+    loadstring(game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true))()
+end)
+
+-- command integration
+local commandEnabled = false
+local function handleCommand(msg)
+    if not msg then return end
+    local attNum = msg:match("^/e%s+attachments%s+(%d+)")
+    if attNum then
+        local n = tonumber(attNum)
+        if n and n >= 1 then
+            createAttachments(n)
+            assignExistingCandidatePartsToAttachments()
+            return
+        end
+    end
+    if msg:match("^/e%s+deleteattachments") then
+        deleteExtraAttachments()
+        return
+    end
+    if msg:match("^/e%s+PAA") then
+        enablePAA()
+        -- wire hooks
+        Players.PlayerAdded:Connect(function(pl) onPlayerAddedForPAA(pl) end)
+        Players.PlayerRemoving:Connect(function(pl) onPlayerRemovingForPAA(pl) end)
+        -- set player attach mapping immediately
+        local idx = 1
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= localPlayer then
+                playerAttachIndex[p.UserId] = idx
+                if attachments[idx] then
+                    attachments[idx].mode = "player"
+                    attachments[idx].targetPlayer = p
+                end
+                idx = idx + 1
+            end
+        end
+        spawn(function() wait(0.05) rebalanceProcessedParts() end)
+        return
+    end
+end
+
+window:Toggle("Enable commands", false, function(Value)
+    commandEnabled = Value
+    if commandEnabled then
+        if commandConnection then commandConnection:Disconnect() end
+        commandConnection = localPlayer.Chatted:Connect(function(msg)
+            if msg:sub(1,3) == "/e " then
+                handleCommand(msg)
+            end
+        end)
+    else
+        if commandConnection then commandConnection:Disconnect() commandConnection = nil end
+    end
+end)
+
+-- noops to prevent doubling
+local function onPlayerAddedNoop() end
+Players.PlayerAdded:Connect(onPlayerAddedNoop)
+local function onPlayerRemovingNoop() end
+Players.PlayerRemoving:Connect(onPlayerRemovingNoop)
+
+local function onCharacterAddedLocal(char)
+    onPlayerCharacterAdded(localPlayer, char)
+end
+localPlayer.CharacterAdded:Connect(onCharacterAddedLocal)
+
+-- heartbeat update
+RunService.Heartbeat:Connect(function()
+    if blackHoleActive then
+        updateAttachmentsPositions()
+    end
+end)
