@@ -1,0 +1,520 @@
+-- Tendril system (improved)
+-- - Actually picks up unanchored parts
+-- - Reuses existing part Attachments when available
+-- - Planner orders segments per tendril
+-- - Rotation/orientation helper
+-- - Telekinesis toggle restored
+-- Chat: /e tendrils <n>
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+
+local localPlayer = Players.LocalPlayer
+
+-- ================= Helpers (kept & extended) =================
+local function clamp(v,a,b) if v<a then return a end if v>b then return b end return v end
+
+local function stripBodyForces(part)
+    for _, x in next, part:GetChildren() do
+        if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+        or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+        or x:IsA("RocketPropulsion") then
+            x:Destroy()
+        end
+    end
+    -- keep attachments if we intend to reuse them; only remove duplicates created by our script
+    for _, c in ipairs(part:GetChildren()) do
+        if c.Name:match("^ÆS_Tendril_") then pcall(function() c:Destroy() end) end
+    end
+    if part:FindFirstChild("Torque") then part:FindFirstChild("Torque"):Destroy() end
+end
+
+local function isPartPlayerCharacter(part)
+    if not part then return false end
+    for _, pl in ipairs(Players:GetPlayers()) do
+        local ch = pl.Character
+        if ch and part:IsDescendantOf(ch) then return true end
+    end
+    return false
+end
+
+local function isWhitelisted(player)
+    if not player then return false end
+    local v = player:FindFirstChild("Whitelisted")
+    if v and typeof(v.Value) == "boolean" then return v.Value end
+    return false
+end
+
+local function getLocalHRP()
+    if localPlayer and localPlayer.Character then
+        return localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    end
+    return nil
+end
+
+local function partVolume(part)
+    local s = part.Size
+    return math.abs(s.X * s.Y * s.Z)
+end
+
+local function isGoodCandidate(part)
+    if not part or not part:IsA("BasePart") then return false end
+    if part.Name == "Handle" then return false end
+    if part.Anchored then return false end
+    if isPartPlayerCharacter(part) then return false end
+    if localPlayer.Character and part:IsDescendantOf(localPlayer.Character) then return false end
+    -- optional: skip extremely small parts
+    if partVolume(part) < 0.1 then return false end
+    return true
+end
+
+-- ================= state =================
+local processedParts = {} -- [part] = {attInPart=Attachment, modelAnchor=Attachment?, alignPos, alignOri, torque, volume}
+local tendrilEnabled = false
+local tendrilCount = 4
+local tendrils = {} -- tendrils[i] = {parts = {part,...}, anchors = {Attachment,...}, sumVolume}
+local loopCheckActive = false
+local hrpAttachmentRootName = "ÆS_Tendril_HRP_Attach"
+local animConn = nil
+local animPhase = 0
+
+-- ================= planner & grouping helpers =================
+
+-- Gather nearby parts and group by ancestor model (non-character models) to allow attachment reuse
+local function groupPartsByModel(candidates)
+    local groups = {} -- model -> {parts}
+    local singles = {} -- parts with no suitable model
+    for _, p in ipairs(candidates) do
+        local mdl = p:FindFirstAncestorOfClass("Model")
+        if mdl and not Players:GetPlayerFromCharacter(mdl) and mdl ~= Workspace then
+            groups[mdl] = groups[mdl] or {}
+            table.insert(groups[mdl], p)
+        else
+            table.insert(singles, p)
+        end
+    end
+    return groups, singles
+end
+
+-- Planner: order parts in a bucket such that they form a continuous chain from HRP outward
+-- Strategy: compute vector from HRP to part, project onto baseDir and sort by projected distance
+local function planTendrilOrder(hrpCFrame, partsList, baseDir)
+    baseDir = baseDir or -hrpCFrame.LookVector -- default: back of HRP
+    local plan = {}
+    for _, p in ipairs(partsList) do
+        if p and p:IsA("BasePart") then
+            local vec = (p.Position - hrpCFrame.Position)
+            local along = vec:Dot(baseDir)
+            -- distance from HRP projected along baseDir; if negative, use actual magnitude + bias
+            local score = along
+            if score <= 0 then score = vec.Magnitude + 0.1 end
+            table.insert(plan, {part = p, score = score})
+        end
+    end
+    table.sort(plan, function(a,b) return a.score < b.score end)
+    local out = {}
+    for _, x in ipairs(plan) do table.insert(out, x.part) end
+    return out
+end
+
+-- Rotational helper: compute anchor CFrame for a segment index based on direction and spacing
+local function computeAnchorCFrame(hrpCFrame, baseDir, cumulativeDist, swayVec, rotationTwist)
+    baseDir = baseDir.Unit
+    local up = hrpCFrame.UpVector
+    local right = baseDir:Cross(up).Unit
+    if right.Magnitude == 0 then right = hrpCFrame.RightVector end
+    local perp = right
+    -- primary translation: along baseDir backwards from hrp
+    local pos = hrpCFrame.Position + (baseDir * cumulativeDist) + (perp * swayVec.X) + (up * swayVec.Y) + (right * swayVec.Z)
+    -- rotation: align Z axis to -baseDir (so part faces outward). add twist
+    local look = CFrame.new(pos, pos - baseDir) -- CFrame looking opposite baseDir
+    local twist = CFrame.Angles(rotationTwist.X, rotationTwist.Y, rotationTwist.Z)
+    return look * twist
+end
+
+-- ================= attachment & assignment =================
+
+-- Attach minimal control data to a part (do NOT create Align* yet) - reuse existing Attachment if present
+local function preparePart(part)
+    if processedParts[part] then return end
+    if not part or not part:IsA("BasePart") then return end
+    stripBodyForces(part)
+    part.CanCollide = false
+
+    -- reuse existing Attachment inside part if present (helps connected models)
+    local existingAtt
+    for _, c in ipairs(part:GetChildren()) do
+        if c:IsA("Attachment") then
+            existingAtt = c
+            break
+        end
+    end
+
+    local att = existingAtt
+    if not att then
+        att = Instance.new("Attachment")
+        att.Name = "ÆS_Tendril_Att"
+        att.Parent = part
+        att.Visible = false
+    end
+
+    -- small torque for stability
+    local torque = Instance.new("Torque")
+    torque.Name = "ÆS_Tendril_Torque"
+    torque.Attachment0 = att
+    torque.Parent = part
+    torque.Torque = Vector3.new(1e6,1e6,1e6)
+
+    processedParts[part] = {
+        attInPart = att,
+        alignPos = nil,
+        alignOri = nil,
+        torque = torque,
+        volume = partVolume(part)
+    }
+end
+
+-- Create or update AlignPosition/AlignOrientation for a part and connect to an HRP anchor Attachment
+local function bindPartToAnchor(part, anchorAttachment)
+    if not part or not anchorAttachment then return end
+    local info = processedParts[part]
+    if not info then return end
+    -- AlignPosition
+    if not info.alignPos or not info.alignPos.Parent then
+        local ap = Instance.new("AlignPosition")
+        ap.Name = "ÆS_Tendril_AlignPos"
+        ap.Attachment0 = info.attInPart
+        ap.Attachment1 = anchorAttachment
+        ap.MaxForce = 1e8
+        ap.MaxVelocity = math.huge
+        ap.Responsiveness = 350
+        ap.Parent = part
+        info.alignPos = ap
+    else
+        info.alignPos.Attachment1 = anchorAttachment
+    end
+    -- AlignOrientation
+    if not info.alignOri or not info.alignOri.Parent then
+        local ao = Instance.new("AlignOrientation")
+        ao.Name = "ÆS_Tendril_AlignOri"
+        ao.Attachment0 = info.attInPart
+        ao.Attachment1 = anchorAttachment
+        ao.MaxTorque = 1e8
+        ao.Responsiveness = 220
+        ao.Parent = part
+        info.alignOri = ao
+    else
+        info.alignOri.Attachment1 = anchorAttachment
+    end
+    part.CanCollide = false
+end
+
+-- ensure HRP anchors exist for a tendril and number of segments
+local function ensureTendrilAnchors(hrp, tendrilIdx, segmentCount)
+    tendrils[tendrilIdx] = tendrils[tendrilIdx] or {parts = {}, anchors = {}, sum = 0}
+    local t = tendrils[tendrilIdx]
+    -- destroy extra anchors if any
+    for i = #t.anchors, segmentCount+1, -1 do
+        local a = t.anchors[i]
+        if a and a.Parent then a:Destroy() end
+        t.anchors[i] = nil
+    end
+    -- create missing anchors
+    for i = #t.anchors + 1, segmentCount do
+        local a = Instance.new("Attachment")
+        a.Name = hrpAttachmentRootName..("_T"..tostring(tendrilIdx).."S"..tostring(i))
+        a.Parent = hrp
+        -- default CFrame; animator will update
+        a.CFrame = CFrame.new(0,0,0)
+        table.insert(t.anchors, a)
+    end
+    return t.anchors
+end
+
+-- Distribute parts by volume (greedy) across tendrilCount buckets
+local function distributePartsByVolume(partsList, n)
+    n = math.max(1, n or 1)
+    local buckets = {}
+    for i = 1, n do buckets[i] = {parts = {}, sum = 0} end
+    table.sort(partsList, function(a,b) return a.volume > b.volume end)
+    for _, pinfo in ipairs(partsList) do
+        -- pick bucket with smallest sum
+        local best = 1
+        for i = 2, n do
+            if buckets[i].sum < buckets[best].sum then best = i end
+        end
+        table.insert(buckets[best].parts, pinfo.part)
+        buckets[best].sum = buckets[best].sum + pinfo.volume
+    end
+    return buckets
+end
+
+-- Rebuild tendril assignments: create anchors + create Align* and bind each part to anchor
+local function rebuildTendrilAssignments()
+    -- collect all processed parts as list with volumes
+    local list = {}
+    for p, info in pairs(processedParts) do
+        if p and p.Parent then
+            table.insert(list, {part = p, volume = info.volume or partVolume(p)})
+        end
+    end
+
+    -- if no parts, clear
+    if #list == 0 then
+        tendrils = {}
+        return
+    end
+
+    -- distribute by volume
+    local buckets = distributePartsByVolume(list, tendrilCount)
+
+    local hrp = getLocalHRP()
+    if not hrp then return end
+
+    -- prepare tendrils table
+    tendrils = {}
+    for i = 1, tendrilCount do
+        local bucket = buckets[i] or {parts = {}, sum = 0}
+        tendrils[i] = {parts = bucket.parts, anchors = {}, sum = bucket.sum or 0}
+        -- plan local ordering: compute baseDir for this tendril as rotated around HRP
+        local hrpCF = hrp.CFrame
+        local angle = ((i-1)/math.max(1,tendrilCount)) * math.rad(360)
+        local baseDir = (CFrame.fromAxisAngle(hrpCF.UpVector, angle) * CFrame.new(-hrpCF.LookVector)).Position
+        baseDir = baseDir.Unit
+        -- order parts for continuity
+        tendrils[i].parts = planTendrilOrder(hrpCF, tendrils[i].parts, baseDir)
+        -- ensure anchor attachments
+        ensureTendrilAnchors(hrp, i, #tendrils[i].parts)
+    end
+
+    -- create AlignPosition/Orientation binding for each part to its designated anchor
+    for i = 1, #tendrils do
+        local t = tendrils[i]
+        for s = 1, #t.parts do
+            local p = t.parts[s]
+            local anchor = t.anchors[s]
+            if p and p.Parent and anchor then
+                bindPartToAnchor(p, anchor)
+            end
+        end
+    end
+end
+
+-- scan Workspace for new candidate parts and prepare them (create minimal attachments/torque)
+local function scanAndPrepareParts()
+    local candidates = {}
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if isGoodCandidate(v) and not processedParts[v] then
+            table.insert(candidates, v)
+        end
+    end
+    -- group by model to prefer reuse (not required but helpful)
+    local models, singles = groupPartsByModel(candidates)
+    -- prepare grouped model parts first (reusing existing attachments inside them)
+    for mdl, parts in pairs(models) do
+        for _, p in ipairs(parts) do preparePart(p) end
+    end
+    for _, p in ipairs(singles) do preparePart(p) end
+
+    -- after preparing new parts, rebuild assignements
+    rebuildTendrilAssignments()
+end
+
+-- ================= animator =================
+local function startAnimator()
+    if animConn and animConn.Connected then return end
+    animConn = RunService.Heartbeat:Connect(function(dt)
+        animPhase = animPhase + dt
+        if not tendrilEnabled then return end
+        local hrp = getLocalHRP()
+        if not hrp then return end
+        local hrpCF = hrp.CFrame
+        local up = hrpCF.UpVector
+        local look = hrpCF.LookVector
+        local right = hrpCF.RightVector
+
+        for i = 1, tendrilCount do
+            local t = tendrils[i]
+            if not t then continue end
+            local segCount = #t.anchors
+            if segCount == 0 then continue end
+
+            -- base angle offset for radial placement
+            local angle = ((i-1) / math.max(1,tendrilCount)) * math.rad(360)
+            local baseDir = (CFrame.fromAxisAngle(up, angle) * CFrame.new(-look)).Position.Unit
+
+            local cumulative = 0
+            for s = 1, segCount do
+                local anchor = t.anchors[s]
+                if not anchor then continue end
+                -- spacing heuristics
+                local baseSpacing = 1.6 + (s-1) * 1.1
+                local p = t.parts[s]
+                if p and p:IsA("BasePart") then
+                    baseSpacing = baseSpacing + (math.pow((processedParts[p] and processedParts[p].volume or partVolume(p)), 1/3) * 0.28)
+                end
+                cumulative = cumulative + baseSpacing
+
+                -- sway computations (menacing, layered)
+                local freq = 0.9 + (i % 4) * 0.12
+                local segPhase = animPhase * freq + s * 0.45 + i*0.12
+                local amp = 0.4 + (s / math.max(1,segCount)) * 1.8
+                local sway = Vector3.new(
+                    math.sin(segPhase*1.2) * amp,          -- lateral
+                    math.sin(segPhase*0.7 + i) * (amp*0.6), -- vertical
+                    math.cos(segPhase*1.05) * (amp*0.9)     -- second lateral
+                )
+
+                -- small twist variation
+                local twist = Vector3.new(math.sin(segPhase*0.8)*0.12, math.cos(segPhase*0.6 + s)*0.18, math.sin(segPhase*0.4 + i)*0.08)
+
+                local cf = computeAnchorCFrame(hrpCF, baseDir, cumulative, sway, twist)
+                -- convert world cf into hrp-local anchor.CFrame (Attachment.CFrame is relative to parent)
+                pcall(function()
+                    anchor.CFrame = hrp.CFrame:ToObjectSpace(cf)
+                end)
+            end
+        end
+    end)
+end
+
+local function stopAnimator()
+    if animConn then
+        animConn:Disconnect()
+        animConn = nil
+    end
+end
+
+-- ================= telekinesis toggle (loader) =================
+local telekinesisEnabled = false
+local telekinesisConn = nil
+local function setTelekinesisEnabled(v)
+    telekinesisEnabled = v
+    if telekinesisEnabled then
+        -- attempt to load remote script (same as before)
+        pcall(function()
+            loadstring(game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true))()
+        end)
+    else
+        -- can't reliably unload remote script; notify/leave disabled state
+        -- we simply set the flag so UI reflects the choice
+    end
+end
+
+-- ================= chat commands =================
+local enableCommands = true
+local function onLocalPlayerChatted(msg)
+    if not enableCommands or not msg then return end
+    local low = msg:lower()
+    local tn = string.match(low, "^/e%s+tendrils%s+(%d+)")
+    if tn then
+        local n = tonumber(tn)
+        if n and n >= 1 then
+            n = clamp(n, 1, 48) -- safety cap
+            tendrilCount = n
+            if tendrilEnabled then rebuildTendrilAssignments() end
+        end
+        return
+    end
+end
+localPlayer.Chatted:Connect(onLocalPlayerChatted)
+
+-- ================= enable/disable tendrils =================
+local function clearTendrils()
+    -- destroy HRP anchors
+    local hrp = getLocalHRP()
+    if hrp then
+        for _, child in ipairs(hrp:GetChildren()) do
+            if child:IsA("Attachment") and tostring(child.Name):match("^"..hrpAttachmentRootName) then
+                pcall(function() child:Destroy() end)
+            end
+        end
+    end
+    -- restore / cleanup processed parts
+    for part, info in pairs(processedParts) do
+        if part and part.Parent then
+            -- destroy Align/Orientation created by us
+            if info.alignPos and info.alignPos.Parent then info.alignPos:Destroy() end
+            if info.alignOri and info.alignOri.Parent then info.alignOri:Destroy() end
+            if info.torque and info.torque.Parent then info.torque:Destroy() end
+            -- we leave existing attachments (we reused them)
+            part.CanCollide = true
+        end
+    end
+    processedParts = {}
+    tendrils = {}
+end
+
+local function setTendrilsEnabled(value)
+    tendrilEnabled = value
+    if tendrilEnabled then
+        scanAndPrepareParts()
+        rebuildTendrilAssignments()
+        startAnimator()
+    else
+        stopAnimator()
+        clearTendrils()
+    end
+end
+
+-- ================= continuous scan toggle =================
+local function startContinuousScan()
+    spawn(function()
+        while loopCheckActive do
+            if tendrilEnabled then scanAndPrepareParts() end
+            wait(0.6)
+        end
+    end)
+end
+
+-- ================= GUI (TurtleLib) =================
+local success, library = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/miroeramaa/TurtleLib/main/TurtleUiLib.lua"))()
+end)
+local window
+if success and library then
+    window = library:Window("Tendrils System")
+else
+    window = {}
+    function window:Toggle() end
+    function window:Button() end
+end
+
+window:Toggle("Tendrils (unanchored parts)", false, function(val)
+    setTendrilsEnabled(val)
+end)
+
+window:Toggle("Continuous Loop Check (find new parts)", false, function(val)
+    loopCheckActive = val
+    if loopCheckActive then startContinuousScan() end
+end)
+
+window:Toggle("Telekinesis/fix target", false, function(val)
+    setTelekinesisEnabled(val)
+end)
+
+window:Button("Load Player List Script", function()
+    pcall(function()
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/Jlchris1/Udklol/refs/heads/main/Playerlistv6"))()
+    end)
+end)
+
+-- initial lightweight scan to populate processedParts
+spawn(function()
+    wait(0.6)
+    scanAndPrepareParts()
+end)
+
+-- when character spawns, rebuild attachments (HRP attachments are parented to HRP)
+Players.LocalPlayer.CharacterAdded:Connect(function()
+    wait(0.4)
+    if tendrilEnabled then rebuildTendrilAssignments() end
+end)
+
+-- cleanup when script ends/unloads
+game:BindToClose(function()
+    setTendrilsEnabled(false)
+end)
+
+-- ===== end =====
