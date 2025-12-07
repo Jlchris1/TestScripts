@@ -1,7 +1,6 @@
--- Unified NPC GUI (full script) - Updated GUI visibility + tracker/void/heal/HPNaN changes
--- Place as a LocalScript in StarterPlayerScripts
+-- Unified NPC GUI (fixed per user request)
+-- Single-file LocalScript (StarterPlayerScripts)
 
--- Services & player
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
@@ -23,8 +22,9 @@ local MED_FONT = 13
 
 -- STATE
 local NPCs = {}
-local trackedNPCs = {}        -- maps model -> data table (or boolean sentinel during creation)
+local trackedNPCs = {}
 local trackedTypes = {}
+local trackedTypesLoopKeys = {}
 local loops = {}
 local loopRunners = {}
 local excluded = {}
@@ -37,7 +37,7 @@ local trackerScanRunning = false
 setmetatable(NPCs, { __mode = "k" })
 setmetatable(trackedNPCs, { __mode = "k" })
 
--- EFFECTS list (removed "Heal" and "HPNaN")
+-- EFFECTS list (removed "Void" and "Void3"; added "VoidV4"; removed HPNaN and Heal)
 local EFFECTS = {
     "Kill","Fling","PlatformStand","Sit","Anchor","CancelChase","GetRid","Erase",
     "Spasm","Jump","Speed","JumpPower","HipHeight","Tracker","VoidV4"
@@ -249,8 +249,9 @@ local function cancelChaseForModel(model)
     end)
 end
 
--- Void v4: PlatformStand, disable collisions, apply Y velocity -5000 (loop uses same)
-local function voidV4Model(model)
+-- Void v4: PlatformStand, disable collisions, apply Y velocity -500 by default
+local function voidV4Model(model, downVelocity)
+    downVelocity = downVelocity or -500
     if not isAllowed(model, "VoidV4") then return end
     local hum = model and model:FindFirstChildOfClass("Humanoid")
     if hum then pcall(function() hum.PlatformStand = true end) end
@@ -258,9 +259,9 @@ local function voidV4Model(model)
         pcall(function()
             p.CanCollide = false
             if p.AssemblyLinearVelocity ~= nil then
-                p.AssemblyLinearVelocity = Vector3.new(0, -5000, 0)
+                p.AssemblyLinearVelocity = Vector3.new(0, downVelocity, 0)
             else
-                p.Velocity = Vector3.new(0, -5000, 0)
+                p.Velocity = Vector3.new(0, downVelocity, 0)
             end
         end)
     end)
@@ -270,17 +271,22 @@ end
 local function addTrackerToModel(model)
     if not model then return end
     if not isAllowed(model, "Tracker") then return end
-    if trackedNPCs[model] then return end
 
-    -- sentinel so concurrent calls won't create duplicates
-    trackedNPCs[model] = true
-
-    local part = getBestPartForModel(model)
-    if not part then
-        trackedNPCs[model] = nil
-        return
+    -- Avoid duplicates: if there's already a trackedNPCs entry, ensure it's valid, otherwise remove it first
+    if trackedNPCs[model] then
+        -- If we already have data but the gui was destroyed, re-create; otherwise skip to prevent duplication
+        local existing = trackedNPCs[model]
+        if existing and existing.gui and existing.gui.Parent and existing.highlight and existing.highlight.Parent then
+            return
+        else
+            removeTrackerFromModel(model)
+        end
     end
 
+    local part = getBestPartForModel(model)
+    if not part then return end
+
+    -- Create billboard gui
     local gui = Instance.new("BillboardGui")
     gui.Name = "NPCTracker"
     gui.Size = UDim2.new(0,140,0,32)
@@ -306,71 +312,70 @@ local function addTrackerToModel(model)
     highlight.OutlineColor = Color3.fromRGB(80,200,120)
     highlight.OutlineTransparency = 0
 
-    -- Connections for cleanup
-    local conns = {}
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if hum then
-        conns.humDied = hum.Died:Connect(function()
-            pcall(function() removeTrackerFromModel(model) end)
-        end)
-    end
-
-    conns.ancestry = model.AncestryChanged:Connect(function(_, parent)
-        if not parent then
-            pcall(function() removeTrackerFromModel(model) end)
-        end
-    end)
-
-    -- Monitor adornee position for extreme/void teleport or zero/NaN -> remove tracker
-    if part and part:IsA("BasePart") then
-        conns.pos = part:GetPropertyChangedSignal("Position"):Connect(function()
-            local ok, pos = pcall(function() return part.Position end)
-            if not ok or not pos then
-                pcall(function() removeTrackerFromModel(model) end)
-                return
-            end
-            if (type(pos) == "Vector3") then
-                local mag = pos.Magnitude
-                if mag ~= mag or mag == math.huge or mag > 1e20 or (pos.X == 0 and pos.Y == 0 and pos.Z == 0) then
-                    pcall(function() removeTrackerFromModel(model) end)
-                end
-            end
-        end)
-    end
-
-    trackedNPCs[model] = { gui = gui, label = label, highlight = highlight, adornee = part, conns = conns }
+    trackedNPCs[model] = { gui = gui, label = label, highlight = highlight, adornee = part }
 end
 
 function removeTrackerFromModel(model)
     local data = trackedNPCs[model]
-    if data and type(data) == "table" then
+    if data then
+        -- Destroy the explicitly stored gui/highlight if present
         if data.gui then pcall(function() data.gui:Destroy() end) end
         if data.highlight then pcall(function() data.highlight:Destroy() end) end
-        if data.conns then
-            for _,c in pairs(data.conns) do
-                if c and typeof(c.Disconnect) == "function" then
-                    pcall(function() c:Disconnect() end)
-                end
+        trackedNPCs[model] = nil
+    end
+
+    -- Additional defensive cleanup: in case any leftover BillboardGui or Highlight exists in PlayerGui with this adornee/model, remove them
+    for _,child in ipairs(PlayerGui:GetChildren()) do
+        if child:IsA("BillboardGui") and child.Name == "NPCTracker" then
+            local ador = child.Adornee
+            if ador and ador.Parent == model then
+                pcall(function() child:Destroy() end)
+            elseif not ador or (ador and not ador.Parent) then
+                -- If its adornee is nil or orphaned, clear it
+                pcall(function() child:Destroy() end)
+            end
+        elseif child:IsA("Highlight") and child.Name == "NPCHighlight" then
+            local ador = child.Adornee
+            if ador == model then
+                pcall(function() child:Destroy() end)
             end
         end
     end
-    trackedNPCs[model] = nil
 end
 
 local function updateAllTrackers()
     local playerPos = player.Character and player.Character.PrimaryPart and player.Character.PrimaryPart.Position
     for model,data in pairs(trackedNPCs) do
-        local part = (data and data.adornee) or getBestPartForModel(model)
-        if not model.Parent or not part then removeTrackerFromModel(model) end
+        -- Defensive removal when model or adornee invalid, when it fell into void (huge coords), or when model is no longer an NPC
+        local remove = false
+        if not model or not model.Parent or not isNPC(model) then remove = true end
+        local adorneePart = data and data.adornee
+        if adorneePart then
+            if not adorneePart.Parent then remove = true end
+            -- if adornee went to insane coords (void), remove tracker
+            local ok, pos = pcall(function() return adorneePart.Position end)
+            if not ok or not pos then remove = true else
+                if math.abs(pos.X) > 1e5 or math.abs(pos.Y) > 1e5 or math.abs(pos.Z) > 1e5 then remove = true end
+            end
+        else
+            remove = true
+        end
+
+        if remove then
+            removeTrackerFromModel(model)
+        end
+
+        -- Update label text for remaining trackers
         if data and data.label and model.Parent then
             local hum = model:FindFirstChildOfClass("Humanoid")
-            local hrp = part
+            local hrp = getBestPartForModel(model)
             local dist = 0
             if playerPos and hrp then dist = (hrp.Position - playerPos).Magnitude end
             if hum then
                 local jp = hum.JumpPower or hum.JumpHeight or 0
+                local hpVal = hum.Health or 0
                 data.label.Text = string.format("%s | HP: %.1f | S: %.1f | JP: %.1f | D: %.1f",
-                    model.Name, hum.Health or 0, hum.WalkSpeed or 0, jp, dist)
+                    model.Name, hpVal, hum.WalkSpeed or 0, jp, dist)
             end
         end
     end
@@ -408,21 +413,13 @@ local function stopAllTypeLoops(typeName)
     stopLoop("hip_"..typeName)
 end
 
--- GUI CREATION (with visibility fixes)
--- Remove any previous GUI to avoid duplicates
-if PlayerGui:FindFirstChild("UnifiedNPCGUI") then
-    pcall(function() PlayerGui:FindFirstChild("UnifiedNPCGUI"):Destroy() end)
-end
-
+-- UI BUILD (compact)
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "UnifiedNPCGUI"
 ScreenGui.ResetOnSpawn = false
-ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
 ScreenGui.IgnoreGuiInset = true
-ScreenGui.Enabled = true
 ScreenGui.Parent = PlayerGui
 
--- Small toggle button (make sure it's visible and high ZIndex)
 local SmallToggle = Instance.new("TextButton")
 SmallToggle.Name = "SmallToggle"
 SmallToggle.Size = UDim2.new(0, SMALL_TOGGLE_W, 0, SMALL_TOGGLE_H)
@@ -435,26 +432,23 @@ SmallToggle.TextSize = 11
 SmallToggle.TextColor3 = Color3.new(1,1,1)
 SmallToggle.Text = "NPC"
 SmallToggle.Parent = ScreenGui
-SmallToggle.ZIndex = 100
-SmallToggle.Visible = true
+SmallToggle.ZIndex = 10
 
--- MainFrame
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
 MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
-MainFrame.Position = UDim2.new(0.5, 0, 0.45, 0)
+MainFrame.Position = UDim2.new(0.5, 0, 0.45, 0) -- slightly higher for mobile
 MainFrame.Size = UDim2.new(0, 120, 0, 24)
 MainFrame.BackgroundColor3 = Color3.fromRGB(25,25,25)
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
 MainFrame.Visible = false
 MainFrame.Parent = ScreenGui
-MainFrame.ZIndex = 100
 
-local TopBar = Instance.new("Frame"); TopBar.Size = UDim2.new(1,0,0,30); TopBar.BackgroundColor3 = Color3.fromRGB(44,44,44); TopBar.Parent = MainFrame; TopBar.ZIndex = 101
-local Title = Instance.new("TextLabel"); Title.Size = UDim2.new(0.65,0,1,0); Title.BackgroundTransparency = 1; Title.TextColor3 = Color3.new(1,1,1); Title.Font = Enum.Font.GothamBold; Title.TextSize = 14; Title.Text = "Unified NPC"; Title.Position = UDim2.new(0.04,0,0,0); Title.Parent = TopBar; Title.ZIndex = 102
+local TopBar = Instance.new("Frame"); TopBar.Size = UDim2.new(1,0,0,30); TopBar.BackgroundColor3 = Color3.fromRGB(44,44,44); TopBar.Parent = MainFrame
+local Title = Instance.new("TextLabel"); Title.Size = UDim2.new(0.65,0,1,0); Title.BackgroundTransparency = 1; Title.TextColor3 = Color3.new(1,1,1); Title.Font = Enum.Font.GothamBold; Title.TextSize = 14; Title.Text = "Unified NPC"; Title.Position = UDim2.new(0.04,0,0,0); Title.Parent = TopBar
 
-local TabsBar = Instance.new("Frame"); TabsBar.Size = UDim2.new(1,0,0,26); TabsBar.Position = UDim2.new(0,0,0,30); TabsBar.BackgroundTransparency = 1; TabsBar.Parent = MainFrame; TabsBar.ZIndex = 101
+local TabsBar = Instance.new("Frame"); TabsBar.Size = UDim2.new(1,0,0,26); TabsBar.Position = UDim2.new(0,0,0,30); TabsBar.BackgroundTransparency = 1; TabsBar.Parent = MainFrame
 local function tabButton(x, text)
     local b = Instance.new("TextButton")
     b.Size = UDim2.new(0.25, -6, 1, 0)
@@ -466,7 +460,6 @@ local function tabButton(x, text)
     b.TextColor3 = Color3.new(1,1,1)
     b.Text = text
     b.Parent = TabsBar
-    b.ZIndex = 102
     return b
 end
 local tabControlsBtn = tabButton(0, "Ctrl")
@@ -480,7 +473,6 @@ Content.Position = UDim2.new(0,0,0, 30 + 26)
 Content.BackgroundColor3 = Color3.fromRGB(32,32,32)
 Content.Parent = MainFrame
 Content.Visible = false
-Content.ZIndex = 100
 
 local CounterLabel = Instance.new("TextLabel")
 CounterLabel.Size = UDim2.new(1, -8, 0, 22)
@@ -493,7 +485,6 @@ CounterLabel.TextSize = SMALL_FONT
 CounterLabel.TextColor3 = Color3.new(1,1,1)
 CounterLabel.Text = "NPCs: 0"
 CounterLabel.Parent = Content
-CounterLabel.ZIndex = 101
 
 local function makeScroll(parent, yOffset, h)
     local s = Instance.new("ScrollingFrame")
@@ -502,7 +493,6 @@ local function makeScroll(parent, yOffset, h)
     s.BackgroundTransparency = 1
     s.ScrollBarThickness = 6
     s.Parent = parent
-    s.ZIndex = 100
     local layout = Instance.new("UIListLayout")
     layout.Parent = s
     layout.SortOrder = Enum.SortOrder.LayoutOrder
@@ -513,23 +503,23 @@ local function makeScroll(parent, yOffset, h)
     return s, layout
 end
 
-local controlsFrame = Instance.new("Frame"); controlsFrame.Size = UDim2.new(1,0,1,0); controlsFrame.BackgroundTransparency = 1; controlsFrame.Parent = Content; controlsFrame.ZIndex = 100
-local utilitiesFrame = Instance.new("Frame"); utilitiesFrame.Size = UDim2.new(1,0,1,0); utilitiesFrame.BackgroundTransparency = 1; utilitiesFrame.Parent = Content; utilitiesFrame.Visible = false; utilitiesFrame.ZIndex = 100
-local advancedFrame = Instance.new("Frame"); advancedFrame.Size = UDim2.new(1,0,1,0); advancedFrame.BackgroundTransparency = 1; advancedFrame.Parent = Content; advancedFrame.Visible = false; advancedFrame.ZIndex = 100
-local whitelistFrame = Instance.new("Frame"); whitelistFrame.Size = UDim2.new(1,0,1,0); whitelistFrame.BackgroundTransparency = 1; whitelistFrame.Parent = Content; whitelistFrame.Visible = false; whitelistFrame.ZIndex = 100
+local controlsFrame = Instance.new("Frame"); controlsFrame.Size = UDim2.new(1,0,1,0); controlsFrame.BackgroundTransparency = 1; controlsFrame.Parent = Content
+local utilitiesFrame = Instance.new("Frame"); utilitiesFrame.Size = UDim2.new(1,0,1,0); utilitiesFrame.BackgroundTransparency = 1; utilitiesFrame.Parent = Content; utilitiesFrame.Visible = false
+local advancedFrame = Instance.new("Frame"); advancedFrame.Size = UDim2.new(1,0,1,0); advancedFrame.BackgroundTransparency = 1; advancedFrame.Parent = Content; advancedFrame.Visible = false
+local whitelistFrame = Instance.new("Frame"); whitelistFrame.Size = UDim2.new(1,0,1,0); whitelistFrame.BackgroundTransparency = 1; whitelistFrame.Parent = Content; whitelistFrame.Visible = false
 
 local ctrlScroll,_ = makeScroll(controlsFrame, 34)
 local utilScroll,_ = makeScroll(utilitiesFrame, 34)
 local advScroll,_ = makeScroll(advancedFrame, 34)
 
--- Whitelist & group scroll (resized to avoid overlap)
+-- Whitelist left: group list on center area, selected-type (left) is now a compact scroll panel placed LEFT of main GUI
 local groupScroll = Instance.new("ScrollingFrame")
-groupScroll.Size = UDim2.new(1, - (140 + 220 + 36), 1, - 72) -- made narrower so features won't overlap
+-- resized so it doesn't overlap features GUI (reduced height)
+groupScroll.Size = UDim2.new(1, - (140 + 20), 1, - 120)
 groupScroll.Position = UDim2.new(0, 146, 0, 36)
 groupScroll.BackgroundTransparency = 1
 groupScroll.ScrollBarThickness = 6
 groupScroll.Parent = whitelistFrame
-groupScroll.ZIndex = 100
 local groupList = Instance.new("UIListLayout"); groupList.Parent = groupScroll; groupList.SortOrder = Enum.SortOrder.LayoutOrder; groupList.Padding = UDim.new(0,4)
 groupList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() groupScroll.CanvasSize = UDim2.new(0,0,0, groupList.AbsoluteContentSize.Y + 8) end)
 
@@ -541,7 +531,6 @@ leftPanel.BorderSizePixel = 0
 leftPanel.ScrollBarThickness = 6
 leftPanel.Parent = whitelistFrame
 leftPanel.Visible = false
-leftPanel.ZIndex = 100
 local leftLayout = Instance.new("UIListLayout"); leftLayout.Parent = leftPanel; leftLayout.SortOrder = Enum.SortOrder.LayoutOrder; leftLayout.Padding = UDim.new(0,4)
 
 local leftTitle = Instance.new("TextLabel")
@@ -553,7 +542,6 @@ leftTitle.TextSize = SMALL_FONT
 leftTitle.TextColor3 = Color3.new(1,1,1)
 leftTitle.Text = "Type: (none)"
 leftTitle.Parent = leftPanel
-leftTitle.ZIndex = 101
 
 local function makeLeftBtnText(text)
     local b = Instance.new("TextButton")
@@ -565,21 +553,19 @@ local function makeLeftBtnText(text)
     b.TextColor3 = Color3.new(1,1,1)
     b.Text = text
     b.Parent = leftPanel
-    b.ZIndex = 101
     return b
 end
 
--- Exclusion panel
+-- Exclusion panel (now placed to LEFT of the main GUI)
 local ExclusionPanel = Instance.new("Frame")
 ExclusionPanel.Name = "ExclusionPanel"
 ExclusionPanel.Size = UDim2.new(0, 200, 0, GUI_HEIGHT)
 ExclusionPanel.AnchorPoint = Vector2.new(0.5, 0.5)
-ExclusionPanel.Position = UDim2.new(0.5, -GUI_WIDTH/2 - 12 - 100, 0.45, 0)
+ExclusionPanel.Position = UDim2.new(0.5, -GUI_WIDTH/2 - 12 - 100, 0.45, 0) -- left side of main
 ExclusionPanel.BackgroundColor3 = Color3.fromRGB(30,30,30)
 ExclusionPanel.BorderSizePixel = 0
 ExclusionPanel.Visible = false
 ExclusionPanel.Parent = ScreenGui
-ExclusionPanel.ZIndex = 100
 
 local exclTitle = Instance.new("TextLabel")
 exclTitle.Size = UDim2.new(1, -8, 0, 22)
@@ -590,7 +576,6 @@ exclTitle.TextSize = SMALL_FONT
 exclTitle.TextColor3 = Color3.new(1,1,1)
 exclTitle.Text = "Exclusions (select a type)"
 exclTitle.Parent = ExclusionPanel
-exclTitle.ZIndex = 101
 
 local exclScroll = Instance.new("ScrollingFrame")
 exclScroll.Size = UDim2.new(1, -12, 1, - 40)
@@ -598,23 +583,21 @@ exclScroll.Position = UDim2.new(0,6,0,36)
 exclScroll.BackgroundTransparency = 1
 exclScroll.ScrollBarThickness = 6
 exclScroll.Parent = ExclusionPanel
-exclScroll.ZIndex = 100
 local exclList = Instance.new("UIListLayout"); exclList.Parent = exclScroll; exclList.SortOrder = Enum.SortOrder.LayoutOrder; exclList.Padding = UDim.new(0,4)
 exclList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     exclScroll.CanvasSize = UDim2.new(0,0,0, exclList.AbsoluteContentSize.Y + 8)
 end)
 
--- Features panel (right)
+-- Features panel (right of main; kept compact)
 local FeaturesPanel = Instance.new("Frame")
 FeaturesPanel.Name = "FeaturesPanel"
 FeaturesPanel.Size = UDim2.new(0, 220, 0, GUI_HEIGHT)
 FeaturesPanel.AnchorPoint = Vector2.new(0.5, 0.5)
-FeaturesPanel.Position = UDim2.new(0.5, GUI_WIDTH/2 + 12 + 100, 0.45, 0)
+FeaturesPanel.Position = UDim2.new(0.5, GUI_WIDTH/2 + 12 + 100, 0.45, 0) -- right side of main (moved farther away to avoid touching)
 FeaturesPanel.BackgroundColor3 = Color3.fromRGB(30,30,30)
 FeaturesPanel.BorderSizePixel = 0
 FeaturesPanel.Visible = false
 FeaturesPanel.Parent = ScreenGui
-FeaturesPanel.ZIndex = 100
 
 local featTitle = Instance.new("TextLabel")
 featTitle.Size = UDim2.new(1, -8, 0, 22)
@@ -625,7 +608,6 @@ featTitle.TextSize = SMALL_FONT
 featTitle.TextColor3 = Color3.new(1,1,1)
 featTitle.Text = "Type Features"
 featTitle.Parent = FeaturesPanel
-featTitle.ZIndex = 101
 
 local featScroll = Instance.new("ScrollingFrame")
 featScroll.Size = UDim2.new(1, -12, 1, - 110)
@@ -633,13 +615,12 @@ featScroll.Position = UDim2.new(0,6,0,36)
 featScroll.BackgroundTransparency = 1
 featScroll.ScrollBarThickness = 6
 featScroll.Parent = FeaturesPanel
-featScroll.ZIndex = 100
 local featList = Instance.new("UIListLayout"); featList.Parent = featScroll; featList.SortOrder = Enum.SortOrder.LayoutOrder; featList.Padding = UDim.new(0,4)
 featList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     featScroll.CanvasSize = UDim2.new(0,0,0, featList.AbsoluteContentSize.Y + 8)
 end)
 
--- compact organized inputs (only Speed & JumpPower kept)
+-- compact organized inputs (more consistent layout)
 local function makeSmallLabel(parent, text, posY)
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.5, -6, 0, 18)
@@ -650,7 +631,6 @@ local function makeSmallLabel(parent, text, posY)
     lbl.TextColor3 = Color3.new(1,1,1)
     lbl.Text = text
     lbl.Parent = parent
-    lbl.ZIndex = 101
     return lbl
 end
 local function makeSmallInput(parent, default, posY)
@@ -664,7 +644,6 @@ local function makeSmallInput(parent, default, posY)
     box.Font = Enum.Font.Gotham
     box.TextSize = SMALL_FONT
     box.Parent = parent
-    box.ZIndex = 101
     return box
 end
 local function makeSmallLoopBtn(parent, posY)
@@ -677,13 +656,13 @@ local function makeSmallLoopBtn(parent, posY)
     btn.TextSize = 11
     btn.TextColor3 = Color3.new(1,1,1)
     btn.Parent = parent
-    btn.ZIndex = 101
     return btn
 end
 
-local speedLabel_feat = makeSmallLabel(FeaturesPanel, "Speed (type)", -56)
-local speedInput_feat = makeSmallInput(FeaturesPanel, "16", -56)
-local speedLoop_feat = makeSmallLoopBtn(FeaturesPanel, -56)
+-- Organized feature inputs: only Speed and JumpPower now (per request)
+local speedLabel_feat = makeSmallLabel(FeaturesPanel, "Speed (type)", -60)
+local speedInput_feat = makeSmallInput(FeaturesPanel, "16", -60)
+local speedLoop_feat = makeSmallLoopBtn(FeaturesPanel, -60)
 
 local jpLabel_feat = makeSmallLabel(FeaturesPanel, "Jump (type)", -32)
 local jpInput_feat = makeSmallInput(FeaturesPanel, "50", -32)
@@ -695,7 +674,6 @@ local function makeRow(parent, text)
     frame.Size = UDim2.new(1, 0, 0, BTN_H)
     frame.BackgroundTransparency = 1
     frame.Parent = parent
-    frame.ZIndex = 100
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(0.66, 0, 1, 0)
     btn.Position = UDim2.new(0, 0, 0, 0)
@@ -721,6 +699,11 @@ end
 
 -- Controls & Utilities (compact rows)
 local killBtn, killLoopBtn = makeRow(ctrlScroll, "Kill All")
+local flingBoxRow = Instance.new("Frame"); flingBoxRow.Size = UDim2.new(1,0,0,BTN_H); flingBoxRow.BackgroundTransparency = 1; flingBoxRow.Parent = ctrlScroll
+local flingBox = Instance.new("TextBox"); flingBox.Size = UDim2.new(0.56,0,1,0); flingBox.Position = UDim2.new(0,0,0,0); flingBox.PlaceholderText = "Fling"; flingBox.Text = "200"; flingBox.BackgroundColor3 = Color3.fromRGB(50,50,50); flingBox.TextColor3 = Color3.new(1,1,1); flingBox.BorderSizePixel = 0; flingBox.Font = Enum.Font.Gotham; flingBox.TextSize = SMALL_FONT; flingBox.Parent = flingBoxRow
+local flingBtn = Instance.new("TextButton"); flingBtn.Size = UDim2.new(0.42, -6, 1, 0); flingBtn.Position = UDim2.new(0.56, 6, 0, 0); flingBtn.BackgroundColor3 = Color3.fromRGB(100,50,50); flingBtn.BorderSizePixel = 0; flingBtn.Font = Enum.Font.Gotham; flingBtn.TextSize = SMALL_FONT; flingBtn.TextColor3 = Color3.new(1,1,1); flingBtn.Text = "Fling"; flingBtn.Parent = flingBoxRow
+local flingLoopBtn = Instance.new("TextButton"); flingLoopBtn.Size = UDim2.new(0.32,0,1,0); flingLoopBtn.Position = UDim2.new(0.68, 6, 0, 0); flingLoopBtn.BackgroundColor3 = Color3.fromRGB(40,40,40); flingLoopBtn.BorderSizePixel = 0; flingLoopBtn.Font = Enum.Font.Gotham; flingLoopBtn.TextSize = 11; flingLoopBtn.TextColor3 = Color3.new(1,1,1); flingLoopBtn.Text = "Loop: Off"; flingLoopBtn.Parent = flingBoxRow
+
 local psBtn, psLoopBtn = makeRow(ctrlScroll, "PlatformStand")
 local sitBtn, sitLoopBtn = makeRow(ctrlScroll, "Sit")
 local anchorBtn, anchorLoopBtn = makeRow(ctrlScroll, "Anchor")
@@ -758,14 +741,19 @@ trackerToggleBtn.TextColor3 = Color3.new(1,1,1)
 trackerToggleBtn.Text = "Toggle NPC Tracker"
 trackerToggleBtn.Parent = trackerFrame
 
--- Click-Kill Tool (kept similar)
+-- LocalScript (put this in StarterPlayerScripts)
+
+local player = game.Players.LocalPlayer
 local backpack = player:WaitForChild("Backpack")
+
+-- Create the tool
 local tool = Instance.new("Tool")
 tool.Name = "NPCKillTool"
 tool.RequiresHandle = false
 tool.Parent = backpack
 
-local function isNPCmodel(model)
+-- Check if a model is an NPC (has Humanoid and is not a player)
+local function isNPC_local(model)
     if not model then return false end
     local humanoid = model:FindFirstChildOfClass("Humanoid")
     if humanoid and not game.Players:GetPlayerFromCharacter(model) then
@@ -774,10 +762,11 @@ local function isNPCmodel(model)
     return false
 end
 
+-- Get the top-level NPC model from any part clicked
 local function getNPCModel(part)
     local current = part
     while current do
-        if current:IsA("Model") and isNPCmodel(current) then
+        if current:IsA("Model") and isNPC_local(current) then
             return current
         end
         current = current.Parent
@@ -785,6 +774,7 @@ local function getNPCModel(part)
     return nil
 end
 
+-- When tool is activated
 tool.Activated:Connect(function()
     local mouse = player:GetMouse()
     local targetPart = mouse.Target
@@ -793,19 +783,27 @@ tool.Activated:Connect(function()
     local npcModel = getNPCModel(targetPart)
     if not npcModel then return end
 
+    -- Find humanoid in NPC model
     local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
     if humanoid then
+        -- Change health: 0 → 1 → 0 instantly
         humanoid.Health = 0
         humanoid.Health = 1
         humanoid.Health = 0
     end
 end)
 
+-- Note: createClickKillOnRespawn/createClickKillTool variables referenced in UI below
 local createClickKillOnRespawn = false
 local clickToolConn = nil
-
 local function createClickKillTool()
-    if backpack:FindFirstChild("NPCKillTool") then return end
+    -- create and add tool to backpack (if backpack exists)
+    if not backpack then
+        backpack = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack")
+    end
+    if not backpack then return end
+    local existing = backpack:FindFirstChild("NPCKillTool")
+    if existing then existing:Destroy() end
     local t = Instance.new("Tool")
     t.Name = "NPCKillTool"
     t.RequiresHandle = false
@@ -826,7 +824,9 @@ local function createClickKillTool()
 end
 
 local function onCharacterAddedForTool(char)
+    -- create tool when respawned if toggle is on
     if createClickKillOnRespawn then
+        -- small delay to ensure Backpack exists
         task.wait(0.1)
         createClickKillTool()
     end
@@ -839,11 +839,14 @@ local function setCreateClickKillOnRespawn(enabled)
         clickToolConn = nil
     end
     if enabled then
+        -- create on next respawn
         clickToolConn = player.CharacterAdded:Connect(onCharacterAddedForTool)
+        -- also, if player already just respawned (character present), do not create now per requirement.
+        -- Only create on future respawn, so we don't create immediately here.
     end
 end
 
--- TRACKER scanning
+-- TRACKER scan functions
 local function startTrackerScan()
     if trackerScanRunning then return end
     trackerScanRunning = true
@@ -872,11 +875,11 @@ trackerToggleBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- per-type left page builder
+-- per-type page builders (cached)
 local function ensureTypeLeftPage(typeName)
     if typeLeftPages[typeName] then return typeLeftPages[typeName] end
     local page = Instance.new("Frame")
-    page.Size = UDim2.new(1,0,0, 260)
+    page.Size = UDim2.new(1,0,0, 220)
     page.BackgroundTransparency = 1
     page.Visible = false
     page.Parent = leftPanel
@@ -892,17 +895,15 @@ local function ensureTypeLeftPage(typeName)
     local btnAnchor = makeLeftBtnText("Toggle Anchor Type"); btnAnchor.Parent = page
     local btnWhitelist = makeLeftBtnText("Whitelist (exclusions)"); btnWhitelist.Parent = page
 
-    local btnDestroyClose = makeLeftBtnText("Destroy Closest HRP")
-    btnDestroyClose.Parent = page
-    btnDestroyClose.MouseButton1Click:Connect(function()
-        if not typeName then return end
-        local list = getNPCsByName(typeName)
-        local myPos = player.Character and player.Character.PrimaryPart and player.Character.PrimaryPart.Position
-        if not myPos then return end
-        for _,m in ipairs(list) do
+    -- Add "Destroy Nearby HRP" button on left type page
+    local destroyNearbyLeft = makeLeftBtnText("Destroy Nearby HRP (type)")
+    destroyNearbyLeft.MouseButton1Click:Connect(function()
+        if not selectedType then return end
+        for _,m in ipairs(getNPCsByName(selectedType)) do
             local hrp = getBestPartForModel(m)
-            if hrp and hrp.Position then
-                local dist = (hrp.Position - myPos).Magnitude
+            if hrp and player.Character and player.Character.PrimaryPart then
+                local playerPos = player.Character.PrimaryPart.Position
+                local dist = (hrp.Position - playerPos).Magnitude
                 local closer = true
                 for _,plr in ipairs(Players:GetPlayers()) do
                     if plr ~= player and plr.Character and plr.Character.PrimaryPart then
@@ -910,7 +911,7 @@ local function ensureTypeLeftPage(typeName)
                         if d < dist then closer = false break end
                     end
                 end
-                if closer then pcall(function() if hrp and hrp.Parent then hrp:Destroy() end end) end
+                if closer then pcall(function() hrp:Destroy() end) end
             end
         end
     end)
@@ -937,7 +938,7 @@ local function ensureTypeLeftPage(typeName)
     btnFling.MouseButton1Click:Connect(function()
         if not selectedType then return end
         if excluded[selectedType] and excluded[selectedType]["Fling"] then return end
-        local p = 200
+        local p = tonumber(flingBox.Text) or 200
         for _,m in ipairs(getNPCsByName(selectedType)) do pcall(function() flingModel(m,p) end) end
     end)
 
@@ -971,6 +972,7 @@ local function ensureTypeLeftPage(typeName)
             ExclusionPanel.Visible = true
         else
             local exPage = Instance.new("Frame")
+            -- #EFFECTS rows
             exPage.Size = UDim2.new(1,0,0, #EFFECTS * (BTN_H + 6))
             exPage.BackgroundTransparency = 1
             exPage.Visible = true
@@ -1009,18 +1011,20 @@ end
 local function ensureTypeFeaturePage(typeName)
     if typeFeaturePages[typeName] then return typeFeaturePages[typeName] end
     local page = Instance.new("Frame")
+    -- Only include EFFECTS relevant to our list (without Heal/HPNaN)
     page.Size = UDim2.new(1,0,0, 40 + (#EFFECTS * (BTN_H + 6)))
     page.BackgroundTransparency = 1
     page.Visible = false
     page.Parent = featScroll
     local layout = Instance.new("UIListLayout"); layout.Parent = page; layout.SortOrder = Enum.SortOrder.LayoutOrder; layout.Padding = UDim.new(0,4)
 
+    -- Build rows for EFFECTS but only create inputs where relevant (Speed, JumpPower)
     for _,eff in ipairs(EFFECTS) do
         local row = Instance.new("Frame"); row.Size = UDim2.new(1,0,0,BTN_H); row.BackgroundTransparency = 1; row.Parent = page
         local btn = Instance.new("TextButton"); btn.Size = UDim2.new(0.5,0,1,0); btn.Position = UDim2.new(0,0,0,0); btn.BackgroundColor3 = Color3.fromRGB(58,58,58); btn.BorderSizePixel = 0; btn.Font = Enum.Font.Gotham; btn.TextSize = SMALL_FONT; btn.TextColor3 = Color3.new(1,1,1); btn.Text = eff; btn.Parent = row
         local small
         local input = nil
-        local hasTextbox = (eff == "Speed" or eff == "JumpPower" or eff == "HipHeight" or eff == "Fling")
+        local hasTextbox = (eff == "Speed" or eff == "JumpPower")
         if eff ~= "Tracker" then
             small = Instance.new("TextButton"); small.Size = UDim2.new(0.48,0,1,0); small.Position = UDim2.new(0.52,6,0,0); small.BackgroundColor3 = Color3.fromRGB(40,40,40); small.BorderSizePixel = 0; small.Font = Enum.Font.Gotham; small.TextSize = 11; small.TextColor3 = Color3.new(1,1,1); small.Text = "Loop: Off"; small.Parent = row
         else
@@ -1031,18 +1035,17 @@ local function ensureTypeFeaturePage(typeName)
             input = Instance.new("TextBox"); input.Size = UDim2.new(0.28,0,1,0); input.Position = UDim2.new(0.52,6,0,0); input.BackgroundColor3 = Color3.fromRGB(50,50,50); input.TextColor3 = Color3.new(1,1,1); input.Font = Enum.Font.Gotham; input.TextSize = SMALL_FONT; input.ClearTextOnFocus = false
             if eff == "Speed" then input.Text = "16"
             elseif eff == "JumpPower" then input.Text = "50"
-            elseif eff == "HipHeight" then input.Text = "2"
-            elseif eff == "Fling" then input.Text = "200"
             else input.Text = "" end
             input.Parent = row
             if small and small:IsA("TextButton") then small.Position = UDim2.new(0.8,6,0,0) end
         end
 
+        -- Core per-type handlers
         btn.MouseButton1Click:Connect(function()
             if not selectedType then return end
             local list = getNPCsByName(selectedType)
             if eff == "Kill" then killAllSimultaneousForList(list)
-            elseif eff == "Fling" then local p = tonumber((input and input.Text) or "200") or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
+            elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
             elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
             elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
             elseif eff == "Anchor" then for _,m in ipairs(list) do toggleAnchor(m) end
@@ -1074,7 +1077,7 @@ local function ensureTypeFeaturePage(typeName)
                         if excluded[selectedType] and excluded[selectedType][eff] then return end
                         local list = getNPCsByName(selectedType)
                         if eff == "Kill" then killAllSimultaneousForList(list)
-                        elseif eff == "Fling" then local p = tonumber((input and input.Text) or "200") or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
+                        elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
                         elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
                         elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
                         elseif eff == "Anchor" then for _,m in ipairs(list) do toggleAnchor(m) end
@@ -1083,7 +1086,10 @@ local function ensureTypeFeaturePage(typeName)
                         elseif eff == "Erase" then for _,m in ipairs(list) do eraseModel(m) end
                         elseif eff == "Spasm" then for _,m in ipairs(list) do spasmModel(m) end
                         elseif eff == "Jump" then for _,m in ipairs(list) do jumpModel(m) end
-                        elseif eff == "VoidV4" then for _,m in ipairs(list) do voidV4Model(m) end
+                        elseif eff == "VoidV4" then for _,m in ipairs(list) do 
+                            -- when looping VoidV4 for type, apply stronger downward velocity (-5000)
+                            voidV4Model(m, -5000)
+                        end
                         elseif eff == "Speed" then local v = tonumber(input and input.Text) or 16 for _,m in ipairs(list) do setSpeed(m, v) end
                         elseif eff == "JumpPower" then local v = tonumber(input and input.Text) or 50 for _,m in ipairs(list) do setJumpPower(m, v) end
                         elseif eff == "HipHeight" then local v = tonumber(input and input.Text) or 2 for _,m in ipairs(list) do setHipHeight(m, v) end
@@ -1102,7 +1108,7 @@ local function ensureTypeFeaturePage(typeName)
                 if eff == "Speed" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["Speed"]) then for _,m in ipairs(list) do setSpeed(m, v) end end
                 elseif eff == "JumpPower" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["JumpPower"]) then for _,m in ipairs(list) do setJumpPower(m, v) end end
                 elseif eff == "HipHeight" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["HipHeight"]) then for _,m in ipairs(list) do setHipHeight(m, v) end end
-                elseif eff == "Fling" then local p = tonumber(input.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m, p) end) end
+                elseif eff == "Fling" then local p = tonumber(input.Text) or tonumber(flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m, p) end) end
                 end
             end)
         end
@@ -1153,7 +1159,6 @@ local function rebuildGroupedList()
         frame.Size = UDim2.new(1,0,0,BTN_H)
         frame.BackgroundTransparency = 1
         frame.Parent = groupScroll
-        frame.ZIndex = 100
         local btn = Instance.new("TextButton")
         btn.Size = UDim2.new(0.6,0,1,0)
         btn.Position = UDim2.new(0,0,0,0)
@@ -1164,7 +1169,6 @@ local function rebuildGroupedList()
         btn.TextColor3 = Color3.new(1,1,1)
         btn.Text = string.format("%s [%d]", name, count)
         btn.Parent = frame
-        btn.ZIndex = 101
         local info = Instance.new("TextLabel")
         info.Size = UDim2.new(0.38, 0, 1, 0)
         info.Position = UDim2.new(0.62, 6, 0, 0)
@@ -1174,7 +1178,6 @@ local function rebuildGroupedList()
         info.TextColor3 = Color3.new(1,1,1)
         info.Text = "Select"
         info.Parent = frame
-        info.ZIndex = 101
 
         btn.MouseButton1Click:Connect(function()
             showTypeUI(name, count)
@@ -1190,6 +1193,9 @@ killLoopBtn.MouseButton1Click:Connect(function()
     if loops.killAll then startLoop("killAll", function() killAllSimultaneousForList(getNPCsArray()) end) else stopLoop("killAll") end
 end)
 
+flingBtn.MouseButton1Click:Connect(function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end)
+flingLoopBtn.MouseButton1Click:Connect(function() loops.flingAll = not loops.flingAll; flingLoopBtn.Text = "Loop: " .. (loops.flingAll and "On" or "Off"); if loops.flingAll then startLoop("flingAll", function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end) else stopLoop("flingAll") end end)
+
 psBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do platformStand(m) end end)
 psLoopBtn.MouseButton1Click:Connect(function() loops.ps = not loops.ps; psLoopBtn.Text = "Loop: " .. (loops.ps and "On" or "Off"); if loops.ps then startLoop("ps", function() for _,m in ipairs(getNPCsArray()) do platformStand(m) end end) else stopLoop("ps") end end)
 
@@ -1201,7 +1207,7 @@ anchorLoopBtn.MouseButton1Click:Connect(function() loops.anchor = not loops.anch
 
 cancelChaseBtn.MouseButton1Click:Connect(function() cancelChaseEnabled = not cancelChaseEnabled; cancelChaseBtn.Text = "Cancel-Chase: "..tostring(cancelChaseEnabled) end)
 
--- Void v4 handlers (global). Loop uses voidV4Model which applies -5000 Y velocity now.
+-- Void v4 handlers (global)
 v4Btn.MouseButton1Click:Connect(function()
     for _,m in ipairs(getNPCsArray()) do
         if isAllowed(m,"VoidV4") then pcall(function() voidV4Model(m) end) end
@@ -1211,7 +1217,8 @@ v4LoopBtn.MouseButton1Click:Connect(function()
     loops.v4 = not loops.v4
     v4LoopBtn.Text = "Loop: "..(loops.v4 and "On" or "Off")
     if loops.v4 then
-        startLoop("v4", function() for _,m in ipairs(getNPCsArray()) do if isAllowed(m,"VoidV4") then pcall(function() voidV4Model(m) end) end end end)
+        -- while looping use stronger downward velocity (-5000)
+        startLoop("v4", function() for _,m in ipairs(getNPCsArray()) do if isAllowed(m,"VoidV4") then pcall(function() voidV4Model(m, -5000) end) end end end)
     else
         stopLoop("v4")
     end
@@ -1297,67 +1304,44 @@ toolToggleClear.MouseButton1Click:Connect(function()
     createClickKillTool()
 end)
 
--- Add "Destroy Closest HRP" buttons to main areas:
-local function destroyClosestHRPForAllTypes()
-    local myPos = player.Character and player.Character.PrimaryPart and player.Character.PrimaryPart.Position
-    if not myPos then return end
-    for _,m in ipairs(getNPCsArray()) do
-        local hrp = getBestPartForModel(m)
-        if hrp and hrp.Position then
-            local dist = (hrp.Position - myPos).Magnitude
-            local closer = true
-            for _,plr in ipairs(Players:GetPlayers()) do
-                if plr ~= player and plr.Character and plr.Character.PrimaryPart then
-                    local d = (hrp.Position - plr.Character.PrimaryPart.Position).Magnitude
-                    if d < dist then closer = false break end
+-- Add "Destroy Nearby HRP" buttons in various panels (Controls, Utilities, Advanced, Whitelist, Features, Exclusion)
+local function makeDestroyNearbyButton(parent, text)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1,0,0,BTN_H)
+    btn.BackgroundColor3 = Color3.fromRGB(60,60,60)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = SMALL_FONT
+    btn.TextColor3 = Color3.new(1,1,1)
+    btn.Text = text
+    btn.Parent = parent
+    btn.MouseButton1Click:Connect(function()
+        for _,m in ipairs(getNPCsArray()) do
+            local hrp = getBestPartForModel(m)
+            if hrp and player.Character and player.Character.PrimaryPart then
+                local playerPos = player.Character.PrimaryPart.Position
+                local dist = (hrp.Position - playerPos).Magnitude
+                local closer = true
+                for _,plr in ipairs(Players:GetPlayers()) do
+                    if plr ~= player and plr.Character and plr.Character.PrimaryPart then
+                        local d = (hrp.Position - plr.Character.PrimaryPart.Position).Magnitude
+                        if d < dist then closer = false break end
+                    end
                 end
+                if closer then pcall(function() hrp:Destroy() end) end
             end
-            if closer then pcall(function() if hrp and hrp.Parent then hrp:Destroy() end end) end
         end
-    end
+    end)
+    return btn
 end
 
-local destroyAllBtn = Instance.new("TextButton")
-destroyAllBtn.Size = UDim2.new(1,0,0,BTN_H)
-destroyAllBtn.Position = UDim2.new(0,0,0,0)
-destroyAllBtn.BackgroundColor3 = Color3.fromRGB(60,60,60)
-destroyAllBtn.Font = Enum.Font.Gotham
-destroyAllBtn.TextSize = SMALL_FONT
-destroyAllBtn.TextColor3 = Color3.new(1,1,1)
-destroyAllBtn.Text = "Destroy Closest HRP (All)"
-destroyAllBtn.Parent = ctrlScroll
-destroyAllBtn.ZIndex = 101
-destroyAllBtn.MouseButton1Click:Connect(function()
-    destroyClosestHRPForAllTypes()
-end)
-
-local destroyFeatBtn = Instance.new("TextButton")
-destroyFeatBtn.Size = UDim2.new(1,0,0,BTN_H)
-destroyFeatBtn.Position = UDim2.new(0,0,0,0)
-destroyFeatBtn.BackgroundColor3 = Color3.fromRGB(60,60,60)
-destroyFeatBtn.Font = Enum.Font.Gotham
-destroyFeatBtn.TextSize = SMALL_FONT
-destroyFeatBtn.TextColor3 = Color3.new(1,1,1)
-destroyFeatBtn.Text = "Destroy Closest HRP (Feature)"
-destroyFeatBtn.Parent = featScroll
-destroyFeatBtn.ZIndex = 101
-destroyFeatBtn.MouseButton1Click:Connect(function()
-    destroyClosestHRPForAllTypes()
-end)
-
-local destroyWLBtn = Instance.new("TextButton")
-destroyWLBtn.Size = UDim2.new(1,0,0,BTN_H)
-destroyWLBtn.Position = UDim2.new(0,0,0,0)
-destroyWLBtn.BackgroundColor3 = Color3.fromRGB(60,60,60)
-destroyWLBtn.Font = Enum.Font.Gotham
-destroyWLBtn.TextSize = SMALL_FONT
-destroyWLBtn.TextColor3 = Color3.new(1,1,1)
-destroyWLBtn.Text = "Destroy Closest HRP (Select)"
-destroyWLBtn.Parent = groupScroll
-destroyWLBtn.ZIndex = 101
-destroyWLBtn.MouseButton1Click:Connect(function()
-    destroyClosestHRPForAllTypes()
-end)
+-- Place destroy buttons
+makeDestroyNearbyButton(ctrlScroll, "Destroy Nearby HRP (all)")
+makeDestroyNearbyButton(utilScroll, "Destroy Nearby HRP (utils)")
+makeDestroyNearbyButton(advScroll, "Destroy Nearby HRP (adv)")
+makeDestroyNearbyButton(groupScroll, "Destroy Nearby HRP (whitelist)")
+makeDestroyNearbyButton(featScroll, "Destroy Nearby HRP (features)")
+makeDestroyNearbyButton(exclScroll, "Destroy Nearby HRP (exclusions)")
 
 -- HEARTBEAT: scanning, cancel-chase, tracker updates
 do
@@ -1445,37 +1429,32 @@ end)
 task.spawn(function()
     while true do
         for m,_ in pairs(trackedNPCs) do
-            if not m or not m.Parent or not isNPC(m) then
-                removeTrackerFromModel(m)
-            else
-                -- also ensure Adornee still valid
-                local data = trackedNPCs[m]
-                if data and data.adornee and (not data.adornee.Parent) then
-                    removeTrackerFromModel(m)
+            local data = trackedNPCs[m]
+            local remove = false
+            if not m or not m.Parent or not isNPC(m) then remove = true end
+            if data and data.adornee then
+                local ok, pos = pcall(function() return data.adornee.Position end)
+                if not ok or not pos then remove = true else
+                    if math.abs(pos.X) > 1e5 or math.abs(pos.Y) > 1e5 or math.abs(pos.Z) > 1e5 then remove = true end
                 end
+            else
+                remove = true
             end
+            if remove then removeTrackerFromModel(m) end
         end
         task.wait(1)
     end
 end)
 
--- Reparent GUI to PlayerGui on CharacterAdded (defensive - sometimes PlayerGui gets replaced)
-player.CharacterAdded:Connect(function()
-    -- ensure ScreenGui is parented to PlayerGui and enabled
-    local pg = player:FindFirstChild("PlayerGui") or PlayerGui
-    if pg and ScreenGui.Parent ~= pg then
-        ScreenGui.Parent = pg
-    end
-    ScreenGui.Enabled = true
-
-    -- reattach trackers if possible, else remove
+-- Ensure trackers remain attached or cleaned after respawn
+player.CharacterAdded:Connect(function(char)
     for m,_ in pairs(trackedNPCs) do
         if trackedNPCs[m] then
             local data = trackedNPCs[m]
             if data and data.gui and data.adornee and data.adornee.Parent then
                 data.gui.Adornee = data.adornee
-                data.gui.Parent = pg
-                if data.highlight then data.highlight.Parent = pg end
+                data.gui.Parent = PlayerGui
+                data.highlight.Parent = PlayerGui
             else
                 removeTrackerFromModel(m)
             end
@@ -1488,5 +1467,8 @@ scanAddNPCs()
 cleanNPCs()
 CounterLabel.Text = "NPCs: " .. tostring(#getNPCsArray())
 rebuildGroupedList()
+
+-- Expose helper to create the tool immediately (for convenience)
+-- createClickKillTool() -- uncomment if you want tool created on load
 
 -- End of script
