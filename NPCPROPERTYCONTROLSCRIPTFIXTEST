@@ -1,4 +1,4 @@
--- Unified NPC GUI (full script) - fixed: robust click-kill respawn tool creation + 0.5s delay, tracker reconnection on respawn
+-- Unified NPC GUI (full script) - updated final: Click-Kill respawn button now TextScaled = true
 -- Place as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
@@ -38,7 +38,7 @@ local trackerScanRunning = false
 setmetatable(NPCs, { __mode = "k" })
 setmetatable(trackedNPCs, { __mode = "k" })
 
--- EFFECTS list
+-- EFFECTS list (removed "Void" and "Void3"; added "VoidV4"; removed "HPNaN" and "Heal")
 local EFFECTS = {
     "Kill","Fling","PlatformStand","Sit","Anchor","CancelChase","GetRid","Erase",
     "Spasm","Jump","Speed","JumpPower","HipHeight","Tracker","VoidV4"
@@ -269,10 +269,10 @@ local function voidV4Model(model, yVel)
 end
 
 -- TRACKER & HIGHLIGHT
-
 local function removeTrackerFromModel(model)
     if not model then return end
     local data = trackedNPCs[model]
+    -- Destroy objects referenced in trackedNPCs table
     if data then
         if data.gui then
             pcall(function() data.gui:Destroy() end)
@@ -280,6 +280,7 @@ local function removeTrackerFromModel(model)
         if data.highlight then
             pcall(function() data.highlight:Destroy() end)
         end
+        -- disconnect stored connections
         if data._connections then
             for _,c in ipairs(data._connections) do
                 pcall(function() c:Disconnect() end)
@@ -287,7 +288,7 @@ local function removeTrackerFromModel(model)
         end
     end
 
-    -- Also attempt to remove any stray BillboardGui/Highlight in PlayerGui that refer to the model
+    -- Also attempt to remove any stray BillboardGui/Highlight in PlayerGui or Workspace that refer to the model
     for _,desc in ipairs(PlayerGui:GetDescendants()) do
         if desc:IsA("BillboardGui") and desc.Name == "NPCTracker" then
             local ador = desc.Adornee
@@ -296,7 +297,11 @@ local function removeTrackerFromModel(model)
             elseif not ador then
                 pcall(function() desc:Destroy() end)
             end
-        elseif desc:IsA("Highlight") and desc.Name == "NPCHighlight" then
+        end
+    end
+    -- search Workspace for highlights that might have been parented there
+    for _,desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("Highlight") and desc.Name == "NPCHighlight" then
             local ador = desc.Adornee
             if ador and ador:IsDescendantOf(model) then
                 pcall(function() desc:Destroy() end)
@@ -339,7 +344,8 @@ local function addTrackerToModel(model)
     local highlight = Instance.new("Highlight")
     highlight.Name = "NPCHighlight"
     highlight.Adornee = model
-    highlight.Parent = PlayerGui
+    -- Place highlight in Workspace (safer across respawns)
+    highlight.Parent = Workspace
     highlight.FillTransparency = 1
     highlight.OutlineColor = Color3.fromRGB(80,200,120)
     highlight.OutlineTransparency = 0
@@ -727,7 +733,7 @@ local function makeRow(parent, text)
     return btn, small
 end
 
--- Controls & Utilities (compact rows)
+-- Controls & Utilities (compact)
 local killBtn, killLoopBtn = makeRow(ctrlScroll, "Kill All")
 local flingBoxRow = Instance.new("Frame"); flingBoxRow.Size = UDim2.new(1,0,0,BTN_H); flingBoxRow.BackgroundTransparency = 1; flingBoxRow.Parent = ctrlScroll
 local flingBox = Instance.new("TextBox"); flingBox.Size = UDim2.new(0.56,0,1,0); flingBox.Position = UDim2.new(0,0,0,0); flingBox.PlaceholderText = "Fling"; flingBox.Text = "200"; flingBox.BackgroundColor3 = Color3.fromRGB(50,50,50); flingBox.TextColor3 = Color3.new(1,1,1); flingBox.BorderSizePixel = 0; flingBox.Font = Enum.Font.Gotham; flingBox.TextSize = SMALL_FONT; flingBox.Parent = flingBoxRow
@@ -777,7 +783,9 @@ trackerToggleBtn.Text = "Toggle NPC Tracker"
 trackerToggleBtn.Parent = trackerFrame
 
 -- LocalScript click-kill tool integration
--- (CHANGES: more robust "find anywhere" check; onCharacterAdded waits 0.5s before creating/moving tool)
+-- We'll implement createClickKillTool() and setCreateClickKillOnRespawn() using your provided tool script
+-- plus an equip GUI to configure Click-Kill fling power and toggle.
+
 local backpack = player:WaitForChild("Backpack")
 local createClickKillOnRespawn = false
 local clickToolConn = nil
@@ -786,7 +794,9 @@ local clickToolConn = nil
 local clickToolFlingEnabled = false
 local clickToolFlingPower = 200
 
+-- We'll create a GUI that appears when the tool is equipped.
 local function ensureClickKillGui()
+    -- If already exists, return it
     local existing = PlayerGui:FindFirstChild("NPCKillToolGUI")
     if existing and existing:IsA("ScreenGui") then return existing end
 
@@ -798,7 +808,7 @@ local function ensureClickKillGui()
 
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(0, 220, 0, 80)
-    frame.Position = UDim2.new(0, 10, 0.5, -40)
+    frame.Position = UDim2.new(0, 10, 0.5, -40) -- LEFT middle start (10px from left, vertically centered)
     frame.AnchorPoint = Vector2.new(0, 0)
     frame.BackgroundColor3 = Color3.fromRGB(30,30,30)
     frame.BorderSizePixel = 0
@@ -846,6 +856,7 @@ local function ensureClickKillGui()
     toggleBtn.Text = "Click-Kill Fling: Off"
     toggleBtn.Parent = frame
 
+    -- Wire up interactions
     pBox.FocusLost:Connect(function()
         local v = tonumber(pBox.Text)
         if v then
@@ -863,7 +874,10 @@ local function ensureClickKillGui()
     -- Make frame draggable
     do
         local dragging = false
-        local dragStart, startPos
+        local dragInput = nil
+        local dragStart = nil
+        local startPos = nil
+
         frame.InputBegan:Connect(function(input)
             if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
                 dragging = true
@@ -876,6 +890,7 @@ local function ensureClickKillGui()
                 end)
             end
         end)
+
         UserInputService.InputChanged:Connect(function(input)
             if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
                 local delta = input.Position - dragStart
@@ -889,41 +904,22 @@ local function ensureClickKillGui()
     return sg
 end
 
--- Robust search for existing NPCKillTool anywhere on the player (Backpack, Character, etc.)
-local function findExistingToolAnywhere()
-    -- Check Backpack and Character directly (fast)
-    if backpack then
-        local t = backpack:FindFirstChild("NPCKillTool")
-        if t and t:IsA("Tool") then return t end
-    end
-    if player.Character then
-        local t = player.Character:FindFirstChild("NPCKillTool")
-        if t and t:IsA("Tool") then return t end
-    end
-    -- Also scan player descendants (covers StarterGear/odd parents)
-    for _,desc in ipairs(player:GetDescendants()) do
-        if desc:IsA("Tool") and desc.Name == "NPCKillTool" then
-            return desc
-        end
-    end
-    return nil
-end
-
 local function createClickKillTool()
-    -- Ensure backpack object exists
-    backpack = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack")
-
-    -- If a tool exists somewhere, move it back to Backpack and return it
-    local existing = findExistingToolAnywhere()
+    -- avoid duplicates in backpack or character; if tool exists in character, attempt to move it to backpack
+    local existing = nil
+    pcall(function()
+        existing = backpack:FindFirstChild("NPCKillTool") or (player.Character and player.Character:FindFirstChild("NPCKillTool"))
+    end)
     if existing then
-        -- If it's already parented to the desired backpack, just return it
-        if existing.Parent ~= backpack then
-            pcall(function() existing.Parent = backpack end)
-        end
-        return existing
+        -- attempt to repair by making sure it's in the backpack
+        pcall(function()
+            if existing:IsA("Tool") and existing.Parent ~= backpack then
+                existing.Parent = backpack
+            end
+        end)
+        return
     end
 
-    -- Create new tool if nothing found
     local tool = Instance.new("Tool")
     tool.Name = "NPCKillTool"
     tool.RequiresHandle = false
@@ -1006,19 +1002,16 @@ local function createClickKillTool()
             end
         end
     end)
-
-    return tool
 end
 
--- onCharacterAddedForTool: create/move the tool after respawn
 local function onCharacterAddedForTool(char)
     if createClickKillOnRespawn then
-        -- WAIT 0.5s as requested to ensure Backpack & character objects are ready.
-        task.wait(0.5) -- changed from 0.1
-        -- Ensure Backpack exists
-        backpack = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack")
-        -- Create or move tool into backpack (createClickKillTool is robust now)
-        pcall(function() createClickKillTool() end)
+        -- slightly longer delay to ensure Backpack & Character are fully ready
+        -- requested: 0.5 seconds delay
+        task.wait(0.5)
+        -- ensure backpack reference (defensive)
+        backpack = player:WaitForChild("Backpack")
+        createClickKillTool()
     end
 end
 
@@ -1360,8 +1353,18 @@ killLoopBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- ... (other button wiring stays same; omitted here to keep sample shorter in chat but you should keep all those connections from original file)
--- For completeness the rest of your original button wiring remains unchanged and is included below in the full file.
+-- Click-Kill Tool creation toggle UI (placed in advanced panel)
+local toolToggleFrame = Instance.new("Frame"); toolToggleFrame.Size = UDim2.new(1,0,0,BTN_H); toolToggleFrame.BackgroundTransparency = 1; toolToggleFrame.Parent = advScroll
+local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.TextScaled = true; toolToggleBtn.Parent = toolToggleFrame
+local toolToggleClear = Instance.new("TextButton"); toolToggleClear.Size = UDim2.new(0.32,0,1,0); toolToggleClear.Position = UDim2.new(0.66,6,0,0); toolToggleClear.BackgroundColor3 = Color3.fromRGB(40,40,40); toolToggleClear.BorderSizePixel = 0; toolToggleClear.Font = Enum.Font.Gotham; toolToggleClear.TextSize = 11; toolToggleClear.TextColor3 = Color3.new(1,1,1); toolToggleClear.Text = "Create Now"; toolToggleClear.Parent = toolToggleFrame
+
+toolToggleBtn.MouseButton1Click:Connect(function()
+    setCreateClickKillOnRespawn(not createClickKillOnRespawn)
+    toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: " .. (createClickKillOnRespawn and "On" or "Off")
+end)
+toolToggleClear.MouseButton1Click:Connect(function()
+    createClickKillTool()
+end)
 
 -- HEARTBEAT: scanning, cancel-chase, tracker updates
 do
@@ -1384,7 +1387,7 @@ do
             acc = 0
             scanAddNPCs()
             cleanNPCs()
-            CounterLabel.Text = "NPCs: " .. tostring(#getNPCsArray())
+            CounterLabel.Text = "NPCs: " . tostring(#getNPCsArray())
             local h = hashCounts()
             if h ~= lastCountsHash then
                 lastCountsHash = h
@@ -1465,21 +1468,13 @@ player.CharacterAdded:Connect(function(char)
     for m,_ in pairs(trackedNPCs) do
         if trackedNPCs[m] then
             local data = trackedNPCs[m]
-            -- Recompute adornee in case the previous part was destroyed and assign to PlayerGui.
-            if data and data.gui then
-                local newPart = getBestPartForModel(m)
-                if newPart and newPart.Parent then
-                    data.adornee = newPart
-                    data.gui.Adornee = newPart
-                    data.gui.Parent = PlayerGui
-                    if data.highlight then
-                        data.highlight.Adornee = m
-                        data.highlight.Parent = PlayerGui
-                    end
-                else
-                    -- If we can't find a valid adorn part, remove tracker cleanly
-                    removeTrackerFromModel(m)
-                end
+            if data and data.gui and data.adornee and data.adornee.Parent then
+                -- restore adornee + parents robustly
+                pcall(function()
+                    data.gui.Adornee = data.adornee
+                    if data.gui.Parent ~= PlayerGui then data.gui.Parent = PlayerGui end
+                    if data.highlight and data.highlight.Parent ~= Workspace then data.highlight.Parent = Workspace end
+                end)
             else
                 removeTrackerFromModel(m)
             end
