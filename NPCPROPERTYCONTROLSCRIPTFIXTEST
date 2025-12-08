@@ -598,7 +598,7 @@ ExclusionPanel.Position = UDim2.new(0.5, -GUI_WIDTH/2 - 12 - 100, 0.45, 0) -- le
 ExclusionPanel.BackgroundColor3 = Color3.fromRGB(30,30,30)
 ExclusionPanel.BorderSizePixel = 0
 ExclusionPanel.Visible = false
-ExclusionPanel.Parent = getPlayerGui()
+ExclusionPanel.Parent = ScreenGui -- FIXED: parent to ScreenGui so it renders
 
 local exclTitle = Instance.new("TextLabel")
 exclTitle.Size = UDim2.new(1, -8, 0, 22)
@@ -630,7 +630,7 @@ FeaturesPanel.Position = UDim2.new(0.5, GUI_WIDTH/2 + 12 + 100, 0.45, 0) -- righ
 FeaturesPanel.BackgroundColor3 = Color3.fromRGB(30,30,30)
 FeaturesPanel.BorderSizePixel = 0
 FeaturesPanel.Visible = false
-FeaturesPanel.Parent = getPlayerGui()
+FeaturesPanel.Parent = ScreenGui -- FIXED: parent to ScreenGui so it renders
 
 local featTitle = Instance.new("TextLabel")
 featTitle.Size = UDim2.new(1, -8, 0, 22)
@@ -953,6 +953,34 @@ local function createClickKillTool()
         return nil
     end
 
+    -- helper: apply damage sequence (0, then 1, then ensure 0)
+    local function applyDamageSequence(hum)
+        if not hum then return end
+        pcall(function()
+            if typeof(hum.TakeDamage) == "function" then
+                hum:TakeDamage(0)
+            end
+        end)
+        task.wait(0.03)
+        pcall(function()
+            if typeof(hum.TakeDamage) == "function" then
+                hum:TakeDamage(1)
+            else
+                -- fallback: nudge health to 1 (if numeric available)
+                if hum.Health ~= nil then
+                    hum.Health = math.max(1, (hum.Health or 1))
+                end
+            end
+        end)
+        task.wait(0.03)
+        -- final ensure death: if still alive, force health to zero
+        pcall(function()
+            if hum.Health and hum.Health > 0 then
+                hum.Health = 0
+            end
+        end)
+    end
+
     -- Ensure equip GUI is prepared (hidden)
     local gui = ensureClickKillGui()
     -- equipped/unequipped show/hide GUI
@@ -1007,10 +1035,8 @@ local function createClickKillTool()
                     end
                 end)
             else
-                -- Default simple kill sequence if fling not enabled
-                pcall(function() humanoid.Health = 0 end)
-                pcall(function() humanoid.Health = 1 end)
-                pcall(function() humanoid.Health = 0 end)
+                -- Default sequence: apply damage 0, then damage 1, then ensure dead (health = 0)
+                applyDamageSequence(humanoid)
             end
         end
     end)
@@ -1493,6 +1519,7 @@ end)
 -- Click-Kill Tool creation toggle UI (placed in advanced panel)
 local toolToggleFrame = Instance.new("Frame"); toolToggleFrame.Size = UDim2.new(1,0,0,BTN_H); toolToggleFrame.BackgroundTransparency = 1; toolToggleFrame.Parent = advScroll
 local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.Parent = toolToggleFrame
+toolToggleBtn.TextScaled = true -- REQUESTED: make the toggle scaled so it fits
 local toolToggleClear = Instance.new("TextButton"); toolToggleClear.Size = UDim2.new(0.32,0,1,0); toolToggleClear.Position = UDim2.new(0.66,6,0,0); toolToggleClear.BackgroundColor3 = Color3.fromRGB(40,40,40); toolToggleClear.BorderSizePixel = 0; toolToggleClear.Font = Enum.Font.Gotham; toolToggleClear.TextSize = 11; toolToggleClear.TextColor3 = Color3.new(1,1,1); toolToggleClear.Text = "Create Now"; toolToggleClear.Parent = toolToggleFrame
 
 toolToggleBtn.MouseButton1Click:Connect(function()
