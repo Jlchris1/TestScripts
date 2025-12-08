@@ -1,6 +1,5 @@
--- Unified NPC GUI (full script) - updated minimal fix for clickkill respawn
--- Original file used as base. Only onCharacterAddedForTool was modified.
--- If anything else is required, tell me and I'll keep it equally surgical.
+-- Unified NPC GUI (full script) - updated with draggable Click-Kill equip GUI (starts left-middle)
+-- Place as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -8,13 +7,17 @@ local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local player = Players.LocalPlayer
-local PlayerGui = player:WaitForChild("PlayerGui")
+
+-- NOTE: don't cache PlayerGui (it can be recreated on respawn). Use this helper when you need it.
+local function getPlayerGui()
+    return player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui")
+end
 
 -- CONFIG (compact/mobile)
 local SCAN_INTERVAL = 0.45
 local LOOP_DELAY = 0.12
-local GUI_WIDTH = 240
-local GUI_HEIGHT = 300
+local GUI_WIDTH = 240     -- smaller
+local GUI_HEIGHT = 300    -- smaller
 local SMALL_TOGGLE_W = 28
 local SMALL_TOGGLE_H = 14
 local CENTER_TOP_Y = 6
@@ -35,9 +38,11 @@ local prevSelectedType = nil
 local cancelChaseEnabled = false
 local trackerScanRunning = false
 
+-- make weak-keyed so removed models can be GC'd
 setmetatable(NPCs, { __mode = "k" })
 setmetatable(trackedNPCs, { __mode = "k" })
 
+-- EFFECTS list (removed "Void" and "Void3"; added "VoidV4"; removed "HPNaN" and "Heal")
 local EFFECTS = {
     "Kill","Fling","PlatformStand","Sit","Anchor","CancelChase","GetRid","Erase",
     "Spasm","Jump","Speed","JumpPower","HipHeight","Tracker","VoidV4"
@@ -249,6 +254,7 @@ local function cancelChaseForModel(model)
     end)
 end
 
+-- Void v4: PlatformStand, disable collisions, apply Y velocity (default -500). Accepts optional yVel param.
 local function voidV4Model(model, yVel)
     if not isAllowed(model, "VoidV4") then return end
     yVel = tonumber(yVel) or -500
@@ -270,28 +276,40 @@ end
 local function removeTrackerFromModel(model)
     if not model then return end
     local data = trackedNPCs[model]
+    -- Destroy objects referenced in trackedNPCs table
     if data then
-        if data.gui then pcall(function() data.gui:Destroy() end) end
-        if data.highlight then pcall(function() data.highlight:Destroy() end) end
+        if data.gui then
+            pcall(function() data.gui:Destroy() end)
+        end
+        if data.highlight then
+            pcall(function() data.highlight:Destroy() end)
+        end
+        -- disconnect stored connections
         if data._connections then
-            for _,c in ipairs(data._connections) do pcall(function() c:Disconnect() end) end
+            for _,c in ipairs(data._connections) do
+                pcall(function() c:Disconnect() end)
+            end
         end
     end
 
-    for _,desc in ipairs(PlayerGui:GetDescendants()) do
-        if desc:IsA("BillboardGui") and desc.Name == "NPCTracker" then
-            local ador = desc.Adornee
-            if ador and ador:IsDescendantOf(model) then
-                pcall(function() desc:Destroy() end)
-            elseif not ador then
-                pcall(function() desc:Destroy() end)
-            end
-        elseif desc:IsA("Highlight") and desc.Name == "NPCHighlight" then
-            local ador = desc.Adornee
-            if ador and ador:IsDescendantOf(model) then
-                pcall(function() desc:Destroy() end)
-            elseif not ador then
-                pcall(function() desc:Destroy() end)
+    -- Also attempt to remove any stray BillboardGui/Highlight in current PlayerGui that refer to the model
+    local pg = getPlayerGui()
+    if pg then
+        for _,desc in ipairs(pg:GetDescendants()) do
+            if desc:IsA("BillboardGui") and desc.Name == "NPCTracker" then
+                local ador = desc.Adornee
+                if ador and ador:IsDescendantOf(model) then
+                    pcall(function() desc:Destroy() end)
+                elseif not ador then
+                    pcall(function() desc:Destroy() end)
+                end
+            elseif desc:IsA("Highlight") and desc.Name == "NPCHighlight" then
+                local ador = desc.Adornee
+                if ador and ador:IsDescendantOf(model) then
+                    pcall(function() desc:Destroy() end)
+                elseif not ador then
+                    pcall(function() desc:Destroy() end)
+                end
             end
         end
     end
@@ -303,10 +321,14 @@ local function addTrackerToModel(model)
     if not model then return end
     if not isAllowed(model, "Tracker") then return end
 
+    -- Remove any previous leftover trackers for this model first (defensive)
     removeTrackerFromModel(model)
 
     local part = getBestPartForModel(model)
     if not part then return end
+
+    local pg = getPlayerGui()
+    if not pg then return end
 
     local gui = Instance.new("BillboardGui")
     gui.Name = "NPCTracker"
@@ -314,7 +336,7 @@ local function addTrackerToModel(model)
     gui.StudsOffset = Vector3.new(0,1.5,0)
     gui.AlwaysOnTop = true
     gui.Adornee = part
-    gui.Parent = PlayerGui
+    gui.Parent = pg -- dynamic parent
 
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1,-4,1,-4)
@@ -328,13 +350,15 @@ local function addTrackerToModel(model)
     local highlight = Instance.new("Highlight")
     highlight.Name = "NPCHighlight"
     highlight.Adornee = model
-    highlight.Parent = PlayerGui
+    highlight.Parent = pg -- dynamic parent
     highlight.FillTransparency = 1
     highlight.OutlineColor = Color3.fromRGB(80,200,120)
     highlight.OutlineTransparency = 0
 
+    -- connection table for cleanup
     local conns = {}
 
+    -- Humanoid death should remove tracker
     local hum = model:FindFirstChildOfClass("Humanoid")
     if hum and hum:IsA("Humanoid") then
         table.insert(conns, hum.Died:Connect(function()
@@ -342,12 +366,14 @@ local function addTrackerToModel(model)
         end))
     end
 
+    -- If model is removed from workspace (Parent changes), remove tracker
     table.insert(conns, model.AncestryChanged:Connect(function(_, newParent)
         if not model.Parent or not isNPC(model) then
             removeTrackerFromModel(model)
         end
     end))
 
+    -- Monitor the adornee part: if its position goes to zero or below void threshold, remove the tracker
     if part and part:IsA("BasePart") then
         local function checkPartPos()
             if not part or not part.Parent then
@@ -363,6 +389,7 @@ local function addTrackerToModel(model)
             end
         end
         table.insert(conns, part:GetPropertyChangedSignal("Position"):Connect(checkPartPos))
+        -- Also run initial check
         checkPartPos()
     end
 
@@ -425,7 +452,7 @@ local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "UnifiedNPCGUI"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.IgnoreGuiInset = true
-ScreenGui.Parent = PlayerGui
+ScreenGui.Parent = getPlayerGui()
 
 local SmallToggle = Instance.new("TextButton")
 SmallToggle.Name = "SmallToggle"
@@ -444,7 +471,7 @@ SmallToggle.ZIndex = 10
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
 MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
-MainFrame.Position = UDim2.new(0.5, 0, 0.45, 0)
+MainFrame.Position = UDim2.new(0.5, 0, 0.45, 0) -- slightly higher for mobile
 MainFrame.Size = UDim2.new(0, 120, 0, 24)
 MainFrame.BackgroundColor3 = Color3.fromRGB(25,25,25)
 MainFrame.BorderSizePixel = 0
@@ -519,7 +546,7 @@ local ctrlScroll,_ = makeScroll(controlsFrame, 34)
 local utilScroll,_ = makeScroll(utilitiesFrame, 34)
 local advScroll,_ = makeScroll(advancedFrame, 34)
 
--- Whitelist / left panels...
+-- Whitelist left: group list on center area, selected-type (left) is now a compact scroll panel placed LEFT of main GUI
 local groupScroll = Instance.new("ScrollingFrame")
 groupScroll.Size = UDim2.new(1, - (140 + 20), 1, - 72)
 groupScroll.Position = UDim2.new(0, 146, 0, 36)
@@ -562,16 +589,16 @@ local function makeLeftBtnText(text)
     return b
 end
 
--- Exclusion panel (left)
+-- Exclusion panel (now placed to LEFT of the main GUI)
 local ExclusionPanel = Instance.new("Frame")
 ExclusionPanel.Name = "ExclusionPanel"
 ExclusionPanel.Size = UDim2.new(0, 200, 0, GUI_HEIGHT)
 ExclusionPanel.AnchorPoint = Vector2.new(0.5, 0.5)
-ExclusionPanel.Position = UDim2.new(0.5, -GUI_WIDTH/2 - 12 - 100, 0.45, 0)
+ExclusionPanel.Position = UDim2.new(0.5, -GUI_WIDTH/2 - 12 - 100, 0.45, 0) -- left side of main
 ExclusionPanel.BackgroundColor3 = Color3.fromRGB(30,30,30)
 ExclusionPanel.BorderSizePixel = 0
 ExclusionPanel.Visible = false
-ExclusionPanel.Parent = ScreenGui
+ExclusionPanel.Parent = getPlayerGui()
 
 local exclTitle = Instance.new("TextLabel")
 exclTitle.Size = UDim2.new(1, -8, 0, 22)
@@ -594,16 +621,16 @@ exclList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     exclScroll.CanvasSize = UDim2.new(0,0,0, exclList.AbsoluteContentSize.Y + 8)
 end)
 
--- Features panel (right)
+-- Features panel (right of main; kept compact)
 local FeaturesPanel = Instance.new("Frame")
 FeaturesPanel.Name = "FeaturesPanel"
 FeaturesPanel.Size = UDim2.new(0, 220, 0, GUI_HEIGHT)
 FeaturesPanel.AnchorPoint = Vector2.new(0.5, 0.5)
-FeaturesPanel.Position = UDim2.new(0.5, GUI_WIDTH/2 + 12 + 100, 0.45, 0)
+FeaturesPanel.Position = UDim2.new(0.5, GUI_WIDTH/2 + 12 + 100, 0.45, 0) -- right side of main (moved farther away to avoid touching)
 FeaturesPanel.BackgroundColor3 = Color3.fromRGB(30,30,30)
 FeaturesPanel.BorderSizePixel = 0
 FeaturesPanel.Visible = false
-FeaturesPanel.Parent = ScreenGui
+FeaturesPanel.Parent = getPlayerGui()
 
 local featTitle = Instance.new("TextLabel")
 featTitle.Size = UDim2.new(1, -8, 0, 22)
@@ -615,8 +642,9 @@ featTitle.TextColor3 = Color3.new(1,1,1)
 featTitle.Text = "Type Features"
 featTitle.Parent = FeaturesPanel
 
+-- Make the features scroll smaller on Y so it doesn't block quick adjust controls
 local featScroll = Instance.new("ScrollingFrame")
-featScroll.Size = UDim2.new(1, -12, 1, - 160)
+featScroll.Size = UDim2.new(1, -12, 1, - 160) -- reduced Y height (was -110)
 featScroll.Position = UDim2.new(0,6,0,36)
 featScroll.BackgroundTransparency = 1
 featScroll.ScrollBarThickness = 6
@@ -626,6 +654,7 @@ featList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     featScroll.CanvasSize = UDim2.new(0,0,0, featList.AbsoluteContentSize.Y + 8)
 end)
 
+-- compact organized inputs (more consistent layout)
 local function makeSmallLabel(parent, text, posY)
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.5, -6, 0, 18)
@@ -664,7 +693,7 @@ local function makeSmallLoopBtn(parent, posY)
     return btn
 end
 
--- Features inputs
+-- Organized feature inputs (removed Heal & HPNaN)
 local speedLabel_feat = makeSmallLabel(FeaturesPanel, "Speed (type)", -80)
 local speedInput_feat = makeSmallInput(FeaturesPanel, "16", -80)
 local speedLoop_feat = makeSmallLoopBtn(FeaturesPanel, -80)
@@ -681,6 +710,7 @@ local flingLabel_feat = makeSmallLabel(FeaturesPanel, "Fling Pwr", -128)
 local flingInput_feat = makeSmallInput(FeaturesPanel, "200", -128)
 local flingLoop_feat = makeSmallLoopBtn(FeaturesPanel, -128)
 
+-- helper row creation (compact)
 local function makeRow(parent, text)
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(1, 0, 0, BTN_H)
@@ -709,13 +739,14 @@ local function makeRow(parent, text)
     return btn, small
 end
 
--- Controls & Utilities
+-- Controls & Utilities (compact rows)
 local killBtn, killLoopBtn = makeRow(ctrlScroll, "Kill All")
 local flingBoxRow = Instance.new("Frame"); flingBoxRow.Size = UDim2.new(1,0,0,BTN_H); flingBoxRow.BackgroundTransparency = 1; flingBoxRow.Parent = ctrlScroll
 local flingBox = Instance.new("TextBox"); flingBox.Size = UDim2.new(0.56,0,1,0); flingBox.Position = UDim2.new(0,0,0,0); flingBox.PlaceholderText = "Fling"; flingBox.Text = "200"; flingBox.BackgroundColor3 = Color3.fromRGB(50,50,50); flingBox.TextColor3 = Color3.new(1,1,1); flingBox.BorderSizePixel = 0; flingBox.Font = Enum.Font.Gotham; flingBox.TextSize = SMALL_FONT; flingBox.Parent = flingBoxRow
 local flingBtn = Instance.new("TextButton"); flingBtn.Size = UDim2.new(0.42, -6, 1, 0); flingBtn.Position = UDim2.new(0.56, 6, 0, 0); flingBtn.BackgroundColor3 = Color3.fromRGB(100,50,50); flingBtn.BorderSizePixel = 0; flingBtn.Font = Enum.Font.Gotham; flingBtn.TextSize = SMALL_FONT; flingBtn.TextColor3 = Color3.new(1,1,1); flingBtn.Text = "Fling"; flingBtn.Parent = flingBoxRow
 local flingLoopBtn = Instance.new("TextButton"); flingLoopBtn.Size = UDim2.new(0.32,0,1,0); flingLoopBtn.Position = UDim2.new(0.68, 6, 0, 0); flingLoopBtn.BackgroundColor3 = Color3.fromRGB(40,40,40); flingLoopBtn.BorderSizePixel = 0; flingLoopBtn.Font = Enum.Font.Gotham; flingLoopBtn.TextSize = 11; flingLoopBtn.TextColor3 = Color3.new(1,1,1); flingLoopBtn.Text = "Loop: Off"; flingLoopBtn.Parent = flingBoxRow
 
+-- Kill+Fling controls (new row placed below the fling row)
 local killFlingFrame = Instance.new("Frame"); killFlingFrame.Size = UDim2.new(1,0,0,BTN_H); killFlingFrame.BackgroundTransparency = 1; killFlingFrame.Parent = ctrlScroll
 local killFlingBtn = Instance.new("TextButton"); killFlingBtn.Size = UDim2.new(0.66,0,1,0); killFlingBtn.Position = UDim2.new(0,0,0,0); killFlingBtn.BackgroundColor3 = Color3.fromRGB(70,30,30); killFlingBtn.BorderSizePixel = 0; killFlingBtn.Font = Enum.Font.Gotham; killFlingBtn.TextSize = SMALL_FONT; killFlingBtn.TextColor3 = Color3.new(1,1,1); killFlingBtn.Text = "Kill+Fling"; killFlingBtn.Parent = killFlingFrame
 local killFlingLoopBtn = Instance.new("TextButton"); killFlingLoopBtn.Size = UDim2.new(0.32,0,1,0); killFlingLoopBtn.Position = UDim2.new(0.68, 6, 0, 0); killFlingLoopBtn.BackgroundColor3 = Color3.fromRGB(40,40,40); killFlingLoopBtn.BorderSizePixel = 0; killFlingLoopBtn.Font = Enum.Font.Gotham; killFlingLoopBtn.TextSize = 11; killFlingLoopBtn.TextColor3 = Color3.new(1,1,1); killFlingLoopBtn.Text = "Loop: Off"; killFlingLoopBtn.Parent = killFlingFrame
@@ -725,50 +756,6 @@ local sitBtn, sitLoopBtn = makeRow(ctrlScroll, "Sit")
 local anchorBtn, anchorLoopBtn = makeRow(ctrlScroll, "Anchor")
 local cancelChaseBtn, cancelChaseLoopBtn = makeRow(ctrlScroll, "Cancel-Chase")
 
--- Here: ClickKill UI controls (restored)
-local clickToolFrame = Instance.new("Frame")
-clickToolFrame.Size = UDim2.new(1,0,0,BTN_H)
-clickToolFrame.BackgroundTransparency = 1
-clickToolFrame.Parent = ctrlScroll
-
-local clickToolCreateBtn = Instance.new("TextButton")
-clickToolCreateBtn.Size = UDim2.new(0.5, -4, 1, 0)
-clickToolCreateBtn.Position = UDim2.new(0, 0, 0, 0)
-clickToolCreateBtn.BackgroundColor3 = Color3.fromRGB(60,60,120)
-clickToolCreateBtn.BorderSizePixel = 0
-clickToolCreateBtn.Font = Enum.Font.Gotham
-clickToolCreateBtn.TextSize = SMALL_FONT
-clickToolCreateBtn.TextColor3 = Color3.new(1,1,1)
-clickToolCreateBtn.Text = "Create ClickKill Tool Now"
-clickToolCreateBtn.Parent = clickToolFrame
-
-local clickToolToggleBtn = Instance.new("TextButton")
-clickToolToggleBtn.Size = UDim2.new(0.5, -4, 1, 0)
-clickToolToggleBtn.Position = UDim2.new(0.5, 8, 0, 0)
-clickToolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58)
-clickToolToggleBtn.BorderSizePixel = 0
-clickToolToggleBtn.Font = Enum.Font.Gotham
-clickToolToggleBtn.TextSize = SMALL_FONT
-clickToolToggleBtn.TextColor3 = Color3.new(1,1,1)
-clickToolToggleBtn.Text = "Click-Fling: Off"
-clickToolToggleBtn.Parent = clickToolFrame
-
--- Create On Respawn toggle (restored)
-local clickToolRespawnFrame = Instance.new("Frame")
-clickToolRespawnFrame.Size = UDim2.new(1,0,0,BTN_H)
-clickToolRespawnFrame.BackgroundTransparency = 1
-clickToolRespawnFrame.Parent = ctrlScroll
-
-local clickToolRespawnToggle = Instance.new("TextButton")
-clickToolRespawnToggle.Size = UDim2.new(1,0,1,0)
-clickToolRespawnToggle.BackgroundColor3 = Color3.fromRGB(48,48,48)
-clickToolRespawnToggle.BorderSizePixel = 0
-clickToolRespawnToggle.Font = Enum.Font.Gotham
-clickToolRespawnToggle.TextSize = SMALL_FONT
-clickToolRespawnToggle.TextColor3 = Color3.new(1,1,1)
-clickToolRespawnToggle.Text = "Create On Respawn: Off"
-clickToolRespawnToggle.Parent = clickToolRespawnFrame
-
 -- Void v4 global control
 local v4Btn, v4LoopBtn = makeRow(ctrlScroll, "Void v4 (global)")
 
@@ -777,7 +764,7 @@ local eraseBtn, eraseLoopBtn = makeRow(utilScroll, "Erase")
 local spasmBtn, spasmLoopBtn = makeRow(utilScroll, "Spasm")
 local jumpBtn, jumpLoopBtn = makeRow(utilScroll, "Jump")
 
--- Advanced global controls
+-- Advanced global controls (compact)
 local speedGlobalFrame = Instance.new("Frame"); speedGlobalFrame.Size = UDim2.new(1,0,0,BTN_H); speedGlobalFrame.BackgroundTransparency = 1; speedGlobalFrame.Parent = advScroll
 local speedGlobalBox = Instance.new("TextBox"); speedGlobalBox.Size = UDim2.new(0.62,0,1,0); speedGlobalBox.Position = UDim2.new(0,0,0,0); speedGlobalBox.Text = "16"; speedGlobalBox.PlaceholderText = "Global Speed"; speedGlobalBox.BackgroundColor3 = Color3.fromRGB(50,50,50); speedGlobalBox.TextColor3 = Color3.new(1,1,1); speedGlobalBox.BorderSizePixel = 0; speedGlobalBox.Font = Enum.Font.Gotham; speedGlobalBox.TextSize = SMALL_FONT; speedGlobalBox.Parent = speedGlobalFrame
 local speedGlobalLoop = Instance.new("TextButton"); speedGlobalLoop.Size = UDim2.new(0.34,0,1,0); speedGlobalLoop.Position = UDim2.new(0.63,6,0,0); speedGlobalLoop.BackgroundColor3 = Color3.fromRGB(40,40,40); speedGlobalLoop.BorderSizePixel = 0; speedGlobalLoop.Font = Enum.Font.Gotham; speedGlobalLoop.TextSize = 11; speedGlobalLoop.TextColor3 = Color3.new(1,1,1); speedGlobalLoop.Text = "Loop: Off"; speedGlobalLoop.Parent = speedGlobalFrame
@@ -801,8 +788,10 @@ trackerToggleBtn.TextColor3 = Color3.new(1,1,1)
 trackerToggleBtn.Text = "Toggle NPC Tracker"
 trackerToggleBtn.Parent = trackerFrame
 
--- LocalScript click-kill tool integration (robust)
-local backpack = player:WaitForChild("Backpack")
+-- LocalScript click-kill tool integration
+-- We'll implement createClickKillTool() and setCreateClickKillOnRespawn() using your provided tool script
+-- plus an equip GUI to configure Click-Kill fling power and toggle.
+
 local createClickKillOnRespawn = false
 local clickToolConn = nil
 
@@ -810,23 +799,65 @@ local clickToolConn = nil
 local clickToolFlingEnabled = false
 local clickToolFlingPower = 200
 
+-- We'll create a GUI that appears when the tool is equipped.
 local function ensureClickKillGui()
-    local existing = PlayerGui:FindFirstChild("NPCKillToolGUI")
+    -- If already exists, return it
+    local pg = getPlayerGui()
+    if not pg then return nil end
+    local existing = pg:FindFirstChild("NPCKillToolGUI")
     if existing and existing:IsA("ScreenGui") then return existing end
 
     local sg = Instance.new("ScreenGui")
     sg.Name = "NPCKillToolGUI"
     sg.ResetOnSpawn = false
-    sg.Parent = PlayerGui
+    sg.Parent = pg
     sg.Enabled = false
 
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(0, 220, 0, 80)
-    frame.Position = UDim2.new(0, 10, 0.5, -40)
+    -- Start on left side, middle of the screen
+    frame.Position = UDim2.new(0, 8, 0.5, -40)
     frame.AnchorPoint = Vector2.new(0, 0)
     frame.BackgroundColor3 = Color3.fromRGB(30,30,30)
     frame.BorderSizePixel = 0
     frame.Parent = sg
+
+    -- Make frame draggable: manual dragging for cross-platform
+    frame.Active = true -- allow input
+    local dragging = false
+    local dragInput = nil
+    local dragStart = nil
+    local startPos = nil
+
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragInput = input
+            dragStart = input.Position
+            startPos = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    dragInput = nil
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging and dragStart and startPos then
+            local delta = input.Position - dragStart
+            -- Convert startPos to pixel offsets and apply delta
+            local newX = startPos.X.Offset + delta.X
+            local newY = startPos.Y.Offset + delta.Y
+            -- clamp to screen bounds approximately
+            local screenW = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.X or 1920
+            local screenH = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.Y or 1080
+            newX = math.clamp(newX, 0, screenW - frame.AbsoluteSize.X)
+            newY = math.clamp(newY, 0, screenH - frame.AbsoluteSize.Y)
+            frame.Position = UDim2.new(0, newX, 0, newY)
+        end
+    end)
 
     local title = Instance.new("TextLabel")
     title.Size = UDim2.new(1, -8, 0, 20)
@@ -870,6 +901,7 @@ local function ensureClickKillGui()
     toggleBtn.Text = "Click-Kill Fling: Off"
     toggleBtn.Parent = frame
 
+    -- Wire up interactions
     pBox.FocusLost:Connect(function()
         local v = tonumber(pBox.Text)
         if v then
@@ -884,63 +916,17 @@ local function ensureClickKillGui()
         toggleBtn.Text = "Click-Kill Fling: " .. (clickToolFlingEnabled and "On" or "Off")
     end)
 
-    do
-        local dragging = false
-        local dragInput = nil
-        local dragStart = nil
-        local startPos = nil
-
-        frame.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                dragStart = input.Position
-                startPos = frame.Position
-                input.Changed:Connect(function()
-                    if input.UserInputState == Enum.UserInputState.End then
-                        dragging = false
-                    end
-                end)
-            end
-        end)
-
-        UserInputService.InputChanged:Connect(function(input)
-            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-                local delta = input.Position - dragStart
-                local newX = startPos.X.Offset + delta.X
-                local newY = startPos.Y.Offset + delta.Y
-                frame.Position = UDim2.new(startPos.X.Scale, newX, startPos.Y.Scale, newY)
-            end
-        end)
-    end
-
     return sg
 end
 
--- Create click-kill tool (robust duplication/orphan handling)
 local function createClickKillTool()
-    local function findExistingAndBackpack()
-        local bp = player:FindFirstChild("Backpack") or backpack
-        local char = player.Character
-        local existing = nil
-        if bp then existing = bp:FindFirstChild("NPCKillTool") end
-        if not existing and char then existing = char:FindFirstChild("NPCKillTool") end
-        if not existing then existing = player:FindFirstChild("NPCKillTool") end
-        return existing, bp
-    end
+    -- look up backpack dynamically (avoid stale reference)
+    local bp = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack")
+    if not bp then return end
 
-    local existing, bp = findExistingAndBackpack()
-
-    if existing and existing.Parent and (existing.Parent == bp or existing.Parent == player.Character) then
-        return
-    end
-
-    if existing and (not existing.Parent or (existing.Parent ~= bp and existing.Parent ~= player.Character)) then
-        pcall(function() existing:Destroy() end)
-    end
-
-    bp = bp or player:FindFirstChild("Backpack") or player:WaitForChild("Backpack")
-
+    -- avoid duplicates in backpack OR character
     if bp:FindFirstChild("NPCKillTool") then return end
+    if player.Character and player.Character:FindFirstChild("NPCKillTool") then return end
 
     local tool = Instance.new("Tool")
     tool.Name = "NPCKillTool"
@@ -967,14 +953,15 @@ local function createClickKillTool()
         return nil
     end
 
+    -- Ensure equip GUI is prepared (hidden)
     local gui = ensureClickKillGui()
-
+    -- equipped/unequipped show/hide GUI
     tool.Equipped:Connect(function()
-        local sg = PlayerGui:FindFirstChild("NPCKillToolGUI")
+        local sg = getPlayerGui() and getPlayerGui():FindFirstChild("NPCKillToolGUI")
         if sg then sg.Enabled = true end
     end)
     tool.Unequipped:Connect(function()
-        local sg = PlayerGui:FindFirstChild("NPCKillToolGUI")
+        local sg = getPlayerGui() and getPlayerGui():FindFirstChild("NPCKillToolGUI")
         if sg then sg.Enabled = false end
     end)
 
@@ -988,16 +975,17 @@ local function createClickKillTool()
 
         local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
         if humanoid then
-            pcall(function() humanoid.Health = 0 end)
-            pcall(function() humanoid.Health = 1 end)
-            pcall(function() humanoid.Health = 0 end)
-
+            -- If click-kill fling enabled, kill then fling
             if clickToolFlingEnabled then
+                -- Kill
+                pcall(function() humanoid.Health = 0 end)
+                -- compute fling velocity away from local player
                 local playerPos = nil
                 if player.Character and player.Character.PrimaryPart then
                     pcall(function() playerPos = player.Character.PrimaryPart.Position end)
                 end
                 local pwr = tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200
+                -- apply velocity to all parts away from player
                 iterateParts(npcModel, function(p)
                     if p and p:IsA("BasePart") and not p.Anchored then
                         pcall(function()
@@ -1018,6 +1006,11 @@ local function createClickKillTool()
                         end)
                     end
                 end)
+            else
+                -- Default simple kill sequence if fling not enabled
+                pcall(function() humanoid.Health = 0 end)
+                pcall(function() humanoid.Health = 1 end)
+                pcall(function() humanoid.Health = 0 end)
             end
         end
     end)
@@ -1025,34 +1018,8 @@ end
 
 local function onCharacterAddedForTool(char)
     if createClickKillOnRespawn then
-        -- wait a bit to allow Backpack/Character to fully initialize
-        task.wait(0.5)
-
-        -- ensure backpack reference (non-blocking)
-        backpack = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack")
-
-        -- Remove any orphaned NPCKillTool that's not in Backpack or the current Character
-        pcall(function()
-            -- check under the player (covers tools parented directly under player or other odd parents)
-            for _,inst in ipairs(player:GetDescendants()) do
-                if inst:IsA("Tool") and inst.Name == "NPCKillTool" then
-                    local par = inst.Parent
-                    if par ~= backpack and par ~= player.Character then
-                        pcall(function() inst:Destroy() end)
-                    end
-                end
-            end
-
-            -- also defensively remove any stray NPCKillTool in Workspace (leftover from odd scripts)
-            for _,inst in ipairs(Workspace:GetDescendants()) do
-                if inst:IsA("Tool") and inst.Name == "NPCKillTool" then
-                    -- if it's parented to Backpack/Character this will be skipped above; safe to destroy otherwise
-                    pcall(function() inst:Destroy() end)
-                end
-            end
-        end)
-
-        -- attempt to create (createClickKillTool already avoids duplicates in Backpack)
+        -- small delay to ensure Backpack exists
+        task.wait(0.1)
         createClickKillTool()
     end
 end
@@ -1064,7 +1031,9 @@ local function setCreateClickKillOnRespawn(enabled)
         clickToolConn = nil
     end
     if enabled then
+        -- create on next respawn
         clickToolConn = player.CharacterAdded:Connect(onCharacterAddedForTool)
+        -- Only create on future respawn per requirement (do not create immediately)
     end
 end
 
@@ -1097,8 +1066,527 @@ trackerToggleBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- (the rest of the UI wiring, type pages, loops, and heartbeat remain untouched from original file)
--- Per your request: everything else is exactly as in the uploaded file; only the onCharacterAddedForTool function above was changed.
+-- per-type page builders (cached)
+local function ensureTypeLeftPage(typeName)
+    if typeLeftPages[typeName] then return typeLeftPages[typeName] end
+    local page = Instance.new("Frame")
+    page.Size = UDim2.new(1,0,0, 220)
+    page.BackgroundTransparency = 1
+    page.Visible = false
+    page.Parent = leftPanel
+    local layout = Instance.new("UIListLayout"); layout.Parent = page; layout.SortOrder = Enum.SortOrder.LayoutOrder; layout.Padding = UDim.new(0,4)
+
+    local pad = Instance.new("Frame"); pad.Size = UDim2.new(1,0,0,6); pad.BackgroundTransparency = 1; pad.Parent = page
+
+    local btnTrack = makeLeftBtnText("Track/Untrack Type"); btnTrack.Parent = page
+    local btnKill = makeLeftBtnText("Kill Type"); btnKill.Parent = page
+    local btnFling = makeLeftBtnText("Fling Type"); btnFling.Parent = page
+    local btnErase = makeLeftBtnText("Erase Type"); btnErase.Parent = page
+    local btnV4 = makeLeftBtnText("Void v4 Type"); btnV4.Parent = page
+    local btnAnchor = makeLeftBtnText("Toggle Anchor Type"); btnAnchor.Parent = page
+    local btnWhitelist = makeLeftBtnText("Whitelist (exclusions)"); btnWhitelist.Parent = page
+
+    btnTrack.MouseButton1Click:Connect(function()
+        if not selectedType then return end
+        trackedTypes[selectedType] = not trackedTypes[selectedType]
+        btnTrack.Text = trackedTypes[selectedType] and "Untrack This Type" or "Track/Untrack This Type"
+        if trackedTypes[selectedType] then
+            for _,m in ipairs(getNPCsByName(selectedType)) do
+                if not trackedNPCs[m] and (not excluded[selectedType] or not excluded[selectedType]["Tracker"]) then addTrackerToModel(m) end
+            end
+        else
+            for _,m in ipairs(getNPCsByName(selectedType)) do removeTrackerFromModel(m) end
+        end
+    end)
+
+    btnKill.MouseButton1Click:Connect(function()
+        if not selectedType then return end
+        if excluded[selectedType] and excluded[selectedType]["Kill"] then return end
+        killAllSimultaneousForList(getNPCsByName(selectedType))
+    end)
+
+    btnFling.MouseButton1Click:Connect(function()
+        if not selectedType then return end
+        if excluded[selectedType] and excluded[selectedType]["Fling"] then return end
+        local p = tonumber(flingBox.Text) or 200
+        for _,m in ipairs(getNPCsByName(selectedType)) do pcall(function() flingModel(m,p) end) end
+    end)
+
+    btnErase.MouseButton1Click:Connect(function()
+        if not selectedType then return end
+        if excluded[selectedType] and excluded[selectedType]["Erase"] then return end
+        for _,m in ipairs(getNPCsByName(selectedType)) do pcall(function() eraseModel(m) end) end
+    end)
+
+    btnV4.MouseButton1Click:Connect(function()
+        if not selectedType then return end
+        if excluded[selectedType] and excluded[selectedType]["VoidV4"] then return end
+        for _,m in ipairs(getNPCsByName(selectedType)) do pcall(function() voidV4Model(m) end) end
+    end)
+
+    btnAnchor.MouseButton1Click:Connect(function()
+        if not selectedType then return end
+        if excluded[selectedType] and excluded[selectedType]["Anchor"] then return end
+        for _,m in ipairs(getNPCsByName(selectedType)) do pcall(function() toggleAnchor(m) end) end
+    end)
+
+    btnWhitelist.MouseButton1Click:Connect(function()
+        if not selectedType then return end
+        exclTitle.Text = "Exclusions for: " .. selectedType
+        if not excluded[selectedType] then excluded[selectedType] = {} end
+
+        local pageEx = typeExclPages[selectedType]
+        if pageEx then
+            for _,p in pairs(typeExclPages) do p.Visible = false end
+            pageEx.Visible = true
+            ExclusionPanel.Visible = true
+        else
+            local exPage = Instance.new("Frame")
+            exPage.Size = UDim2.new(1,0,0, #EFFECTS * (BTN_H + 6))
+            exPage.BackgroundTransparency = 1
+            exPage.Visible = true
+            exPage.Parent = exclScroll
+            local exLayout = Instance.new("UIListLayout"); exLayout.Parent = exPage; exLayout.SortOrder = Enum.SortOrder.LayoutOrder; exLayout.Padding = UDim.new(0,4)
+            for _,eff in ipairs(EFFECTS) do
+                local row = Instance.new("Frame"); row.Size = UDim2.new(1,0,0,BTN_H); row.BackgroundTransparency = 1; row.Parent = exPage
+                local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1,0,1,0); btn.Position = UDim2.new(0,0,0,0);
+                btn.BackgroundColor3 = (excluded[selectedType][eff] and Color3.fromRGB(60,180,75) or Color3.fromRGB(58,58,58))
+                btn.BorderSizePixel = 0; btn.Font = Enum.Font.Gotham; btn.TextSize = SMALL_FONT; btn.TextColor3 = Color3.new(1,1,1); btn.Text = eff .. (excluded[selectedType][eff] and " (excluded)" or ""); btn.Parent = row
+                btn.MouseButton1Click:Connect(function()
+                    excluded[selectedType][eff] = not excluded[selectedType][eff]
+                    btn.BackgroundColor3 = (excluded[selectedType][eff] and Color3.fromRGB(60,180,75) or Color3.fromRGB(58,58,58))
+                    btn.Text = eff .. (excluded[selectedType][eff] and " (excluded)" or "")
+                    if eff == "Tracker" and excluded[selectedType][eff] then
+                        for _,m in ipairs(getNPCsByName(selectedType)) do removeTrackerFromModel(m) end
+                        trackedTypes[selectedType] = nil
+                    end
+                    if eff == "Speed" and excluded[selectedType][eff] then stopLoop("speed_"..selectedType) end
+                    if eff == "JumpPower" and excluded[selectedType][eff] then stopLoop("jp_"..selectedType) end
+                end)
+            end
+            for _,p in pairs(typeExclPages) do p.Visible = false end
+            typeExclPages[selectedType] = exPage
+            ExclusionPanel.Visible = true
+            exPage:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+                exclScroll.CanvasSize = UDim2.new(0,0,0, exPage.AbsoluteSize.Y + 8)
+            end)
+        end
+    end)
+
+    typeLeftPages[typeName] = page
+    return page
+end
+
+local function ensureTypeFeaturePage(typeName)
+    if typeFeaturePages[typeName] then return typeFeaturePages[typeName] end
+    local page = Instance.new("Frame")
+    page.Size = UDim2.new(1,0,0, 40 + (#EFFECTS * (BTN_H + 6)))
+    page.BackgroundTransparency = 1
+    page.Visible = false
+    page.Parent = featScroll
+    local layout = Instance.new("UIListLayout"); layout.Parent = page; layout.SortOrder = Enum.SortOrder.LayoutOrder; layout.Padding = UDim.new(0,4)
+
+    for _,eff in ipairs(EFFECTS) do
+        local row = Instance.new("Frame"); row.Size = UDim2.new(1,0,0,BTN_H); row.BackgroundTransparency = 1; row.Parent = page
+        local btn = Instance.new("TextButton"); btn.Size = UDim2.new(0.5,0,1,0); btn.Position = UDim2.new(0,0,0,0); btn.BackgroundColor3 = Color3.fromRGB(58,58,58); btn.BorderSizePixel = 0; btn.Font = Enum.Font.Gotham; btn.TextSize = SMALL_FONT; btn.TextColor3 = Color3.new(1,1,1); btn.Text = eff; btn.Parent = row
+        local small
+        local input = nil
+        local hasTextbox = (eff == "Speed" or eff == "JumpPower" or eff == "HipHeight" or eff == "Fling")
+        if eff ~= "Tracker" then
+            small = Instance.new("TextButton"); small.Size = UDim2.new(0.48,0,1,0); small.Position = UDim2.new(0.52,6,0,0); small.BackgroundColor3 = Color3.fromRGB(40,40,40); small.BorderSizePixel = 0; small.Font = Enum.Font.Gotham; small.TextSize = 11; small.TextColor3 = Color3.new(1,1,1); small.Text = "Loop: Off"; small.Parent = row
+        else
+            small = Instance.new("TextLabel"); small.Size = UDim2.new(0.48,0,1,0); small.Position = UDim2.new(0.52,6,0,0); small.BackgroundTransparency = 1; small.Font = Enum.Font.Gotham; small.TextSize = 11; small.TextColor3 = Color3.new(1,1,1); small.Text = "(tracker scan)"; small.Parent = row
+        end
+
+        if hasTextbox then
+            input = Instance.new("TextBox"); input.Size = UDim2.new(0.28,0,1,0); input.Position = UDim2.new(0.52,6,0,0); input.BackgroundColor3 = Color3.fromRGB(50,50,50); input.TextColor3 = Color3.new(1,1,1); input.Font = Enum.Font.Gotham; input.TextSize = SMALL_FONT; input.ClearTextOnFocus = false
+            if eff == "Speed" then input.Text = "16"
+            elseif eff == "JumpPower" then input.Text = "50"
+            elseif eff == "HipHeight" then input.Text = "2"
+            elseif eff == "Fling" then input.Text = tostring(flingBox.Text or "200")
+            else input.Text = "" end
+            input.Parent = row
+            if small and small:IsA("TextButton") then small.Position = UDim2.new(0.8,6,0,0) end
+        end
+
+        btn.MouseButton1Click:Connect(function()
+            if not selectedType then return end
+            local list = getNPCsByName(selectedType)
+            if eff == "Kill" then killAllSimultaneousForList(list)
+            elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
+            elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
+            elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
+            elseif eff == "Anchor" then for _,m in ipairs(list) do toggleAnchor(m) end
+            elseif eff == "CancelChase" then for _,m in ipairs(list) do cancelChaseForModel(m) end
+            elseif eff == "GetRid" then for _,m in ipairs(list) do local p = getBestPartForModel(m) if p then p.CFrame = CFrame.new(9e37,9e37,9e37) end end
+            elseif eff == "Erase" then for _,m in ipairs(list) do eraseModel(m) end
+            elseif eff == "Spasm" then for _,m in ipairs(list) do spasmModel(m) end
+            elseif eff == "Jump" then for _,m in ipairs(list) do jumpModel(m) end
+            elseif eff == "VoidV4" then for _,m in ipairs(list) do voidV4Model(m) end
+            elseif eff == "Speed" then local v = tonumber(input and input.Text) or 16 for _,m in ipairs(list) do setSpeed(m, v) end
+            elseif eff == "JumpPower" then local v = tonumber(input and input.Text) or 50 for _,m in ipairs(list) do setJumpPower(m, v) end
+            elseif eff == "HipHeight" then local v = tonumber(input and input.Text) or 2 for _,m in ipairs(list) do setHipHeight(m, v) end
+            elseif eff == "Tracker" then
+                if excluded[selectedType] and excluded[selectedType]["Tracker"] then return end
+                for _,m in ipairs(list) do
+                    if trackedNPCs[m] then removeTrackerFromModel(m) else addTrackerToModel(m) end
+                end
+            end
+        end)
+
+        if small and small:IsA("TextButton") then
+            small.MouseButton1Click:Connect(function()
+                if not selectedType then return end
+                local key = string.format("%s_%s", eff, selectedType)
+                loops[key] = not loops[key]
+                small.Text = "Loop: " .. (loops[key] and "On" or "Off")
+                if loops[key] then
+                    startLoop(key, function()
+                        if excluded[selectedType] and excluded[selectedType][eff] then return end
+                        local list = getNPCsByName(selectedType)
+                        if eff == "Kill" then killAllSimultaneousForList(list)
+                        elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
+                        elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
+                        elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
+                        elseif eff == "Anchor" then for _,m in ipairs(list) do toggleAnchor(m) end
+                        elseif eff == "CancelChase" then for _,m in ipairs(list) do cancelChaseForModel(m) end
+                        elseif eff == "GetRid" then for _,m in ipairs(list) do local p = getBestPartForModel(m) if p then p.CFrame = CFrame.new(9e37,9e37,9e37) end end
+                        elseif eff == "Erase" then for _,m in ipairs(list) do eraseModel(m) end
+                        elseif eff == "Spasm" then for _,m in ipairs(list) do spasmModel(m) end
+                        elseif eff == "Jump" then for _,m in ipairs(list) do jumpModel(m) end
+                        elseif eff == "VoidV4" then for _,m in ipairs(list) do voidV4Model(m) end
+                        elseif eff == "Speed" then local v = tonumber(input and input.Text) or 16 for _,m in ipairs(list) do setSpeed(m, v) end
+                        elseif eff == "JumpPower" then local v = tonumber(input and input.Text) or 50 for _,m in ipairs(list) do setJumpPower(m, v) end
+                        elseif eff == "HipHeight" then local v = tonumber(input and input.Text) or 2 for _,m in ipairs(list) do setHipHeight(m, v) end
+                        end
+                    end)
+                else
+                    stopLoop(key)
+                end
+            end)
+        end
+
+        if input then
+            input.FocusLost:Connect(function()
+                if not selectedType then return end
+                local list = getNPCsByName(selectedType)
+                if eff == "Speed" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["Speed"]) then for _,m in ipairs(list) do setSpeed(m, v) end end
+                elseif eff == "JumpPower" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["JumpPower"]) then for _,m in ipairs(list) do setJumpPower(m, v) end end
+                elseif eff == "HipHeight" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["HipHeight"]) then for _,m in ipairs(list) do setHipHeight(m, v) end end
+                elseif eff == "Fling" then local p = tonumber(input.Text) or tonumber(flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m, p) end) end
+                end
+            end)
+        end
+    end
+
+    page:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        featScroll.CanvasSize = UDim2.new(0,0,0, page.AbsoluteSize.Y + 8)
+    end)
+
+    typeFeaturePages[typeName] = page
+    return page
+end
+
+local function showTypeUI(typeName, count)
+    if prevSelectedType and prevSelectedType ~= typeName then
+        stopAllTypeLoops(prevSelectedType)
+    end
+    prevSelectedType = typeName
+    selectedType = typeName
+
+    for _,p in pairs(typeLeftPages) do p.Visible = false end
+    leftPanel.Visible = true
+    leftTitle.Text = "Type: " .. typeName .. " [" .. tostring(count) .. "]"
+    local leftP = ensureTypeLeftPage(typeName)
+    leftP.Visible = true
+
+    for _,p in pairs(typeFeaturePages) do p.Visible = false end
+    local featP = ensureTypeFeaturePage(typeName)
+    featP.Visible = true
+    featTitle.Text = "Features: " .. typeName
+    FeaturesPanel.Visible = true
+
+    for _,p in pairs(typeExclPages) do p.Visible = false end
+    if typeExclPages[typeName] then typeExclPages[typeName].Visible = false end
+    ExclusionPanel.Visible = false
+end
+
+local function rebuildGroupedList()
+    for _, child in ipairs(groupScroll:GetChildren()) do if child:IsA("Frame") then child:Destroy() end end
+    local counts = {}
+    for model,_ in pairs(NPCs) do
+        if model and model.Parent and isNPC(model) then
+            counts[model.Name] = (counts[model.Name] or 0) + 1
+        end
+    end
+    for name, count in pairs(counts) do
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1,0,0,BTN_H)
+        frame.BackgroundTransparency = 1
+        frame.Parent = groupScroll
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0.6,0,1,0)
+        btn.Position = UDim2.new(0,0,0,0)
+        btn.BackgroundColor3 = Color3.fromRGB(58,58,58)
+        btn.BorderSizePixel = 0
+        btn.Font = Enum.Font.Gotham
+        btn.TextSize = SMALL_FONT
+        btn.TextColor3 = Color3.new(1,1,1)
+        btn.Text = string.format("%s [%d]", name, count)
+        btn.Parent = frame
+        local info = Instance.new("TextLabel")
+        info.Size = UDim2.new(0.38, 0, 1, 0)
+        info.Position = UDim2.new(0.62, 6, 0, 0)
+        info.BackgroundTransparency = 1
+        info.Font = Enum.Font.Gotham
+        info.TextSize = 11
+        info.TextColor3 = Color3.new(1,1,1)
+        info.Text = "Select"
+        info.Parent = frame
+
+        btn.MouseButton1Click:Connect(function()
+            showTypeUI(name, count)
+        end)
+    end
+end
+
+-- Main UI behaviors & loops (compact)
+killBtn.MouseButton1Click:Connect(function() killAllSimultaneousForList(getNPCsArray()) end)
+killLoopBtn.MouseButton1Click:Connect(function()
+    loops.killAll = not loops.killAll
+    killLoopBtn.Text = "Loop: " .. (loops.killAll and "On" or "Off")
+    if loops.killAll then startLoop("killAll", function() killAllSimultaneousForList(getNPCsArray()) end) else stopLoop("killAll") end
+end)
+
+flingBtn.MouseButton1Click:Connect(function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end)
+flingLoopBtn.MouseButton1Click:Connect(function() loops.flingAll = not loops.flingAll; flingLoopBtn.Text = "Loop: " .. (loops.flingAll and "On" or "Off"); if loops.flingAll then startLoop("flingAll", function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end) else stopLoop("flingAll") end end)
+
+-- Kill+Fling behavior: kills and then flings all NPCs using flingBox value
+killFlingBtn.MouseButton1Click:Connect(function()
+    local p = tonumber(flingBox.Text) or 200
+    for _,m in ipairs(getNPCsArray()) do
+        if isAllowed(m, "Kill") then
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            if hum then
+                pcall(function() hum.Health = 0 end)
+            end
+        end
+        pcall(function() flingModel(m, p) end)
+    end
+end)
+killFlingLoopBtn.MouseButton1Click:Connect(function()
+    loops.killFlingAll = not loops.killFlingAll
+    killFlingLoopBtn.Text = "Loop: " .. (loops.killFlingAll and "On" or "Off")
+    if loops.killFlingAll then
+        startLoop("killFlingAll", function()
+            local p = tonumber(flingBox.Text) or 200
+            for _,m in ipairs(getNPCsArray()) do
+                pcall(function()
+                    if isAllowed(m, "Kill") then
+                        local hum = m:FindFirstChildOfClass("Humanoid")
+                        if hum then pcall(function() hum.Health = 0 end) end
+                    end
+                    flingModel(m, p)
+                end)
+            end
+        end)
+    else
+        stopLoop("killFlingAll")
+    end
+end)
+
+psBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do platformStand(m) end end)
+psLoopBtn.MouseButton1Click:Connect(function() loops.ps = not loops.ps; psLoopBtn.Text = "Loop: " .. (loops.ps and "On" or "Off"); if loops.ps then startLoop("ps", function() for _,m in ipairs(getNPCsArray()) do platformStand(m) end end) else stopLoop("ps") end end)
+
+sitBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do makeSit(m) end end)
+sitLoopBtn.MouseButton1Click:Connect(function() loops.sit = not loops.sit; sitLoopBtn.Text = "Loop: " .. (loops.sit and "On" or "Off"); if loops.sit then startLoop("sit", function() for _,m in ipairs(getNPCsArray()) do makeSit(m) end end) else stopLoop("sit") end end)
+
+anchorBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do toggleAnchor(m) end end)
+anchorLoopBtn.MouseButton1Click:Connect(function() loops.anchor = not loops.anchor; anchorLoopBtn.Text = "Loop: " .. (loops.anchor and "On" or "Off"); if loops.anchor then startLoop("anchor", function() for _,m in ipairs(getNPCsArray()) do toggleAnchor(m) end end) else stopLoop("anchor") end end)
+
+cancelChaseBtn.MouseButton1Click:Connect(function() cancelChaseEnabled = not cancelChaseEnabled; cancelChaseBtn.Text = "Cancel-Chase: "..tostring(cancelChaseEnabled) end)
+
+-- Void v4 handlers (global)
+v4Btn.MouseButton1Click:Connect(function()
+    for _,m in ipairs(getNPCsArray()) do
+        if isAllowed(m,"VoidV4") then pcall(function() voidV4Model(m) end) end
+    end
+end)
+v4LoopBtn.MouseButton1Click:Connect(function()
+    loops.v4 = not loops.v4
+    v4LoopBtn.Text = "Loop: "..(loops.v4 and "On" or "Off")
+    if loops.v4 then
+        -- use -5000 when loop is on
+        startLoop("v4", function() for _,m in ipairs(getNPCsArray()) do if isAllowed(m,"VoidV4") then pcall(function() voidV4Model(m, -5000) end) end end end)
+    else
+        stopLoop("v4")
+    end
+end)
+
+getRidBtn.MouseButton1Click:Connect(function()
+    for _,m in ipairs(getNPCsArray()) do
+        if isAllowed(m, "GetRid") then
+            local hrp = getBestPartForModel(m)
+            if hrp and player.Character and player.Character.PrimaryPart then
+                local playerPos = player.Character.PrimaryPart.Position
+                local dist = (hrp.Position - playerPos).Magnitude
+                local closer = true
+                for _,plr in ipairs(Players:GetPlayers()) do
+                    if plr ~= player and plr.Character and plr.Character.PrimaryPart then
+                        local d = (hrp.Position - plr.Character.PrimaryPart.Position).Magnitude
+                        if d < dist then closer = false break end
+                    end
+                end
+                if closer then pcall(function() hrp.CFrame = CFrame.new(9e37,9e37,9e37) end) end
+            end
+        end
+    end
+end)
+getRidLoop.MouseButton1Click:Connect(function() loops.getRid = not loops.getRid; getRidLoop.Text = "Loop: "..(loops.getRid and "On" or "Off"); if loops.getRid then startLoop("getRid", function() for _,m in ipairs(getNPCsArray()) do pcall(function() if isAllowed(m,"GetRid") then local hrp = getBestPartForModel(m) if hrp then hrp.CFrame = CFrame.new(9e37,9e37,9e37) end end end) end end) else stopLoop("getRid") end end)
+
+eraseBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do eraseModel(m) end end)
+eraseLoopBtn.MouseButton1Click:Connect(function() loops.erase = not loops.erase; eraseLoopBtn.Text = "Loop: "..(loops.erase and "On" or "Off"); if loops.erase then startLoop("erase", function() for _,m in ipairs(getNPCsArray()) do eraseModel(m) end end) else stopLoop("erase") end end)
+
+spasmBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do spasmModel(m) end end)
+spasmLoopBtn.MouseButton1Click:Connect(function() loops.spasm = not loops.spasm; spasmLoopBtn.Text = "Loop: "..(loops.spasm and "On" or "Off"); if loops.spasm then startLoop("spasm", function() for _,m in ipairs(getNPCsArray()) do spasmModel(m) end end) else stopLoop("spasm") end end)
+
+jumpBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do jumpModel(m) end end)
+jumpLoopBtn.MouseButton1Click:Connect(function() loops.jump = not loops.jump; jumpLoopBtn.Text = "Loop: "..(loops.jump and "On" or "Off"); if loops.jump then startLoop("jump", function() for _,m in ipairs(getNPCsArray()) do jumpModel(m) end end) else stopLoop("jump") end end)
+
+hipLoop.MouseButton1Click:Connect(function() loops.hip = not loops.hip; hipLoop.Text = "Loop: "..(loops.hip and "On" or "Off"); if loops.hip then startLoop("hip", function() local v = tonumber(hipBox.Text) or 2 for _,m in ipairs(getNPCsArray()) do setHipHeight(m, v) end end) else stopLoop("hip") end end)
+
+-- global speed/jump
+speedGlobalLoop.MouseButton1Click:Connect(function()
+    loops["speed_global"] = not loops["speed_global"]
+    speedGlobalLoop.Text = "Loop: "..(loops["speed_global"] and "On" or "Off")
+    if loops["speed_global"] then
+        startLoop("speed_global", function()
+            local v = tonumber(speedGlobalBox.Text) or 16
+            for _,m in ipairs(getNPCsArray()) do setSpeed(m, v) end
+        end)
+    else
+        stopLoop("speed_global")
+    end
+end)
+speedGlobalBox.FocusLost:Connect(function()
+    local v = tonumber(speedGlobalBox.Text)
+    if v then for _,m in ipairs(getNPCsArray()) do setSpeed(m, v) end end
+end)
+
+jumpGlobalLoop.MouseButton1Click:Connect(function()
+    loops["jump_global"] = not loops["jump_global"]
+    jumpGlobalLoop.Text = "Loop: "..(loops["jump_global"] and "On" or "Off")
+    if loops["jump_global"] then
+        startLoop("jump_global", function()
+            local v = tonumber(jumpGlobalBox.Text) or 50
+            for _,m in ipairs(getNPCsArray()) do setJumpPower(m, v) end
+        end)
+    else
+        stopLoop("jump_global")
+    end
+end)
+jumpGlobalBox.FocusLost:Connect(function()
+    local v = tonumber(jumpGlobalBox.Text)
+    if v then for _,m in ipairs(getNPCsArray()) do setJumpPower(m, v) end end
+end)
+
+-- Click-Kill Tool creation toggle UI (placed in advanced panel)
+local toolToggleFrame = Instance.new("Frame"); toolToggleFrame.Size = UDim2.new(1,0,0,BTN_H); toolToggleFrame.BackgroundTransparency = 1; toolToggleFrame.Parent = advScroll
+local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.Parent = toolToggleFrame
+local toolToggleClear = Instance.new("TextButton"); toolToggleClear.Size = UDim2.new(0.32,0,1,0); toolToggleClear.Position = UDim2.new(0.66,6,0,0); toolToggleClear.BackgroundColor3 = Color3.fromRGB(40,40,40); toolToggleClear.BorderSizePixel = 0; toolToggleClear.Font = Enum.Font.Gotham; toolToggleClear.TextSize = 11; toolToggleClear.TextColor3 = Color3.new(1,1,1); toolToggleClear.Text = "Create Now"; toolToggleClear.Parent = toolToggleFrame
+
+toolToggleBtn.MouseButton1Click:Connect(function()
+    setCreateClickKillOnRespawn(not createClickKillOnRespawn)
+    toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: " .. (createClickKillOnRespawn and "On" or "Off")
+end)
+toolToggleClear.MouseButton1Click:Connect(function()
+    createClickKillTool()
+end)
+
+-- HEARTBEAT: scanning, cancel-chase, tracker updates
+do
+    local acc = 0
+    local lastCountsHash = ""
+    local function hashCounts()
+        local counts = {}
+        for m,_ in pairs(NPCs) do
+            if m and m.Parent and isNPC(m) then counts[m.Name] = (counts[m.Name] or 0) + 1 end
+        end
+        local items = {}
+        for k,v in pairs(counts) do table.insert(items, k..":"..v) end
+        table.sort(items)
+        return table.concat(items, "|")
+    end
+
+    RunService.Heartbeat:Connect(function(dt)
+        acc = acc + dt
+        if acc >= SCAN_INTERVAL then
+            acc = 0
+            scanAddNPCs()
+            cleanNPCs()
+            CounterLabel.Text = "NPCs: " .. tostring(#getNPCsArray())
+            local h = hashCounts()
+            if h ~= lastCountsHash then
+                lastCountsHash = h
+                rebuildGroupedList()
+            end
+            -- Only add tracked type trackers when tracker scan is enabled
+            if trackerScanRunning then
+                for t,_ in pairs(trackedTypes) do
+                    for _,m in ipairs(getNPCsByName(t)) do
+                        if not trackedNPCs[m] and (not excluded[t] or not excluded[t]["Tracker"]) then addTrackerToModel(m) end
+                    end
+                end
+            end
+        end
+        if cancelChaseEnabled then
+            for model,_ in pairs(NPCs) do
+                if model and model.Parent and isNPC(model) then pcall(function() cancelChaseForModel(model) end) end
+            end
+        end
+        updateAllTrackers()
+    end)
+end
+
+-- Tabs show/hide (compact)
+local function showTab(name)
+    controlsFrame.Visible = false
+    utilitiesFrame.Visible = false
+    advancedFrame.Visible = false
+    whitelistFrame.Visible = false
+    leftPanel.Visible = false
+    FeaturesPanel.Visible = false
+    ExclusionPanel.Visible = false
+    if name == "Controls" then controlsFrame.Visible = true
+    elseif name == "Utilities" then utilitiesFrame.Visible = true
+    elseif name == "Advanced" then advancedFrame.Visible = true
+    elseif name == "Whitelist" then whitelistFrame.Visible = true; rebuildGroupedList() end
+end
+tabControlsBtn.MouseButton1Click:Connect(function() showTab("Controls") end)
+tabUtilitiesBtn.MouseButton1Click:Connect(function() showTab("Utilities") end)
+tabAdvancedBtn.MouseButton1Click:Connect(function() showTab("Advanced") end)
+tabWhitelistBtn.MouseButton1Click:Connect(function() showTab("Whitelist") end)
+
+-- SMALL TOGGLE open/close (Visible toggles only)
+local isOpen = false
+SmallToggle.MouseButton1Click:Connect(function()
+    isOpen = not isOpen
+    if isOpen then
+        SmallToggle.Text = "X"
+        MainFrame.Visible = true
+        Content.Visible = true
+        local targetSize = UDim2.new(0, GUI_WIDTH, 0, GUI_HEIGHT)
+        TweenService:Create(MainFrame, TweenInfo.new(0.18, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), { Size = targetSize }):Play()
+        showTab("Controls")
+    else
+        SmallToggle.Text = "NPC"
+        MainFrame.Visible = false
+        Content.Visible = false
+        ExclusionPanel.Visible = false
+        FeaturesPanel.Visible = false
+        leftPanel.Visible = false
+    end
+end)
 
 -- Defensive trackedNPCs cleanup (handles orphan cases)
 task.spawn(function()
@@ -1114,17 +1602,56 @@ end)
 
 -- Ensure trackers remain attached or cleaned after respawn
 player.CharacterAdded:Connect(function(char)
+    -- reparent / re-create trackers into the new PlayerGui if necessary
+    local pg = getPlayerGui()
     for m,_ in pairs(trackedNPCs) do
-        if trackedNPCs[m] then
-            local data = trackedNPCs[m]
-            if data and data.gui and data.adornee and data.adornee.Parent then
-                data.gui.Adornee = data.adornee
-                data.gui.Parent = PlayerGui
-                data.highlight.Parent = PlayerGui
+        local data = trackedNPCs[m]
+        if data then
+            local okGui = data.gui and data.gui.Parent and data.gui.Adornee and data.gui.Adornee.Parent
+            local okHighlight = data.highlight and data.highlight.Parent
+            -- if both gui and highlight still exist and adornee part is valid, reparent to current PlayerGui
+            if (okGui or okHighlight) then
+                if data.gui and pg then
+                    pcall(function() data.gui.Parent = pg end)
+                end
+                if data.highlight and pg then
+                    pcall(function() data.highlight.Parent = pg end)
+                end
             else
+                -- gui/highlight were destroyed (likely due to PlayerGui recreation). Remove and recreate tracker.
                 removeTrackerFromModel(m)
+                -- if Tracker is allowed for this model's type, re-add
+                if m and m.Parent and not (excluded[m.Name] and excluded[m.Name]["Tracker"]) then
+                    addTrackerToModel(m)
+                end
             end
         end
+    end
+end)
+
+-- Also watch PlayerGui being removed/added (defensive): when PlayerGui is recreated, reattach or recreate trackers
+player.ChildAdded:Connect(function(child)
+    if child.Name == "PlayerGui" then
+        -- small delay to allow other ScreenGuis to be created
+        task.delay(0.1, function()
+            local pg = getPlayerGui()
+            -- reattach existing trackers to new PlayerGui or recreate
+            for m,_ in pairs(trackedNPCs) do
+                local data = trackedNPCs[m]
+                if data then
+                    if data.gui and data.gui.Parent then
+                        pcall(function() data.gui.Parent = pg end)
+                    elseif data.highlight and data.highlight.Parent then
+                        pcall(function() data.highlight.Parent = pg end)
+                    else
+                        removeTrackerFromModel(m)
+                        if m and m.Parent and not (excluded[m.Name] and excluded[m.Name]["Tracker"]) then
+                            addTrackerToModel(m)
+                        end
+                    end
+                end
+            end
+        end)
     end
 end)
 
