@@ -37,7 +37,7 @@ local trackerScanRunning = false
 setmetatable(NPCs, { __mode = "k" })
 setmetatable(trackedNPCs, { __mode = "k" })
 
--- EFFECTS list (removed "Void" and "Void3"; added "VoidV4"; removed Heal and HPNaN)
+-- EFFECTS list (removed Heal and HPNaN)
 local EFFECTS = {
     "Kill","Fling","PlatformStand","Sit","Anchor","CancelChase","GetRid","Erase",
     "Spasm","Jump","Speed","JumpPower","HipHeight","Tracker","VoidV4"
@@ -268,7 +268,7 @@ local function voidV4Model(model, yVelocity)
 end
 
 -- TRACKER & HIGHLIGHT
--- removeTrackerFromModel forward-decl for use in Workspace.DescendantRemoving above
+-- removeTrackerFromModel forward-decl for use in various places
 function removeTrackerFromModel(model)
     local data = trackedNPCs[model]
     if data then
@@ -286,9 +286,7 @@ function removeTrackerFromModel(model)
 end
 
 local function clearOrphanTrackersForModel(model)
-    -- robustly remove any leftover billboard/highlight in PlayerGui that refer to this model's adornee/Adornee being part
     if not model then return end
-    local part = getBestPartForModel(model)
     for _,g in ipairs(PlayerGui:GetDescendants()) do
         if g:IsA("BillboardGui") and g.Name == "NPCTracker" then
             local ador = g.Adornee
@@ -309,17 +307,44 @@ local function addTrackerToModel(model)
     if not model then return end
     if not isAllowed(model, "Tracker") then return end
 
-    -- if a tracker exists for this model, remove it first (prevents duplicates)
+    -- If already tracked by our table, ensure no duplicates
     if trackedNPCs[model] then
-        removeTrackerFromModel(model)
+        return
     end
 
-    -- also destroy any orphaned GUIs/highlights in PlayerGui that point to the model
+    -- Remove any orphaned existing GUIs/highlights that point to this model (defensive)
     clearOrphanTrackersForModel(model)
 
     local part = getBestPartForModel(model)
     if not part then return end
 
+    -- Prevent creating a new gui if PlayerGui already has one adorning this model (extra defense)
+    for _,g in ipairs(PlayerGui:GetDescendants()) do
+        if g:IsA("BillboardGui") and g.Name == "NPCTracker" then
+            local ador = g.Adornee
+            if ador and ador:IsDescendantOf(model) then
+                -- already exists; tie it into trackedNPCs so our cleanup/disconnect logic works
+                local label = nil
+                for _,child in ipairs(g:GetChildren()) do
+                    if child:IsA("TextLabel") then label = child; break end
+                end
+                local highlightFound = nil
+                for _,h in ipairs(PlayerGui:GetDescendants()) do
+                    if h:IsA("Highlight") and h.Name == "NPCHighlight" then
+                        local ador2 = h.Adornee
+                        if ador2 and (ador2 == model or ador2:IsDescendantOf(model)) then
+                            highlightFound = h
+                            break
+                        end
+                    end
+                end
+                trackedNPCs[model] = { gui = g, label = label, highlight = highlightFound, adornee = part, conns = {} }
+                return
+            end
+        end
+    end
+
+    -- create billboard GUI
     local gui = Instance.new("BillboardGui")
     gui.Name = "NPCTracker"
     gui.Size = UDim2.new(0,140,0,32)
@@ -335,37 +360,36 @@ local function addTrackerToModel(model)
     label.TextColor3 = Color3.new(1,1,1)
     label.Font = Enum.Font.Code
     label.TextScaled = true
+    label.Text = model.Name
     label.Parent = gui
 
+    -- create highlight (client-only)
     local highlight = Instance.new("Highlight")
     highlight.Name = "NPCHighlight"
     highlight.Adornee = model
-    highlight.Parent = PlayerGui
     highlight.FillTransparency = 1
     highlight.OutlineColor = Color3.fromRGB(80,200,120)
     highlight.OutlineTransparency = 0
+    highlight.Parent = PlayerGui -- keep it client-side and consistent with BillboardGui
 
     -- track cleanup connections
     local conns = {}
-    -- remove tracker if Humanoid dies
     local hum = model:FindFirstChildOfClass("Humanoid")
     if hum then
         table.insert(conns, hum.Died:Connect(function()
             removeTrackerFromModel(model)
         end))
     end
-    -- remove if model leaves workspace / gets parented away
     table.insert(conns, model.AncestryChanged:Connect(function(_, parent)
         if not model:IsDescendantOf(Workspace) then
             removeTrackerFromModel(model)
         end
     end))
 
-    -- store
     trackedNPCs[model] = { gui = gui, label = label, highlight = highlight, adornee = part, conns = conns }
 end
 
--- updateAllTrackers: now removes trackers for invalid positions (void teleport) and dead/humanoid-less models
+-- updateAllTrackers: removes trackers for invalid positions (void teleport) and dead/humanoid-less models
 local function updateAllTrackers()
     local playerPos = player.Character and player.Character.PrimaryPart and player.Character.PrimaryPart.Position
     for model,data in pairs(trackedNPCs) do
@@ -376,13 +400,13 @@ local function updateAllTrackers()
             if not part then
                 removeTrackerFromModel(model)
             else
-                -- sanity checks: remove tracker if model is no longer in Workspace
+                -- remove if model is no longer in Workspace
                 if not model:IsDescendantOf(Workspace) then
                     removeTrackerFromModel(model)
                 else
                     -- remove if humanoid dead or missing
                     local hum = model:FindFirstChildOfClass("Humanoid")
-                    if (hum == nil) or (hum.Health ~= hum.Health) or (hum.Health and hum.Health <= 0) then
+                    if (hum == nil) or (hum.Health and hum.Health <= 0) then
                         removeTrackerFromModel(model)
                     else
                         -- remove if adornee position is extreme or NaN (teleported to absurd coords)
@@ -394,9 +418,8 @@ local function updateAllTrackers()
                             if maxAbs > 1e6 then
                                 removeTrackerFromModel(model)
                             else
-                                -- optionally remove if teleport to origin AND model far from any players (avoids deleting legit origin NPCs)
-                                if pos == Vector3.new(0,0,0) then
-                                    -- check if any player is near that origin part (if none, it's likely a void teleport residue)
+                                -- handle common "teleported to origin" residue: if position is exactly 0,0,0 and no player is nearby -> remove
+                                if pos.X == 0 and pos.Y == 0 and pos.Z == 0 then
                                     local nearAny = false
                                     for _,plr in ipairs(Players:GetPlayers()) do
                                         if plr.Character and plr.Character.PrimaryPart then
@@ -873,11 +896,10 @@ local function setCreateClickKillOnRespawn(enabled)
     if enabled then
         -- create on next respawn
         clickToolConn = player.CharacterAdded:Connect(function()
-            -- small delay to ensure Backpack exists
             task.wait(0.1)
             createClickKillTool()
         end)
-        -- Note: per your previous comment, do not create immediately if the character already exists.
+        -- do not create immediately if character already exists (per requirement)
     end
 end
 
@@ -910,7 +932,6 @@ end
 trackerToggleBtn.MouseButton1Click:Connect(function()
     if trackerScanRunning then
         stopTrackerScan()
-        -- remove any tracked trackers
         for m,_ in pairs(trackedNPCs) do removeTrackerFromModel(m) end
         trackerToggleBtn.Text = "Toggle NPC Tracker"
     else
@@ -1415,7 +1436,7 @@ player.CharacterAdded:Connect(function(char)
             if data and data.gui and data.adornee and data.adornee.Parent then
                 data.gui.Adornee = data.adornee
                 data.gui.Parent = PlayerGui
-                data.highlight.Parent = PlayerGui
+                if data.highlight then data.highlight.Parent = PlayerGui end
             else
                 removeTrackerFromModel(m)
             end
