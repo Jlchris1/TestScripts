@@ -1,4 +1,4 @@
--- Unified NPC GUI (full script) - updated: smaller text in Click-Kill equip GUI
+-- Unified NPC GUI (full script) - updated final: Click-Kill respawn button now TextScaled = true
 -- Place as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
@@ -815,7 +815,7 @@ local function ensureClickKillGui()
     title.Position = UDim2.new(0, 4, 0, 4)
     title.BackgroundTransparency = 1
     title.Font = Enum.Font.GothamBold
-    title.TextSize = 12 -- reduced to fit
+    title.TextSize = 14
     title.TextColor3 = Color3.new(1,1,1)
     title.Text = "NPCKill Tool - Click Fling"
     title.Parent = frame
@@ -825,7 +825,7 @@ local function ensureClickKillGui()
     pLabel.Position = UDim2.new(0, 4, 0, 28)
     pLabel.BackgroundTransparency = 1
     pLabel.Font = Enum.Font.Gotham
-    pLabel.TextSize = 11 -- reduced
+    pLabel.TextSize = 12
     pLabel.TextColor3 = Color3.new(1,1,1)
     pLabel.Text = "Fling Power"
     pLabel.Parent = frame
@@ -838,7 +838,7 @@ local function ensureClickKillGui()
     pBox.BackgroundColor3 = Color3.fromRGB(50,50,50)
     pBox.TextColor3 = Color3.new(1,1,1)
     pBox.Font = Enum.Font.Gotham
-    pBox.TextSize = 11 -- reduced
+    pBox.TextSize = 12
     pBox.ClearTextOnFocus = false
     pBox.Parent = frame
 
@@ -847,10 +847,9 @@ local function ensureClickKillGui()
     toggleBtn.Position = UDim2.new(0, 4, 0, 56)
     toggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58)
     toggleBtn.Font = Enum.Font.Gotham
-    toggleBtn.TextSize = 11 -- reduced
+    toggleBtn.TextSize = 12
     toggleBtn.TextColor3 = Color3.new(1,1,1)
     toggleBtn.Text = "Click-Kill Fling: Off"
-    toggleBtn.TextWrapped = true
     toggleBtn.Parent = frame
 
     -- Wire up interactions
@@ -1467,7 +1466,7 @@ end)
 
 -- Click-Kill Tool creation toggle UI (placed in advanced panel)
 local toolToggleFrame = Instance.new("Frame"); toolToggleFrame.Size = UDim2.new(1,0,0,BTN_H); toolToggleFrame.BackgroundTransparency = 1; toolToggleFrame.Parent = advScroll
-local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.Parent = toolToggleFrame
+local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.TextScaled = true; toolToggleBtn.Parent = toolToggleFrame
 local toolToggleClear = Instance.new("TextButton"); toolToggleClear.Size = UDim2.new(0.32,0,1,0); toolToggleClear.Position = UDim2.new(0.66,6,0,0); toolToggleClear.BackgroundColor3 = Color3.fromRGB(40,40,40); toolToggleClear.BorderSizePixel = 0; toolToggleClear.Font = Enum.Font.Gotham; toolToggleClear.TextSize = 11; toolToggleClear.TextColor3 = Color3.new(1,1,1); toolToggleClear.Text = "Create Now"; toolToggleClear.Parent = toolToggleFrame
 
 toolToggleBtn.MouseButton1Click:Connect(function()
