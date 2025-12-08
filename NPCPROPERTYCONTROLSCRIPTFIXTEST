@@ -1,6 +1,5 @@
--- Unified NPC GUI (full script)
--- Features: NPC scanning, per-type controls, trackers, and a Click-Kill Tool + Void v4 feature
--- Note: This is a single-file LocalScript meant to be placed in a LocalScript context (e.g., StarterPlayerScripts)
+-- Unified NPC GUI (single LocalScript)
+-- Place in StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -38,7 +37,7 @@ local trackerScanRunning = false
 setmetatable(NPCs, { __mode = "k" })
 setmetatable(trackedNPCs, { __mode = "k" })
 
--- EFFECTS list (removed "Void" and "Void3"; added "VoidV4"; removed "Heal" and "HPNaN")
+-- EFFECTS list (removed "Void" and "Void3"; added "VoidV4"; removed Heal and HPNaN)
 local EFFECTS = {
     "Kill","Fling","PlatformStand","Sit","Anchor","CancelChase","GetRid","Erase",
     "Spasm","Jump","Speed","JumpPower","HipHeight","Tracker","VoidV4"
@@ -251,138 +250,175 @@ local function cancelChaseForModel(model)
 end
 
 -- Void v4: PlatformStand, disable collisions, apply Y velocity (default -500)
--- supports optional velocity argument (so loop can pass -5000)
-local function voidV4Model(model, vel)
+local function voidV4Model(model, yVelocity)
     if not isAllowed(model, "VoidV4") then return end
-    vel = vel or -500
+    yVelocity = tonumber(yVelocity) or -500
     local hum = model and model:FindFirstChildOfClass("Humanoid")
     if hum then pcall(function() hum.PlatformStand = true end) end
     iterateParts(model, function(p)
         pcall(function()
             p.CanCollide = false
             if p.AssemblyLinearVelocity ~= nil then
-                p.AssemblyLinearVelocity = Vector3.new(0, vel, 0)
+                p.AssemblyLinearVelocity = Vector3.new(0, yVelocity, 0)
             else
-                p.Velocity = Vector3.new(0, vel, 0)
+                p.Velocity = Vector3.new(0, yVelocity, 0)
             end
         end)
     end)
 end
 
 -- TRACKER & HIGHLIGHT
-local function addTrackerToModel(model)
-    if not model then return end
-    if not isAllowed(model, "Tracker") then return end
-
-    -- Prevent double creation (reserve slot immediately)
-    if trackedNPCs[model] then return end
-    trackedNPCs[model] = true  -- reserve to prevent duplicate creations
-
-    local part = getBestPartForModel(model)
-    if not part then
-        trackedNPCs[model] = nil
-        return
-    end
-
-    local success, gui = pcall(function()
-        local g = Instance.new("BillboardGui")
-        g.Name = "NPCTracker"
-        g.Size = UDim2.new(0,140,0,32)
-        g.StudsOffset = Vector3.new(0,1.5,0)
-        g.AlwaysOnTop = true
-        g.Adornee = part
-        g.Parent = PlayerGui
-
-        local label = Instance.new("TextLabel")
-        label.Size = UDim2.new(1,-4,1,-4)
-        label.Position = UDim2.new(0,2,0,2)
-        label.BackgroundTransparency = 1
-        label.TextColor3 = Color3.new(1,1,1)
-        label.Font = Enum.Font.Code
-        label.TextScaled = true
-        label.Parent = g
-
-        local highlight = Instance.new("Highlight")
-        highlight.Name = "NPCHighlight"
-        highlight.Adornee = model
-        highlight.Parent = PlayerGui
-        highlight.FillTransparency = 1
-        highlight.OutlineColor = Color3.fromRGB(80,200,120)
-        highlight.OutlineTransparency = 0
-
-        return { gui = g, label = label, highlight = highlight, adornee = part }
-    end)
-
-    if not success or not gui then
-        trackedNPCs[model] = nil
-        return
-    end
-
-    -- Connect cleanup listeners so if NPC dies or is removed we remove the tracker
-    local conns = {}
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if hum then
-        table.insert(conns, hum.Died:Connect(function()
-            pcall(function() removeTrackerFromModel(model) end)
-        end))
-    end
-    table.insert(conns, model.AncestryChanged:Connect(function()
-        if not model.Parent then
-            pcall(function() removeTrackerFromModel(model) end)
-        end
-    end))
-
-    gui.connections = conns
-    trackedNPCs[model] = gui
-end
-
+-- removeTrackerFromModel forward-decl for use in Workspace.DescendantRemoving above
 function removeTrackerFromModel(model)
     local data = trackedNPCs[model]
-    if not data then return end
-    -- if we reserved with boolean earlier, allow safe removal
-    if type(data) == "boolean" then
-        trackedNPCs[model] = nil
-        return
-    end
-    if data.gui then pcall(function() data.gui:Destroy() end) end
-    if data.highlight then pcall(function() data.highlight:Destroy() end) end
-    if data.connections and type(data.connections) == "table" then
-        for _,c in ipairs(data.connections) do
-            pcall(function() c:Disconnect() end)
+    if data then
+        -- disconnect tracked connections
+        if data.conns then
+            for _,c in pairs(data.conns) do
+                pcall(function() c:Disconnect() end)
+            end
+            data.conns = nil
         end
+        if data.gui then pcall(function() data.gui:Destroy() end) end
+        if data.highlight then pcall(function() data.highlight:Destroy() end) end
     end
     trackedNPCs[model] = nil
 end
 
+local function clearOrphanTrackersForModel(model)
+    -- robustly remove any leftover billboard/highlight in PlayerGui that refer to this model's adornee/Adornee being part
+    if not model then return end
+    local part = getBestPartForModel(model)
+    for _,g in ipairs(PlayerGui:GetDescendants()) do
+        if g:IsA("BillboardGui") and g.Name == "NPCTracker" then
+            local ador = g.Adornee
+            if ador and ador:IsDescendantOf(model) then
+                pcall(function() g:Destroy() end)
+            end
+        end
+        if g:IsA("Highlight") and g.Name == "NPCHighlight" then
+            local ador = g.Adornee
+            if ador and (ador == model or ador:IsDescendantOf(model)) then
+                pcall(function() g:Destroy() end)
+            end
+        end
+    end
+end
+
+local function addTrackerToModel(model)
+    if not model then return end
+    if not isAllowed(model, "Tracker") then return end
+
+    -- if a tracker exists for this model, remove it first (prevents duplicates)
+    if trackedNPCs[model] then
+        removeTrackerFromModel(model)
+    end
+
+    -- also destroy any orphaned GUIs/highlights in PlayerGui that point to the model
+    clearOrphanTrackersForModel(model)
+
+    local part = getBestPartForModel(model)
+    if not part then return end
+
+    local gui = Instance.new("BillboardGui")
+    gui.Name = "NPCTracker"
+    gui.Size = UDim2.new(0,140,0,32)
+    gui.StudsOffset = Vector3.new(0,1.5,0)
+    gui.AlwaysOnTop = true
+    gui.Adornee = part
+    gui.Parent = PlayerGui
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1,-4,1,-4)
+    label.Position = UDim2.new(0,2,0,2)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.new(1,1,1)
+    label.Font = Enum.Font.Code
+    label.TextScaled = true
+    label.Parent = gui
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "NPCHighlight"
+    highlight.Adornee = model
+    highlight.Parent = PlayerGui
+    highlight.FillTransparency = 1
+    highlight.OutlineColor = Color3.fromRGB(80,200,120)
+    highlight.OutlineTransparency = 0
+
+    -- track cleanup connections
+    local conns = {}
+    -- remove tracker if Humanoid dies
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum then
+        table.insert(conns, hum.Died:Connect(function()
+            removeTrackerFromModel(model)
+        end))
+    end
+    -- remove if model leaves workspace / gets parented away
+    table.insert(conns, model.AncestryChanged:Connect(function(_, parent)
+        if not model:IsDescendantOf(Workspace) then
+            removeTrackerFromModel(model)
+        end
+    end))
+
+    -- store
+    trackedNPCs[model] = { gui = gui, label = label, highlight = highlight, adornee = part, conns = conns }
+end
+
+-- updateAllTrackers: now removes trackers for invalid positions (void teleport) and dead/humanoid-less models
 local function updateAllTrackers()
     local playerPos = player.Character and player.Character.PrimaryPart and player.Character.PrimaryPart.Position
     for model,data in pairs(trackedNPCs) do
-        -- if reserved placeholder or data missing, skip or cleanup
-        if not data or type(data) == "boolean" then
-            if not model or not model.Parent or not isNPC(model) then trackedNPCs[model] = nil end
-            goto continue
-        end
-
-        local part = getBestPartForModel(model)
-        -- Destroy tracker if model removed, part gone, or part in the void (huge coordinates)
-        local shouldRemove = false
-        if not model.Parent then shouldRemove = true end
-        if not part or not part.Parent then shouldRemove = true end
-        if part and part:IsA("BasePart") then
-            local pos = part.Position
-            if not pos or (math.abs(pos.X) > 1e6 or math.abs(pos.Y) > 1e6 or math.abs(pos.Z) > 1e6) then
-                -- likely teleported to the void coordinates (9e37) or otherwise invalid => remove
-                shouldRemove = true
+        if not model or not model.Parent or not data then
+            removeTrackerFromModel(model)
+        else
+            local part = getBestPartForModel(model)
+            if not part then
+                removeTrackerFromModel(model)
+            else
+                -- sanity checks: remove tracker if model is no longer in Workspace
+                if not model:IsDescendantOf(Workspace) then
+                    removeTrackerFromModel(model)
+                else
+                    -- remove if humanoid dead or missing
+                    local hum = model:FindFirstChildOfClass("Humanoid")
+                    if (hum == nil) or (hum.Health ~= hum.Health) or (hum.Health and hum.Health <= 0) then
+                        removeTrackerFromModel(model)
+                    else
+                        -- remove if adornee position is extreme or NaN (teleported to absurd coords)
+                        local ok, pos = pcall(function() return part.Position end)
+                        if not ok or not pos or (type(pos) ~= "Vector3") then
+                            removeTrackerFromModel(model)
+                        else
+                            local maxAbs = math.max(math.abs(pos.X), math.abs(pos.Y), math.abs(pos.Z))
+                            if maxAbs > 1e6 then
+                                removeTrackerFromModel(model)
+                            else
+                                -- optionally remove if teleport to origin AND model far from any players (avoids deleting legit origin NPCs)
+                                if pos == Vector3.new(0,0,0) then
+                                    -- check if any player is near that origin part (if none, it's likely a void teleport residue)
+                                    local nearAny = false
+                                    for _,plr in ipairs(Players:GetPlayers()) do
+                                        if plr.Character and plr.Character.PrimaryPart then
+                                            local d = (plr.Character.PrimaryPart.Position - pos).Magnitude
+                                            if d < 100 then nearAny = true; break end
+                                        end
+                                    end
+                                    if not nearAny then removeTrackerFromModel(model) end
+                                end
+                            end
+                        end
+                    end
+                end
             end
         end
-        if shouldRemove then
-            removeTrackerFromModel(model)
-            goto continue
-        end
+    end
 
+    -- update labels for surviving trackers
+    for model,data in pairs(trackedNPCs) do
         if data and data.label and model.Parent then
             local hum = model:FindFirstChildOfClass("Humanoid")
-            local hrp = part
+            local hrp = data.adornee
             local dist = 0
             if playerPos and hrp then dist = (hrp.Position - playerPos).Magnitude end
             if hum then
@@ -391,7 +427,6 @@ local function updateAllTrackers()
                     model.Name, hum.Health or 0, hum.WalkSpeed or 0, jp, dist)
             end
         end
-        ::continue::
     end
 end
 
@@ -528,8 +563,7 @@ local advScroll,_ = makeScroll(advancedFrame, 34)
 
 -- Whitelist left: group list on center area, selected-type (left) is now a compact scroll panel placed LEFT of main GUI
 local groupScroll = Instance.new("ScrollingFrame")
--- resize so it doesn't overlap with features panel on the right (left room for 220px FeaturesPanel)
-groupScroll.Size = UDim2.new(1, - (140 + 20 + 220), 1, - 72)
+groupScroll.Size = UDim2.new(1, - (140 + 20), 1, - 72)
 groupScroll.Position = UDim2.new(0, 146, 0, 36)
 groupScroll.BackgroundTransparency = 1
 groupScroll.ScrollBarThickness = 6
@@ -673,14 +707,22 @@ local function makeSmallLoopBtn(parent, posY)
     return btn
 end
 
--- Organized feature inputs (only Speed and JumpPower now)
-local speedLabel_feat = makeSmallLabel(FeaturesPanel, "Speed (type)", -40)
-local speedInput_feat = makeSmallInput(FeaturesPanel, "16", -40)
-local speedLoop_feat = makeSmallLoopBtn(FeaturesPanel, -40)
+-- Organized feature inputs (removed Heal)
+local speedLabel_feat = makeSmallLabel(FeaturesPanel, "Speed (type)", -80)
+local speedInput_feat = makeSmallInput(FeaturesPanel, "16", -80)
+local speedLoop_feat = makeSmallLoopBtn(FeaturesPanel, -80)
 
-local jpLabel_feat = makeSmallLabel(FeaturesPanel, "Jump (type)", -14)
-local jpInput_feat = makeSmallInput(FeaturesPanel, "50", -14)
-local jpLoop_feat = makeSmallLoopBtn(FeaturesPanel, -14)
+local jpLabel_feat = makeSmallLabel(FeaturesPanel, "Jump (type)", -56)
+local jpInput_feat = makeSmallInput(FeaturesPanel, "50", -56)
+local jpLoop_feat = makeSmallLoopBtn(FeaturesPanel, -56)
+
+local hipLabel_feat = makeSmallLabel(FeaturesPanel, "Hip (type)", -32)
+local hipInput_feat = makeSmallInput(FeaturesPanel, "2", -32)
+local hipLoop_feat = makeSmallLoopBtn(FeaturesPanel, -32)
+
+local flingLabel_feat = makeSmallLabel(FeaturesPanel, "Fling Pwr", -128)
+local flingInput_feat = makeSmallInput(FeaturesPanel, "200", -128)
+local flingLoop_feat = makeSmallLoopBtn(FeaturesPanel, -128)
 
 -- helper row creation (compact)
 local function makeRow(parent, text)
@@ -713,17 +755,10 @@ end
 
 -- Controls & Utilities (compact rows)
 local killBtn, killLoopBtn = makeRow(ctrlScroll, "Kill All")
-
--- Replace fling controls with Speed and Jump controls in Controls tab
-local speedBoxRow = Instance.new("Frame"); speedBoxRow.Size = UDim2.new(1,0,0,BTN_H); speedBoxRow.BackgroundTransparency = 1; speedBoxRow.Parent = ctrlScroll
-local speedBox = Instance.new("TextBox"); speedBox.Size = UDim2.new(0.56,0,1,0); speedBox.Position = UDim2.new(0,0,0,0); speedBox.PlaceholderText = "Speed"; speedBox.Text = "16"; speedBox.BackgroundColor3 = Color3.fromRGB(50,50,50); speedBox.TextColor3 = Color3.new(1,1,1); speedBox.BorderSizePixel = 0; speedBox.Font = Enum.Font.Gotham; speedBox.TextSize = SMALL_FONT; speedBox.Parent = speedBoxRow
-local speedSetBtn = Instance.new("TextButton"); speedSetBtn.Size = UDim2.new(0.42, -6, 1, 0); speedSetBtn.Position = UDim2.new(0.56, 6, 0, 0); speedSetBtn.BackgroundColor3 = Color3.fromRGB(100,50,50); speedSetBtn.BorderSizePixel = 0; speedSetBtn.Font = Enum.Font.Gotham; speedSetBtn.TextSize = SMALL_FONT; speedSetBtn.TextColor3 = Color3.new(1,1,1); speedSetBtn.Text = "Set Speed"; speedSetBtn.Parent = speedBoxRow
-local speedLoopBtn = Instance.new("TextButton"); speedLoopBtn.Size = UDim2.new(0.32,0,1,0); speedLoopBtn.Position = UDim2.new(0.68, 6, 0, 0); speedLoopBtn.BackgroundColor3 = Color3.fromRGB(40,40,40); speedLoopBtn.BorderSizePixel = 0; speedLoopBtn.Font = Enum.Font.Gotham; speedLoopBtn.TextSize = 11; speedLoopBtn.TextColor3 = Color3.new(1,1,1); speedLoopBtn.Text = "Loop: Off"; speedLoopBtn.Parent = speedBoxRow
-
-local jumpBoxRow = Instance.new("Frame"); jumpBoxRow.Size = UDim2.new(1,0,0,BTN_H); jumpBoxRow.BackgroundTransparency = 1; jumpBoxRow.Parent = ctrlScroll
-local jumpBox = Instance.new("TextBox"); jumpBox.Size = UDim2.new(0.56,0,1,0); jumpBox.Position = UDim2.new(0,0,0,0); jumpBox.PlaceholderText = "Jump"; jumpBox.Text = "50"; jumpBox.BackgroundColor3 = Color3.fromRGB(50,50,50); jumpBox.TextColor3 = Color3.new(1,1,1); jumpBox.BorderSizePixel = 0; jumpBox.Font = Enum.Font.Gotham; jumpBox.TextSize = SMALL_FONT; jumpBox.Parent = jumpBoxRow
-local jumpSetBtn = Instance.new("TextButton"); jumpSetBtn.Size = UDim2.new(0.42, -6, 1, 0); jumpSetBtn.Position = UDim2.new(0.56, 6, 0, 0); jumpSetBtn.BackgroundColor3 = Color3.fromRGB(100,50,50); jumpSetBtn.BorderSizePixel = 0; jumpSetBtn.Font = Enum.Font.Gotham; jumpSetBtn.TextSize = SMALL_FONT; jumpSetBtn.TextColor3 = Color3.new(1,1,1); jumpSetBtn.Text = "Set Jump"; jumpSetBtn.Parent = jumpBoxRow
-local jumpLoopBtn = Instance.new("TextButton"); jumpLoopBtn.Size = UDim2.new(0.32,0,1,0); jumpLoopBtn.Position = UDim2.new(0.68, 6, 0, 0); jumpLoopBtn.BackgroundColor3 = Color3.fromRGB(40,40,40); jumpLoopBtn.BorderSizePixel = 0; jumpLoopBtn.Font = Enum.Font.Gotham; jumpLoopBtn.TextSize = 11; jumpLoopBtn.TextColor3 = Color3.new(1,1,1); jumpLoopBtn.Text = "Loop: Off"; jumpLoopBtn.Parent = jumpBoxRow
+local flingBoxRow = Instance.new("Frame"); flingBoxRow.Size = UDim2.new(1,0,0,BTN_H); flingBoxRow.BackgroundTransparency = 1; flingBoxRow.Parent = ctrlScroll
+local flingBox = Instance.new("TextBox"); flingBox.Size = UDim2.new(0.56,0,1,0); flingBox.Position = UDim2.new(0,0,0,0); flingBox.PlaceholderText = "Fling"; flingBox.Text = "200"; flingBox.BackgroundColor3 = Color3.fromRGB(50,50,50); flingBox.TextColor3 = Color3.new(1,1,1); flingBox.BorderSizePixel = 0; flingBox.Font = Enum.Font.Gotham; flingBox.TextSize = SMALL_FONT; flingBox.Parent = flingBoxRow
+local flingBtn = Instance.new("TextButton"); flingBtn.Size = UDim2.new(0.42, -6, 1, 0); flingBtn.Position = UDim2.new(0.56, 6, 0, 0); flingBtn.BackgroundColor3 = Color3.fromRGB(100,50,50); flingBtn.BorderSizePixel = 0; flingBtn.Font = Enum.Font.Gotham; flingBtn.TextSize = SMALL_FONT; flingBtn.TextColor3 = Color3.new(1,1,1); flingBtn.Text = "Fling"; flingBtn.Parent = flingBoxRow
+local flingLoopBtn = Instance.new("TextButton"); flingLoopBtn.Size = UDim2.new(0.32,0,1,0); flingLoopBtn.Position = UDim2.new(0.68, 6, 0, 0); flingLoopBtn.BackgroundColor3 = Color3.fromRGB(40,40,40); flingLoopBtn.BorderSizePixel = 0; flingLoopBtn.Font = Enum.Font.Gotham; flingLoopBtn.TextSize = 11; flingLoopBtn.TextColor3 = Color3.new(1,1,1); flingLoopBtn.Text = "Loop: Off"; flingLoopBtn.Parent = flingBoxRow
 
 local psBtn, psLoopBtn = makeRow(ctrlScroll, "PlatformStand")
 local sitBtn, sitLoopBtn = makeRow(ctrlScroll, "Sit")
@@ -737,36 +772,6 @@ local getRidBtn, getRidLoop = makeRow(utilScroll, "Get Rid")
 local eraseBtn, eraseLoopBtn = makeRow(utilScroll, "Erase")
 local spasmBtn, spasmLoopBtn = makeRow(utilScroll, "Spasm")
 local jumpBtn, jumpLoopBtn = makeRow(utilScroll, "Jump")
-
--- Add Destroy Close HRPs button helper creator (we'll add it in Utilities, Left panel and Features)
-local function createDestroyCloseButton(parent)
-    local btn, small = makeRow(parent, "Destroy Close HRPs")
-    btn.MouseButton1Click:Connect(function()
-        for _,m in ipairs(getNPCsArray()) do
-            local hrp = getBestPartForModel(m)
-            if hrp and player.Character and player.Character.PrimaryPart then
-                local playerPos = player.Character.PrimaryPart.Position
-                local dist = (hrp.Position - playerPos).Magnitude
-                local closer = true
-                for _,plr in ipairs(Players:GetPlayers()) do
-                    if plr ~= player and plr.Character and plr.Character.PrimaryPart then
-                        local d = (hrp.Position - plr.Character.PrimaryPart.Position).Magnitude
-                        if d < dist then closer = false break end
-                    end
-                end
-                if closer then
-                    pcall(function() if hrp and hrp.Parent then hrp:Destroy() end end)
-                end
-            end
-        end
-    end)
-    return btn, small
-end
-
--- create in utilities and features and leftPanel footer
-createDestroyCloseButton(utilScroll)
--- we'll add in the left panel dynamically per type page as well (see ensureTypeLeftPage), and in FeaturesPanel below too
-createDestroyCloseButton(FeaturesPanel)
 
 -- Advanced global controls (compact)
 local speedGlobalFrame = Instance.new("Frame"); speedGlobalFrame.Size = UDim2.new(1,0,0,BTN_H); speedGlobalFrame.BackgroundTransparency = 1; speedGlobalFrame.Parent = advScroll
@@ -792,65 +797,71 @@ trackerToggleBtn.TextColor3 = Color3.new(1,1,1)
 trackerToggleBtn.Text = "Toggle NPC Tracker"
 trackerToggleBtn.Parent = trackerFrame
 
--- LocalScript (put this in StarterPlayerScripts)
+-- Click-Kill Tool creation toggle UI (placed in advanced panel)
+local toolToggleFrame = Instance.new("Frame"); toolToggleFrame.Size = UDim2.new(1,0,0,BTN_H); toolToggleFrame.BackgroundTransparency = 1; toolToggleFrame.Parent = advScroll
+local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.Parent = toolToggleFrame
+local toolToggleClear = Instance.new("TextButton"); toolToggleClear.Size = UDim2.new(0.32,0,1,0); toolToggleClear.Position = UDim2.new(0.66,6,0,0); toolToggleClear.BackgroundColor3 = Color3.fromRGB(40,40,40); toolToggleClear.BorderSizePixel = 0; toolToggleClear.Font = Enum.Font.Gotham; toolToggleClear.TextSize = 11; toolToggleClear.TextColor3 = Color3.new(1,1,1); toolToggleClear.Text = "Create Now"; toolToggleClear.Parent = toolToggleFrame
 
-local player = game.Players.LocalPlayer
-local backpack = player:WaitForChild("Backpack")
+-- Create Click-Kill tool function (uses the exact tool logic you provided)
+local createClickKillOnRespawn = false
+local clickToolConn = nil
+local function createClickKillTool()
+    -- avoid creating duplicates in backpack
+    local backpack = player:FindFirstChild("Backpack")
+    if not backpack then return end
 
--- Create the tool
-local tool = Instance.new("Tool")
-tool.Name = "NPCKillTool"
-tool.RequiresHandle = false
-tool.Parent = backpack
-
--- Check if a model is an NPC (has Humanoid and is not a player)
-local function isNPC(model)
-    if not model then return false end
-    local humanoid = model:FindFirstChildOfClass("Humanoid")
-    if humanoid and not game.Players:GetPlayerFromCharacter(model) then
-        return true
-    end
-    return false
-end
-
--- Get the top-level NPC model from any part clicked
-local function getNPCModel(part)
-    local current = part
-    while current do
-        if current:IsA("Model") and isNPC(current) then
-            return current
+    -- remove old tool(s) with same name
+    for _,obj in ipairs(backpack:GetChildren()) do
+        if obj:IsA("Tool") and obj.Name == "NPCKillTool" then
+            pcall(function() obj:Destroy() end)
         end
-        current = current.Parent
     end
-    return nil
-end
 
--- When tool is activated
-tool.Activated:Connect(function()
-    local mouse = player:GetMouse()
-    local targetPart = mouse.Target
-    if not targetPart then return end
+    local tool = Instance.new("Tool")
+    tool.Name = "NPCKillTool"
+    tool.RequiresHandle = false
+    tool.Parent = backpack
 
-    local npcModel = getNPCModel(targetPart)
-    if not npcModel then return end
-
-    -- Find humanoid in NPC model
-    local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
-    if humanoid then
-        -- Change health: 0 → 1 → 0 instantly
-        humanoid.Health = 0
-        humanoid.Health = 1
-        humanoid.Health = 0
+    -- Check if a model is an NPC (has Humanoid and is not a player)
+    local function isNPCTool(model)
+        if not model then return false end
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if humanoid and not game.Players:GetPlayerFromCharacter(model) then
+            return true
+        end
+        return false
     end
-end)
 
-local function onCharacterAddedForTool(char)
-    -- create tool when respawned if toggle is on
-    if createClickKillOnRespawn then
-        -- small delay to ensure Backpack exists
-        task.wait(0.1)
-        createClickKillTool()
+    -- Get the top-level NPC model from any part clicked
+    local function getNPCModelTool(part)
+        local current = part
+        while current do
+            if current:IsA("Model") and isNPCTool(current) then
+                return current
+            end
+            current = current.Parent
+        end
+        return nil
     end
+
+    -- When tool is activated
+    tool.Activated:Connect(function()
+        local mouse = player:GetMouse()
+        local targetPart = mouse.Target
+        if not targetPart then return end
+
+        local npcModel = getNPCModelTool(targetPart)
+        if not npcModel then return end
+
+        -- Find humanoid in NPC model
+        local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            -- Change health: 0 → 1 → 0 instantly
+            humanoid.Health = 0
+            humanoid.Health = 1
+            humanoid.Health = 0
+        end
+    end)
 end
 
 local function setCreateClickKillOnRespawn(enabled)
@@ -861,11 +872,22 @@ local function setCreateClickKillOnRespawn(enabled)
     end
     if enabled then
         -- create on next respawn
-        clickToolConn = player.CharacterAdded:Connect(onCharacterAddedForTool)
-        -- also, if player already just respawned (character present), do not create now per requirement.
-        -- Only create on future respawn, so we don't create immediately here.
+        clickToolConn = player.CharacterAdded:Connect(function()
+            -- small delay to ensure Backpack exists
+            task.wait(0.1)
+            createClickKillTool()
+        end)
+        -- Note: per your previous comment, do not create immediately if the character already exists.
     end
 end
+
+toolToggleBtn.MouseButton1Click:Connect(function()
+    setCreateClickKillOnRespawn(not createClickKillOnRespawn)
+    toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: " .. (createClickKillOnRespawn and "On" or "Off")
+end)
+toolToggleClear.MouseButton1Click:Connect(function()
+    createClickKillTool()
+end)
 
 -- TRACKER scan functions
 local function startTrackerScan()
@@ -888,6 +910,7 @@ end
 trackerToggleBtn.MouseButton1Click:Connect(function()
     if trackerScanRunning then
         stopTrackerScan()
+        -- remove any tracked trackers
         for m,_ in pairs(trackedNPCs) do removeTrackerFromModel(m) end
         trackerToggleBtn.Text = "Toggle NPC Tracker"
     else
@@ -916,26 +939,6 @@ local function ensureTypeLeftPage(typeName)
     local btnAnchor = makeLeftBtnText("Toggle Anchor Type"); btnAnchor.Parent = page
     local btnWhitelist = makeLeftBtnText("Whitelist (exclusions)"); btnWhitelist.Parent = page
 
-    -- add Destroy Close HRPs button on type left page as well
-    local btnDestroyClose = makeLeftBtnText("Destroy Close HRPs")
-    btnDestroyClose.MouseButton1Click:Connect(function()
-        for _,m in ipairs(getNPCsByName(typeName)) do
-            local hrp = getBestPartForModel(m)
-            if hrp and player.Character and player.Character.PrimaryPart then
-                local playerPos = player.Character.PrimaryPart.Position
-                local dist = (hrp.Position - playerPos).Magnitude
-                local closer = true
-                for _,plr in ipairs(Players:GetPlayers()) do
-                    if plr ~= player and plr.Character and plr.Character.PrimaryPart then
-                        local d = (hrp.Position - plr.Character.PrimaryPart.Position).Magnitude
-                        if d < dist then closer = false break end
-                    end
-                end
-                if closer then pcall(function() if hrp and hrp.Parent then hrp:Destroy() end end) end
-            end
-        end
-    end)
-
     btnTrack.MouseButton1Click:Connect(function()
         if not selectedType then return end
         trackedTypes[selectedType] = not trackedTypes[selectedType]
@@ -958,7 +961,7 @@ local function ensureTypeLeftPage(typeName)
     btnFling.MouseButton1Click:Connect(function()
         if not selectedType then return end
         if excluded[selectedType] and excluded[selectedType]["Fling"] then return end
-        local p = tonumber(speedBox.Text) or 200 -- reusing speedBox if needed (no fling special)
+        local p = tonumber(flingBox.Text) or 200
         for _,m in ipairs(getNPCsByName(selectedType)) do pcall(function() flingModel(m,p) end) end
     end)
 
@@ -1041,7 +1044,7 @@ local function ensureTypeFeaturePage(typeName)
         local btn = Instance.new("TextButton"); btn.Size = UDim2.new(0.5,0,1,0); btn.Position = UDim2.new(0,0,0,0); btn.BackgroundColor3 = Color3.fromRGB(58,58,58); btn.BorderSizePixel = 0; btn.Font = Enum.Font.Gotham; btn.TextSize = SMALL_FONT; btn.TextColor3 = Color3.new(1,1,1); btn.Text = eff; btn.Parent = row
         local small
         local input = nil
-        local hasTextbox = (eff == "Speed" or eff == "JumpPower")
+        local hasTextbox = (eff == "Speed" or eff == "JumpPower" or eff == "HipHeight" or eff == "Fling")
         if eff ~= "Tracker" then
             small = Instance.new("TextButton"); small.Size = UDim2.new(0.48,0,1,0); small.Position = UDim2.new(0.52,6,0,0); small.BackgroundColor3 = Color3.fromRGB(40,40,40); small.BorderSizePixel = 0; small.Font = Enum.Font.Gotham; small.TextSize = 11; small.TextColor3 = Color3.new(1,1,1); small.Text = "Loop: Off"; small.Parent = row
         else
@@ -1052,16 +1055,19 @@ local function ensureTypeFeaturePage(typeName)
             input = Instance.new("TextBox"); input.Size = UDim2.new(0.28,0,1,0); input.Position = UDim2.new(0.52,6,0,0); input.BackgroundColor3 = Color3.fromRGB(50,50,50); input.TextColor3 = Color3.new(1,1,1); input.Font = Enum.Font.Gotham; input.TextSize = SMALL_FONT; input.ClearTextOnFocus = false
             if eff == "Speed" then input.Text = "16"
             elseif eff == "JumpPower" then input.Text = "50"
+            elseif eff == "HipHeight" then input.Text = "2"
+            elseif eff == "Fling" then input.Text = tostring(flingBox.Text or "200")
             else input.Text = "" end
             input.Parent = row
             if small and small:IsA("TextButton") then small.Position = UDim2.new(0.8,6,0,0) end
         end
 
+        -- main button action
         btn.MouseButton1Click:Connect(function()
             if not selectedType then return end
             local list = getNPCsByName(selectedType)
             if eff == "Kill" then killAllSimultaneousForList(list)
-            elseif eff == "Fling" then local p = tonumber((input and input.Text) or speedBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
+            elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
             elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
             elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
             elseif eff == "Anchor" then for _,m in ipairs(list) do toggleAnchor(m) end
@@ -1074,7 +1080,6 @@ local function ensureTypeFeaturePage(typeName)
             elseif eff == "Speed" then local v = tonumber(input and input.Text) or 16 for _,m in ipairs(list) do setSpeed(m, v) end
             elseif eff == "JumpPower" then local v = tonumber(input and input.Text) or 50 for _,m in ipairs(list) do setJumpPower(m, v) end
             elseif eff == "HipHeight" then local v = tonumber(input and input.Text) or 2 for _,m in ipairs(list) do setHipHeight(m, v) end
-            elseif eff == "HPNaN" then -- REMOVED: do nothing
             elseif eff == "Tracker" then
                 if excluded[selectedType] and excluded[selectedType]["Tracker"] then return end
                 for _,m in ipairs(list) do
@@ -1094,7 +1099,7 @@ local function ensureTypeFeaturePage(typeName)
                         if excluded[selectedType] and excluded[selectedType][eff] then return end
                         local list = getNPCsByName(selectedType)
                         if eff == "Kill" then killAllSimultaneousForList(list)
-                        elseif eff == "Fling" then local p = tonumber((input and input.Text) or speedBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
+                        elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
                         elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
                         elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
                         elseif eff == "Anchor" then for _,m in ipairs(list) do toggleAnchor(m) end
@@ -1103,7 +1108,7 @@ local function ensureTypeFeaturePage(typeName)
                         elseif eff == "Erase" then for _,m in ipairs(list) do eraseModel(m) end
                         elseif eff == "Spasm" then for _,m in ipairs(list) do spasmModel(m) end
                         elseif eff == "Jump" then for _,m in ipairs(list) do jumpModel(m) end
-                        elseif eff == "VoidV4" then for _,m in ipairs(list) do voidV4Model(m, -5000) end
+                        elseif eff == "VoidV4" then for _,m in ipairs(list) do voidV4Model(m) end
                         elseif eff == "Speed" then local v = tonumber(input and input.Text) or 16 for _,m in ipairs(list) do setSpeed(m, v) end
                         elseif eff == "JumpPower" then local v = tonumber(input and input.Text) or 50 for _,m in ipairs(list) do setJumpPower(m, v) end
                         elseif eff == "HipHeight" then local v = tonumber(input and input.Text) or 2 for _,m in ipairs(list) do setHipHeight(m, v) end
@@ -1122,7 +1127,7 @@ local function ensureTypeFeaturePage(typeName)
                 if eff == "Speed" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["Speed"]) then for _,m in ipairs(list) do setSpeed(m, v) end end
                 elseif eff == "JumpPower" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["JumpPower"]) then for _,m in ipairs(list) do setJumpPower(m, v) end end
                 elseif eff == "HipHeight" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["HipHeight"]) then for _,m in ipairs(list) do setHipHeight(m, v) end end
-                elseif eff == "Fling" then local p = tonumber(input.Text) or tonumber(speedBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m, p) end) end
+                elseif eff == "Fling" then local p = tonumber(input.Text) or tonumber(flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m, p) end) end
                 end
             end)
         end
@@ -1207,11 +1212,8 @@ killLoopBtn.MouseButton1Click:Connect(function()
     if loops.killAll then startLoop("killAll", function() killAllSimultaneousForList(getNPCsArray()) end) else stopLoop("killAll") end
 end)
 
-speedSetBtn.MouseButton1Click:Connect(function() local p = tonumber(speedBox.Text) or 16 for _,m in ipairs(getNPCsArray()) do setSpeed(m,p) end end)
-speedLoopBtn.MouseButton1Click:Connect(function() loops.speedAll = not loops.speedAll; speedLoopBtn.Text = "Loop: " .. (loops.speedAll and "On" or "Off"); if loops.speedAll then startLoop("speedAll", function() local p = tonumber(speedBox.Text) or 16 for _,m in ipairs(getNPCsArray()) do setSpeed(m,p) end end) else stopLoop("speedAll") end end)
-
-jumpSetBtn.MouseButton1Click:Connect(function() local p = tonumber(jumpBox.Text) or 50 for _,m in ipairs(getNPCsArray()) do setJumpPower(m,p) end end)
-jumpLoopBtn.MouseButton1Click:Connect(function() loops.jpAll = not loops.jpAll; jumpLoopBtn.Text = "Loop: " .. (loops.jpAll and "On" or "Off"); if loops.jpAll then startLoop("jpAll", function() local p = tonumber(jumpBox.Text) or 50 for _,m in ipairs(getNPCsArray()) do setJumpPower(m,p) end end) else stopLoop("jpAll") end end)
+flingBtn.MouseButton1Click:Connect(function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end)
+flingLoopBtn.MouseButton1Click:Connect(function() loops.flingAll = not loops.flingAll; flingLoopBtn.Text = "Loop: " .. (loops.flingAll and "On" or "Off"); if loops.flingAll then startLoop("flingAll", function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end) else stopLoop("flingAll") end end)
 
 psBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do platformStand(m) end end)
 psLoopBtn.MouseButton1Click:Connect(function() loops.ps = not loops.ps; psLoopBtn.Text = "Loop: " .. (loops.ps and "On" or "Off"); if loops.ps then startLoop("ps", function() for _,m in ipairs(getNPCsArray()) do platformStand(m) end end) else stopLoop("ps") end end)
@@ -1234,6 +1236,7 @@ v4LoopBtn.MouseButton1Click:Connect(function()
     loops.v4 = not loops.v4
     v4LoopBtn.Text = "Loop: "..(loops.v4 and "On" or "Off")
     if loops.v4 then
+        -- when looped, use -5000 velocity as requested
         startLoop("v4", function() for _,m in ipairs(getNPCsArray()) do if isAllowed(m,"VoidV4") then pcall(function() voidV4Model(m, -5000) end) end end end)
     else
         stopLoop("v4")
@@ -1307,19 +1310,6 @@ jumpGlobalBox.FocusLost:Connect(function()
     if v then for _,m in ipairs(getNPCsArray()) do setJumpPower(m, v) end end
 end)
 
--- Click-Kill Tool creation toggle UI (placed in advanced panel)
-local toolToggleFrame = Instance.new("Frame"); toolToggleFrame.Size = UDim2.new(1,0,0,BTN_H); toolToggleFrame.BackgroundTransparency = 1; toolToggleFrame.Parent = advScroll
-local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.Parent = toolToggleFrame
-local toolToggleClear = Instance.new("TextButton"); toolToggleClear.Size = UDim2.new(0.32,0,1,0); toolToggleClear.Position = UDim2.new(0.66,6,0,0); toolToggleClear.BackgroundColor3 = Color3.fromRGB(40,40,40); toolToggleClear.BorderSizePixel = 0; toolToggleClear.Font = Enum.Font.Gotham; toolToggleClear.TextSize = 11; toolToggleClear.TextColor3 = Color3.new(1,1,1); toolToggleClear.Text = "Create Now"; toolToggleClear.Parent = toolToggleFrame
-
-toolToggleBtn.MouseButton1Click:Connect(function()
-    setCreateClickKillOnRespawn(not createClickKillOnRespawn)
-    toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: " .. (createClickKillOnRespawn and "On" or "Off")
-end)
-toolToggleClear.MouseButton1Click:Connect(function()
-    createClickKillTool()
-end)
-
 -- HEARTBEAT: scanning, cancel-chase, tracker updates
 do
     local acc = 0
@@ -1347,9 +1337,12 @@ do
                 lastCountsHash = h
                 rebuildGroupedList()
             end
-            for t,_ in pairs(trackedTypes) do
-                for _,m in ipairs(getNPCsByName(t)) do
-                    if not trackedNPCs[m] and (not excluded[t] or not excluded[t]["Tracker"]) then addTrackerToModel(m) end
+            -- only auto-add trackers for trackedTypes when tracker scan is running
+            if trackerScanRunning then
+                for t,_ in pairs(trackedTypes) do
+                    for _,m in ipairs(getNPCsByName(t)) do
+                        if not trackedNPCs[m] and (not excluded[t] or not excluded[t]["Tracker"]) then addTrackerToModel(m) end
+                    end
                 end
             end
         end
