@@ -598,7 +598,7 @@ ExclusionPanel.Position = UDim2.new(0.5, -GUI_WIDTH/2 - 12 - 100, 0.45, 0) -- le
 ExclusionPanel.BackgroundColor3 = Color3.fromRGB(30,30,30)
 ExclusionPanel.BorderSizePixel = 0
 ExclusionPanel.Visible = false
-ExclusionPanel.Parent = ScreenGui -- FIXED: parent to ScreenGui so it renders
+ExclusionPanel.Parent = ScreenGui -- ensure parented to ScreenGui
 
 local exclTitle = Instance.new("TextLabel")
 exclTitle.Size = UDim2.new(1, -8, 0, 22)
@@ -626,11 +626,11 @@ local FeaturesPanel = Instance.new("Frame")
 FeaturesPanel.Name = "FeaturesPanel"
 FeaturesPanel.Size = UDim2.new(0, 220, 0, GUI_HEIGHT)
 FeaturesPanel.AnchorPoint = Vector2.new(0.5, 0.5)
-FeaturesPanel.Position = UDim2.new(0.5, GUI_WIDTH/2 + 12 + 100, 0.45, 0) -- right side of main (moved farther away to avoid touching)
+FeaturesPanel.Position = UDim2.new(0.5, GUI_WIDTH/2 + 12 + 100, 0.45, 0) -- right side of main
 FeaturesPanel.BackgroundColor3 = Color3.fromRGB(30,30,30)
 FeaturesPanel.BorderSizePixel = 0
 FeaturesPanel.Visible = false
-FeaturesPanel.Parent = ScreenGui -- FIXED: parent to ScreenGui so it renders
+FeaturesPanel.Parent = ScreenGui -- ensure parented to ScreenGui
 
 local featTitle = Instance.new("TextLabel")
 featTitle.Size = UDim2.new(1, -8, 0, 22)
@@ -789,9 +789,6 @@ trackerToggleBtn.Text = "Toggle NPC Tracker"
 trackerToggleBtn.Parent = trackerFrame
 
 -- LocalScript click-kill tool integration
--- We'll implement createClickKillTool() and setCreateClickKillOnRespawn() using your provided tool script
--- plus an equip GUI to configure Click-Kill fling power and toggle.
-
 local createClickKillOnRespawn = false
 local clickToolConn = nil
 
@@ -953,30 +950,22 @@ local function createClickKillTool()
         return nil
     end
 
-    -- helper: apply damage sequence (0, then 1, then ensure 0)
+    -- helper: apply damage sequence (0 -> wait 0.01 -> 1 -> wait 0.01 -> final kill using same heavy method as killAllSimultaneousForList)
     local function applyDamageSequence(hum)
         if not hum then return end
+        -- step 1: set to 0
+        pcall(function() hum.Health = 0 end)
+        task.wait(0.01)
+        -- step 2: set to 1
+        pcall(function() hum.Health = 1 end)
+        task.wait(0.01)
+        -- final: attempt heavy kill (TakeDamage(math.huge) like killAllSimultaneousForList)
         pcall(function()
-            if typeof(hum.TakeDamage) == "function" then
-                hum:TakeDamage(0)
-            end
-        end)
-        task.wait(0.03)
-        pcall(function()
-            if typeof(hum.TakeDamage) == "function" then
-                hum:TakeDamage(1)
+            local ok = pcall(function() hum:TakeDamage(math.huge) end)
+            if not ok then
+                pcall(function() hum.Health = -math.huge end)
             else
-                -- fallback: nudge health to 1 (if numeric available)
-                if hum.Health ~= nil then
-                    hum.Health = math.max(1, (hum.Health or 1))
-                end
-            end
-        end)
-        task.wait(0.03)
-        -- final ensure death: if still alive, force health to zero
-        pcall(function()
-            if hum.Health and hum.Health > 0 then
-                hum.Health = 0
+                pcall(function() hum.Health = 0 end)
             end
         end)
     end
@@ -1005,8 +994,9 @@ local function createClickKillTool()
         if humanoid then
             -- If click-kill fling enabled, kill then fling
             if clickToolFlingEnabled then
-                -- Kill
-                pcall(function() humanoid.Health = 0 end)
+                -- Kill using the same heavy method after the 0->1->0 sequence for extra reliability
+                applyDamageSequence(humanoid)
+
                 -- compute fling velocity away from local player
                 local playerPos = nil
                 if player.Character and player.Character.PrimaryPart then
@@ -1035,7 +1025,7 @@ local function createClickKillTool()
                     end
                 end)
             else
-                -- Default sequence: apply damage 0, then damage 1, then ensure dead (health = 0)
+                -- Default sequence: 0 -> wait 0.01 -> 1 -> wait 0.01 -> heavy kill
                 applyDamageSequence(humanoid)
             end
         end
@@ -1519,7 +1509,7 @@ end)
 -- Click-Kill Tool creation toggle UI (placed in advanced panel)
 local toolToggleFrame = Instance.new("Frame"); toolToggleFrame.Size = UDim2.new(1,0,0,BTN_H); toolToggleFrame.BackgroundTransparency = 1; toolToggleFrame.Parent = advScroll
 local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.Parent = toolToggleFrame
-toolToggleBtn.TextScaled = true -- REQUESTED: make the toggle scaled so it fits
+toolToggleBtn.TextScaled = true -- ensure label fits
 local toolToggleClear = Instance.new("TextButton"); toolToggleClear.Size = UDim2.new(0.32,0,1,0); toolToggleClear.Position = UDim2.new(0.66,6,0,0); toolToggleClear.BackgroundColor3 = Color3.fromRGB(40,40,40); toolToggleClear.BorderSizePixel = 0; toolToggleClear.Font = Enum.Font.Gotham; toolToggleClear.TextSize = 11; toolToggleClear.TextColor3 = Color3.new(1,1,1); toolToggleClear.Text = "Create Now"; toolToggleClear.Parent = toolToggleFrame
 
 toolToggleBtn.MouseButton1Click:Connect(function()
