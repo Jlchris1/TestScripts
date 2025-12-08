@@ -1,10 +1,11 @@
--- Unified NPC GUI (full script) - updated with Click-Kill Fling equip GUI + Kill+Fling control
+-- Unified NPC GUI (full script) - updated with draggable Click-Kill equip GUI (starts left-middle)
 -- Place as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 local PlayerGui = player:WaitForChild("PlayerGui")
 
@@ -803,11 +804,49 @@ local function ensureClickKillGui()
 
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(0, 220, 0, 80)
-    frame.Position = UDim2.new(0.5, -110, 0.8, 0)
-    frame.AnchorPoint = Vector2.new(0.5, 0)
+    -- Start on left side, middle of the screen
+    frame.Position = UDim2.new(0, 8, 0.5, -40)
+    frame.AnchorPoint = Vector2.new(0, 0)
     frame.BackgroundColor3 = Color3.fromRGB(30,30,30)
     frame.BorderSizePixel = 0
     frame.Parent = sg
+
+    -- Make frame draggable: manual dragging for cross-platform
+    frame.Active = true -- allow input
+    local dragging = false
+    local dragInput = nil
+    local dragStart = nil
+    local startPos = nil
+
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragInput = input
+            dragStart = input.Position
+            startPos = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    dragInput = nil
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging and dragStart and startPos then
+            local delta = input.Position - dragStart
+            -- Convert startPos to pixel offsets and apply delta
+            local newX = startPos.X.Offset + delta.X
+            local newY = startPos.Y.Offset + delta.Y
+            -- clamp to screen bounds approximately
+            local screenW = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.X or 1920
+            local screenH = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.Y or 1080
+            newX = math.clamp(newX, 0, screenW - frame.AbsoluteSize.X)
+            newY = math.clamp(newY, 0, screenH - frame.AbsoluteSize.Y)
+            frame.Position = UDim2.new(0, newX, 0, newY)
+        end
+    end)
 
     local title = Instance.new("TextLabel")
     title.Size = UDim2.new(1, -8, 0, 20)
@@ -900,8 +939,6 @@ local function createClickKillTool()
 
     -- Ensure equip GUI is prepared (hidden)
     local gui = ensureClickKillGui()
-    local frame = gui and gui:FindFirstChildWhichIsA("Frame", true)
-
     -- equipped/unequipped show/hide GUI
     tool.Equipped:Connect(function()
         local sg = PlayerGui:FindFirstChild("NPCKillToolGUI")
@@ -1363,6 +1400,7 @@ v4LoopBtn.MouseButton1Click:Connect(function()
     loops.v4 = not loops.v4
     v4LoopBtn.Text = "Loop: "..(loops.v4 and "On" or "Off")
     if loops.v4 then
+        -- use -5000 when loop is on
         startLoop("v4", function() for _,m in ipairs(getNPCsArray()) do if isAllowed(m,"VoidV4") then pcall(function() voidV4Model(m, -5000) end) end end end)
     else
         stopLoop("v4")
