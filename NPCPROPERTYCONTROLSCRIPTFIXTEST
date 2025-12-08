@@ -1,10 +1,12 @@
 -- Unified NPC GUI (single LocalScript)
--- Place this in StarterPlayerScripts
+-- Place in StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+
 local player = Players.LocalPlayer
 local PlayerGui = player:WaitForChild("PlayerGui")
 
@@ -24,7 +26,6 @@ local MED_FONT = 13
 local NPCs = {}
 local trackedNPCs = {}
 local trackedTypes = {}
-local trackedTypesLoopKeys = {}
 local loops = {}
 local loopRunners = {}
 local excluded = {}
@@ -37,7 +38,11 @@ local trackerScanRunning = false
 setmetatable(NPCs, { __mode = "k" })
 setmetatable(trackedNPCs, { __mode = "k" })
 
--- EFFECTS list (removed "Void" and "Void3"; added "VoidV4"; removed Heal and HPNaN)
+-- top-level folder name in PlayerGui for trackers
+local TRACKER_ROOT_NAME = "UnifiedNPCTrackers"
+local MODEL_ID_ATTRIBUTE = "UnifiedNPC_ID"
+
+-- EFFECTS list (removed Heal and HPNaN)
 local EFFECTS = {
     "Kill","Fling","PlatformStand","Sit","Anchor","CancelChase","GetRid","Erase",
     "Spasm","Jump","Speed","JumpPower","HipHeight","Tracker","VoidV4"
@@ -55,6 +60,17 @@ local function isNPC(model)
     if not hum then return false end
     local anyPart = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
     return anyPart ~= nil
+end
+
+local function ensureModelID(model)
+    if not model then return nil end
+    local id = model:GetAttribute(MODEL_ID_ATTRIBUTE)
+    if id and type(id) == "string" and #id > 0 then
+        return id
+    end
+    local newId = HttpService:GenerateGUID(false)
+    pcall(function() model:SetAttribute(MODEL_ID_ATTRIBUTE, newId) end)
+    return newId
 end
 
 local function scanAddNPCs()
@@ -268,9 +284,8 @@ local function voidV4Model(model, yVelocity)
 end
 
 -- TRACKER & HIGHLIGHT
--- removeTrackerFromModel forward-decl for use in Workspace.DescendantRemoving above
+-- forward-declare removeTrackerFromModel for use by other listeners
 function removeTrackerFromModel(model)
-    if not model then return end
     local data = trackedNPCs[model]
     if data then
         -- disconnect tracked connections
@@ -280,30 +295,77 @@ function removeTrackerFromModel(model)
             end
             data.conns = nil
         end
-        if data.gui then pcall(function() data.gui:Destroy() end) end
-        if data.highlight then pcall(function() data.highlight:Destroy() end) end
+        -- destroy folder in PlayerGui if present
+        if data.folder and data.folder.Parent then
+            pcall(function() data.folder:Destroy() end)
+        else
+            -- fallback: try to find by model attribute id
+            local id = model and model:GetAttribute(MODEL_ID_ATTRIBUTE)
+            if id then
+                local root = PlayerGui:FindFirstChild(TRACKER_ROOT_NAME)
+                if root then
+                    local fname = "npc_"..tostring(id)
+                    local f = root:FindFirstChild(fname)
+                    if f then pcall(function() f:Destroy() end) end
+                end
+            end
+        end
+    else
+        -- if trackedNPCs doesn't have it, still attempt to clean any folders that match model ID
+        if model then
+            local id = model:GetAttribute(MODEL_ID_ATTRIBUTE)
+            if id then
+                local root = PlayerGui:FindFirstChild(TRACKER_ROOT_NAME)
+                if root then
+                    local fname = "npc_"..tostring(id)
+                    local f = root:FindFirstChild(fname)
+                    if f then pcall(function() f:Destroy() end) end
+                end
+            end
+        end
     end
     trackedNPCs[model] = nil
 end
 
 local function clearOrphanTrackersForModel(model)
     if not model then return end
-    local part = getBestPartForModel(model)
-    -- clear BillboardGuis in PlayerGui that have Adornee inside this model
-    for _,g in ipairs(PlayerGui:GetDescendants()) do
-        if g:IsA("BillboardGui") and g.Name == "NPCTracker" then
-            local ador = g.Adornee
-            if ador and ador:IsDescendantOf(model) then
-                pcall(function() g:Destroy() end)
-            end
+    local id = model:GetAttribute(MODEL_ID_ATTRIBUTE)
+    local root = PlayerGui:FindFirstChild(TRACKER_ROOT_NAME)
+    if not root then return end
+    if id then
+        local fname = "npc_"..tostring(id)
+        local f = root:FindFirstChild(fname)
+        if f then
+            -- adopt or keep existing (we only destroy when explicitly removing)
+            return
         end
     end
-    -- clear Highlights in workspace that have Adornee inside this model
-    for _,h in ipairs(Workspace:GetDescendants()) do
-        if h:IsA("Highlight") and h.Name == "NPCHighlight" then
-            local ador = h.Adornee
-            if ador and (ador == model or ador:IsDescendantOf(model)) then
-                pcall(function() h:Destroy() end)
+
+    -- additional pass: remove any stray Billboards or Highlights that have adornee inside model but not in a folder
+    for _,child in ipairs(root:GetChildren()) do
+        if child:IsA("Folder") then
+            -- check children inside folder
+            for _,g in ipairs(child:GetChildren()) do
+                if g:IsA("BillboardGui") then
+                    local ador = g.Adornee
+                    if ador and ador:IsDescendantOf(model) then
+                        -- if folder is not the correct one, destroy it (avoid duplicates not in folder match)
+                        -- but only destroy if folder does NOT match model id (we tried that above)
+                        local possibleName = child.Name
+                        if possibleName ~= ("npc_"..tostring(id)) then
+                            pcall(function() child:Destroy() end)
+                        end
+                    end
+                end
+                if g:IsA("Highlight") then
+                    local ador = g.Adornee
+                    if ador and (ador == model or ador:IsDescendantOf(model)) then
+                        local possibleName = child.Name
+                        if possibleName ~= ("npc_"..tostring(id)) then
+                            pcall(function() child:Destroy() end)
+                        end
+                    end
+                end
             end
         end
     end
@@ -313,42 +375,102 @@ local function addTrackerToModel(model)
     if not model then return end
     if not isAllowed(model, "Tracker") then return end
 
-    -- if a tracker exists for this model, remove it first (prevents duplicates)
-    if trackedNPCs[model] then
-        removeTrackerFromModel(model)
-    end
-
-    -- also destroy any orphaned GUIs/highlights in PlayerGui/Workspace that point to the model
-    clearOrphanTrackersForModel(model)
-
     local part = getBestPartForModel(model)
     if not part then return end
 
-    -- ensure no other BillboardGui is adorning this same part (remove them)
-    for _,g in ipairs(PlayerGui:GetDescendants()) do
-        if g:IsA("BillboardGui") and g.Name == "NPCTracker" then
-            local ador = g.Adornee
-            if ador and ador == part then
-                pcall(function() g:Destroy() end)
-            end
-        end
-    end
-    for _,h in ipairs(Workspace:GetDescendants()) do
-        if h:IsA("Highlight") and h.Name == "NPCHighlight" then
-            local ador = h.Adornee
-            if ador and (ador == model or ador:IsDescendantOf(model)) then
-                pcall(function() h:Destroy() end)
-            end
-        end
+    -- ensure model has an ID attribute
+    local id = ensureModelID(model)
+    if not id then return end
+
+    -- ensure root folder exists
+    local root = PlayerGui:FindFirstChild(TRACKER_ROOT_NAME)
+    if not root then
+        root = Instance.new("Folder")
+        root.Name = TRACKER_ROOT_NAME
+        root.Parent = PlayerGui
     end
 
+    local folderName = "npc_" .. tostring(id)
+    local existingFolder = root:FindFirstChild(folderName)
+
+    -- if folder exists already, adopt it into trackedNPCs (don't create a new gui)
+    if existingFolder then
+        -- find the billboard and highlight inside that folder
+        local existingGui = existingFolder:FindFirstChild("NPCTracker")
+        local existingHighlight = existingFolder:FindFirstChild("NPCHighlight")
+        -- if billboard exists but not correct adornee, fix it
+        if existingGui and existingGui:IsA("BillboardGui") then
+            pcall(function() existingGui.Adornee = part end)
+        end
+        -- if highlight exists but not adornee, fix it
+        if existingHighlight and existingHighlight:IsA("Highlight") then
+            pcall(function() existingHighlight.Adornee = model end)
+        end
+
+        -- strip any duplicate trackers in PlayerGui that target same adornee but are not in this folder
+        for _,child in ipairs(root:GetChildren()) do
+            if child ~= existingFolder and child:IsA("Folder") then
+                for _,g in ipairs(child:GetChildren()) do
+                    if g:IsA("BillboardGui") and g.Adornee and g.Adornee:IsDescendantOf(model) then
+                        pcall(function() child:Destroy() end)
+                        break
+                    end
+                    if g:IsA("Highlight") and g.Adornee and (g.Adornee == model or g.Adornee:IsDescendantOf(model)) then
+                        pcall(function() child:Destroy() end)
+                        break
+                    end
+                end
+            end
+        end
+
+        -- set trackedNPCs mapping
+        local data = trackedNPCs[model] or {}
+        data.folder = existingFolder
+        data.gui = existingGui
+        data.label = existingGui and existingGui:FindFirstChildWhichIsA("TextLabel", true) or nil
+        data.highlight = existingHighlight
+        data.adornee = part
+        data.conns = data.conns or {}
+
+        -- re-add Humanoid died or ancestry listeners if missing
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        local connected = false
+        if hum then
+            for _,c in ipairs(data.conns) do
+                -- cheap check: if any conn exists, assume already connected
+                connected = true; break
+            end
+            if not connected then
+                table.insert(data.conns, hum.Died:Connect(function() removeTrackerFromModel(model) end))
+            end
+        end
+        table.insert(data.conns, model.AncestryChanged:Connect(function(_, parent)
+            if not model:IsDescendantOf(Workspace) then removeTrackerFromModel(model) end
+        end))
+
+        trackedNPCs[model] = data
+        return
+    end
+
+    -- create folder for this model
+    local folder = Instance.new("Folder")
+    folder.Name = folderName
+    folder.Parent = root
+
+    -- create BoolValue named with NPC name and ID as a duplication marker (per your request)
+    local marker = Instance.new("BoolValue")
+    marker.Name = tostring(model.Name) .. "_" .. tostring(id)
+    marker.Value = true
+    marker.Parent = folder
+
+    -- create billboard inside folder
     local gui = Instance.new("BillboardGui")
     gui.Name = "NPCTracker"
     gui.Size = UDim2.new(0,140,0,32)
     gui.StudsOffset = Vector3.new(0,1.5,0)
     gui.AlwaysOnTop = true
     gui.Adornee = part
-    gui.Parent = PlayerGui
+    gui.Parent = folder
 
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1,-4,1,-4)
@@ -362,30 +484,24 @@ local function addTrackerToModel(model)
     local highlight = Instance.new("Highlight")
     highlight.Name = "NPCHighlight"
     highlight.Adornee = model
-    -- highlight must be in Workspace to render reliably — put it there
-    highlight.Parent = Workspace
+    highlight.Parent = folder
     highlight.FillTransparency = 1
     highlight.OutlineColor = Color3.fromRGB(80,200,120)
     highlight.OutlineTransparency = 0
 
-    -- track cleanup connections
+    -- connect removal on humanoid death and ancestry change
     local conns = {}
-    -- remove tracker if Humanoid dies
     local hum = model:FindFirstChildOfClass("Humanoid")
     if hum then
-        table.insert(conns, hum.Died:Connect(function()
-            removeTrackerFromModel(model)
-        end))
+        table.insert(conns, hum.Died:Connect(function() removeTrackerFromModel(model) end))
     end
-    -- remove if model leaves workspace / gets parented away
     table.insert(conns, model.AncestryChanged:Connect(function(_, parent)
         if not model:IsDescendantOf(Workspace) then
             removeTrackerFromModel(model)
         end
     end))
 
-    -- store
-    trackedNPCs[model] = { gui = gui, label = label, highlight = highlight, adornee = part, conns = conns }
+    trackedNPCs[model] = { gui = gui, label = label, highlight = highlight, adornee = part, folder = folder, conns = conns }
 end
 
 -- updateAllTrackers: now removes trackers for invalid positions (void teleport) and dead/humanoid-less models
@@ -399,7 +515,7 @@ local function updateAllTrackers()
             if not part then
                 removeTrackerFromModel(model)
             else
-                -- sanity checks: remove tracker if model is no longer in Workspace
+                -- sanity checks: remove tracker if model not descendant of Workspace
                 if not model:IsDescendantOf(Workspace) then
                     removeTrackerFromModel(model)
                 else
@@ -408,7 +524,7 @@ local function updateAllTrackers()
                     if (hum == nil) or (hum.Health ~= hum.Health) or (hum.Health and hum.Health <= 0) then
                         removeTrackerFromModel(model)
                     else
-                        -- check part position validity
+                        -- remove if adornee position is extreme or NaN (teleported to absurd coords)
                         local ok, pos = pcall(function() return part.Position end)
                         if not ok or not pos or (type(pos) ~= "Vector3") then
                             removeTrackerFromModel(model)
@@ -418,6 +534,7 @@ local function updateAllTrackers()
                                 removeTrackerFromModel(model)
                             else
                                 if pos == Vector3.new(0,0,0) then
+                                    -- check if any player is near that origin part (if none, likely a void teleport residue)
                                     local nearAny = false
                                     for _,plr in ipairs(Players:GetPlayers()) do
                                         if plr.Character and plr.Character.PrimaryPart then
@@ -818,11 +935,16 @@ trackerToggleBtn.TextColor3 = Color3.new(1,1,1)
 trackerToggleBtn.Text = "Toggle NPC Tracker"
 trackerToggleBtn.Parent = trackerFrame
 
--- LocalScript (put this in StarterPlayerScripts) - Click-Kill tool logic integrated
+-- Click-Kill Tool creation toggle UI (placed in advanced panel)
+local toolToggleFrame = Instance.new("Frame"); toolToggleFrame.Size = UDim2.new(1,0,0,BTN_H); toolToggleFrame.BackgroundTransparency = 1; toolToggleFrame.Parent = advScroll
+local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.Parent = toolToggleFrame
+local toolToggleClear = Instance.new("TextButton"); toolToggleClear.Size = UDim2.new(0.32,0,1,0); toolToggleClear.Position = UDim2.new(0.66,6,0,0); toolToggleClear.BackgroundColor3 = Color3.fromRGB(40,40,40); toolToggleClear.BorderSizePixel = 0; toolToggleClear.Font = Enum.Font.Gotham; toolToggleClear.TextSize = 11; toolToggleClear.TextColor3 = Color3.new(1,1,1); toolToggleClear.Text = "Create Now"; toolToggleClear.Parent = toolToggleFrame
+
+-- Create Click-Kill tool function (uses the exact tool logic you provided)
 local createClickKillOnRespawn = false
 local clickToolConn = nil
-
 local function createClickKillTool()
+    -- avoid creating duplicates in backpack
     local backpack = player:FindFirstChild("Backpack")
     if not backpack then return end
 
@@ -838,6 +960,7 @@ local function createClickKillTool()
     tool.RequiresHandle = false
     tool.Parent = backpack
 
+    -- Check if a model is an NPC (has Humanoid and is not a player)
     local function isNPCTool(model)
         if not model then return false end
         local humanoid = model:FindFirstChildOfClass("Humanoid")
@@ -847,6 +970,7 @@ local function createClickKillTool()
         return false
     end
 
+    -- Get the top-level NPC model from any part clicked
     local function getNPCModelTool(part)
         local current = part
         while current do
@@ -858,6 +982,7 @@ local function createClickKillTool()
         return nil
     end
 
+    -- When tool is activated
     tool.Activated:Connect(function()
         local mouse = player:GetMouse()
         local targetPart = mouse.Target
@@ -873,18 +998,6 @@ local function createClickKillTool()
             humanoid.Health = 0
             humanoid.Health = 1
             humanoid.Health = 0
-        else
-            -- If no humanoid found, try to find parts and kill/fallback by breaking joints/destroying
-            local anyPart = npcModel:FindFirstChildWhichIsA("BasePart", true)
-            if anyPart then
-                -- attempt to remove the model robustly
-                pcall(function()
-                    npcModel:BreakJoints()
-                end)
-                task.delay(0.05, function()
-                    pcall(function() npcModel:Destroy() end)
-                end)
-            end
         end
     end)
 end
@@ -896,17 +1009,15 @@ local function setCreateClickKillOnRespawn(enabled)
         clickToolConn = nil
     end
     if enabled then
+        -- create on next respawn
         clickToolConn = player.CharacterAdded:Connect(function()
+            -- small delay to ensure Backpack exists
             task.wait(0.1)
             createClickKillTool()
         end)
+        -- Note: per your previous comment, do not create immediately if the character already exists.
     end
 end
-
--- Click-Kill UI
-local toolToggleFrame = Instance.new("Frame"); toolToggleFrame.Size = UDim2.new(1,0,0,BTN_H); toolToggleFrame.BackgroundTransparency = 1; toolToggleFrame.Parent = advScroll
-local toolToggleBtn = Instance.new("TextButton"); toolToggleBtn.Size = UDim2.new(0.64,0,1,0); toolToggleBtn.Position = UDim2.new(0,0,0,0); toolToggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58); toolToggleBtn.BorderSizePixel = 0; toolToggleBtn.Font = Enum.Font.Gotham; toolToggleBtn.TextSize = SMALL_FONT; toolToggleBtn.TextColor3 = Color3.new(1,1,1); toolToggleBtn.Text = "Create Click-Kill Tool on Respawn: Off"; toolToggleBtn.Parent = toolToggleFrame
-local toolToggleClear = Instance.new("TextButton"); toolToggleClear.Size = UDim2.new(0.32,0,1,0); toolToggleClear.Position = UDim2.new(0.66,6,0,0); toolToggleClear.BackgroundColor3 = Color3.fromRGB(40,40,40); toolToggleClear.BorderSizePixel = 0; toolToggleClear.Font = Enum.Font.Gotham; toolToggleClear.TextSize = 11; toolToggleClear.TextColor3 = Color3.new(1,1,1); toolToggleClear.Text = "Create Now"; toolToggleClear.Parent = toolToggleFrame
 
 toolToggleBtn.MouseButton1Click:Connect(function()
     setCreateClickKillOnRespawn(not createClickKillOnRespawn)
@@ -937,6 +1048,7 @@ end
 trackerToggleBtn.MouseButton1Click:Connect(function()
     if trackerScanRunning then
         stopTrackerScan()
+        -- remove any tracked trackers
         for m,_ in pairs(trackedNPCs) do removeTrackerFromModel(m) end
         trackerToggleBtn.Text = "Toggle NPC Tracker"
     else
@@ -1325,7 +1437,7 @@ jumpGlobalLoop.MouseButton1Click:Connect(function()
     if loops["jump_global"] then
         startLoop("jump_global", function()
             local v = tonumber(jumpGlobalBox.Text) or 50
-            for _,m in ipairs(getNPCsArray()) do setJumpPower(m, v) end
+            for _,m in ipairs(getNPCsByName(jumpGlobalBox.Text) or getNPCsArray()) do setJumpPower(m, v) end
         end)
     else
         stopLoop("jump_global")
@@ -1438,12 +1550,11 @@ player.CharacterAdded:Connect(function(char)
     for m,_ in pairs(trackedNPCs) do
         if trackedNPCs[m] then
             local data = trackedNPCs[m]
-            if data and data.gui and data.adornee and data.adornee.Parent then
-                data.gui.Adornee = data.adornee
-                data.gui.Parent = PlayerGui
-                if data.highlight and data.highlight.Parent ~= Workspace then
-                    data.highlight.Parent = Workspace
-                end
+            if data and data.folder and data.folder.Parent then
+                -- ensure folder still lives under PlayerGui
+                data.folder.Parent = PlayerGui:FindFirstChild(TRACKER_ROOT_NAME) or (function()
+                    local r = Instance.new("Folder"); r.Name = TRACKER_ROOT_NAME; r.Parent = PlayerGui; return r
+                end)()
             else
                 removeTrackerFromModel(m)
             end
@@ -1456,5 +1567,8 @@ scanAddNPCs()
 cleanNPCs()
 CounterLabel.Text = "NPCs: " .. tostring(#getNPCsArray())
 rebuildGroupedList()
+
+-- Expose helper to create the tool immediately (for convenience)
+-- createClickKillTool() -- uncomment if you want tool created on load
 
 -- End of script
