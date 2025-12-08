@@ -1,4 +1,4 @@
--- Unified NPC GUI (full script) - updated per request
+-- Unified NPC GUI (full script) - updated with Click-Kill Fling equip GUI + Kill+Fling control
 -- Place as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
@@ -288,14 +288,12 @@ local function removeTrackerFromModel(model)
     end
 
     -- Also attempt to remove any stray BillboardGui/Highlight in PlayerGui that refer to the model
-    -- This covers orphans that might have been created earlier.
     for _,desc in ipairs(PlayerGui:GetDescendants()) do
         if desc:IsA("BillboardGui") and desc.Name == "NPCTracker" then
             local ador = desc.Adornee
             if ador and ador:IsDescendantOf(model) then
                 pcall(function() desc:Destroy() end)
             elseif not ador then
-                -- If it lost adornee, it's orphaned - destroy it
                 pcall(function() desc:Destroy() end)
             end
         elseif desc:IsA("Highlight") and desc.Name == "NPCHighlight" then
@@ -633,8 +631,9 @@ featTitle.TextColor3 = Color3.new(1,1,1)
 featTitle.Text = "Type Features"
 featTitle.Parent = FeaturesPanel
 
+-- Make the features scroll smaller on Y so it doesn't block quick adjust controls
 local featScroll = Instance.new("ScrollingFrame")
-featScroll.Size = UDim2.new(1, -12, 1, - 110)
+featScroll.Size = UDim2.new(1, -12, 1, - 160) -- reduced Y height (was -110)
 featScroll.Position = UDim2.new(0,6,0,36)
 featScroll.BackgroundTransparency = 1
 featScroll.ScrollBarThickness = 6
@@ -736,6 +735,11 @@ local flingBox = Instance.new("TextBox"); flingBox.Size = UDim2.new(0.56,0,1,0);
 local flingBtn = Instance.new("TextButton"); flingBtn.Size = UDim2.new(0.42, -6, 1, 0); flingBtn.Position = UDim2.new(0.56, 6, 0, 0); flingBtn.BackgroundColor3 = Color3.fromRGB(100,50,50); flingBtn.BorderSizePixel = 0; flingBtn.Font = Enum.Font.Gotham; flingBtn.TextSize = SMALL_FONT; flingBtn.TextColor3 = Color3.new(1,1,1); flingBtn.Text = "Fling"; flingBtn.Parent = flingBoxRow
 local flingLoopBtn = Instance.new("TextButton"); flingLoopBtn.Size = UDim2.new(0.32,0,1,0); flingLoopBtn.Position = UDim2.new(0.68, 6, 0, 0); flingLoopBtn.BackgroundColor3 = Color3.fromRGB(40,40,40); flingLoopBtn.BorderSizePixel = 0; flingLoopBtn.Font = Enum.Font.Gotham; flingLoopBtn.TextSize = 11; flingLoopBtn.TextColor3 = Color3.new(1,1,1); flingLoopBtn.Text = "Loop: Off"; flingLoopBtn.Parent = flingBoxRow
 
+-- Kill+Fling controls (new row placed below the fling row)
+local killFlingFrame = Instance.new("Frame"); killFlingFrame.Size = UDim2.new(1,0,0,BTN_H); killFlingFrame.BackgroundTransparency = 1; killFlingFrame.Parent = ctrlScroll
+local killFlingBtn = Instance.new("TextButton"); killFlingBtn.Size = UDim2.new(0.66,0,1,0); killFlingBtn.Position = UDim2.new(0,0,0,0); killFlingBtn.BackgroundColor3 = Color3.fromRGB(70,30,30); killFlingBtn.BorderSizePixel = 0; killFlingBtn.Font = Enum.Font.Gotham; killFlingBtn.TextSize = SMALL_FONT; killFlingBtn.TextColor3 = Color3.new(1,1,1); killFlingBtn.Text = "Kill+Fling"; killFlingBtn.Parent = killFlingFrame
+local killFlingLoopBtn = Instance.new("TextButton"); killFlingLoopBtn.Size = UDim2.new(0.32,0,1,0); killFlingLoopBtn.Position = UDim2.new(0.68, 6, 0, 0); killFlingLoopBtn.BackgroundColor3 = Color3.fromRGB(40,40,40); killFlingLoopBtn.BorderSizePixel = 0; killFlingLoopBtn.Font = Enum.Font.Gotham; killFlingLoopBtn.TextSize = 11; killFlingLoopBtn.TextColor3 = Color3.new(1,1,1); killFlingLoopBtn.Text = "Loop: Off"; killFlingLoopBtn.Parent = killFlingFrame
+
 local psBtn, psLoopBtn = makeRow(ctrlScroll, "PlatformStand")
 local sitBtn, sitLoopBtn = makeRow(ctrlScroll, "Sit")
 local anchorBtn, anchorLoopBtn = makeRow(ctrlScroll, "Anchor")
@@ -775,10 +779,95 @@ trackerToggleBtn.Parent = trackerFrame
 
 -- LocalScript click-kill tool integration
 -- We'll implement createClickKillTool() and setCreateClickKillOnRespawn() using your provided tool script
+-- plus an equip GUI to configure Click-Kill fling power and toggle.
 
 local backpack = player:WaitForChild("Backpack")
 local createClickKillOnRespawn = false
 local clickToolConn = nil
+
+-- Click-Kill tool state for the equip GUI
+local clickToolFlingEnabled = false
+local clickToolFlingPower = 200
+
+-- We'll create a GUI that appears when the tool is equipped.
+local function ensureClickKillGui()
+    -- If already exists, return it
+    local existing = PlayerGui:FindFirstChild("NPCKillToolGUI")
+    if existing and existing:IsA("ScreenGui") then return existing end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "NPCKillToolGUI"
+    sg.ResetOnSpawn = false
+    sg.Parent = PlayerGui
+    sg.Enabled = false
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 220, 0, 80)
+    frame.Position = UDim2.new(0.5, -110, 0.8, 0)
+    frame.AnchorPoint = Vector2.new(0.5, 0)
+    frame.BackgroundColor3 = Color3.fromRGB(30,30,30)
+    frame.BorderSizePixel = 0
+    frame.Parent = sg
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -8, 0, 20)
+    title.Position = UDim2.new(0, 4, 0, 4)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 14
+    title.TextColor3 = Color3.new(1,1,1)
+    title.Text = "NPCKill Tool - Click Fling"
+    title.Parent = frame
+
+    local pLabel = Instance.new("TextLabel")
+    pLabel.Size = UDim2.new(0.5, -6, 0, 24)
+    pLabel.Position = UDim2.new(0, 4, 0, 28)
+    pLabel.BackgroundTransparency = 1
+    pLabel.Font = Enum.Font.Gotham
+    pLabel.TextSize = 12
+    pLabel.TextColor3 = Color3.new(1,1,1)
+    pLabel.Text = "Fling Power"
+    pLabel.Parent = frame
+
+    local pBox = Instance.new("TextBox")
+    pBox.Size = UDim2.new(0.44, 0, 0, 24)
+    pBox.Position = UDim2.new(0.5, 4, 0, 28)
+    pBox.Text = tostring(clickToolFlingPower)
+    pBox.PlaceholderText = "200"
+    pBox.BackgroundColor3 = Color3.fromRGB(50,50,50)
+    pBox.TextColor3 = Color3.new(1,1,1)
+    pBox.Font = Enum.Font.Gotham
+    pBox.TextSize = 12
+    pBox.ClearTextOnFocus = false
+    pBox.Parent = frame
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(1, -8, 0, 20)
+    toggleBtn.Position = UDim2.new(0, 4, 0, 56)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(58,58,58)
+    toggleBtn.Font = Enum.Font.Gotham
+    toggleBtn.TextSize = 12
+    toggleBtn.TextColor3 = Color3.new(1,1,1)
+    toggleBtn.Text = "Click-Kill Fling: Off"
+    toggleBtn.Parent = frame
+
+    -- Wire up interactions
+    pBox.FocusLost:Connect(function()
+        local v = tonumber(pBox.Text)
+        if v then
+            clickToolFlingPower = v
+        else
+            pBox.Text = tostring(clickToolFlingPower or 200)
+        end
+    end)
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        clickToolFlingEnabled = not clickToolFlingEnabled
+        toggleBtn.Text = "Click-Kill Fling: " .. (clickToolFlingEnabled and "On" or "Off")
+    end)
+
+    return sg
+end
 
 local function createClickKillTool()
     -- avoid duplicates in backpack
@@ -809,6 +898,20 @@ local function createClickKillTool()
         return nil
     end
 
+    -- Ensure equip GUI is prepared (hidden)
+    local gui = ensureClickKillGui()
+    local frame = gui and gui:FindFirstChildWhichIsA("Frame", true)
+
+    -- equipped/unequipped show/hide GUI
+    tool.Equipped:Connect(function()
+        local sg = PlayerGui:FindFirstChild("NPCKillToolGUI")
+        if sg then sg.Enabled = true end
+    end)
+    tool.Unequipped:Connect(function()
+        local sg = PlayerGui:FindFirstChild("NPCKillToolGUI")
+        if sg then sg.Enabled = false end
+    end)
+
     tool.Activated:Connect(function()
         local mouse = player:GetMouse()
         local targetPart = mouse.Target
@@ -819,9 +922,43 @@ local function createClickKillTool()
 
         local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
         if humanoid then
-            humanoid.Health = 0
-            humanoid.Health = 1
-            humanoid.Health = 0
+            -- If click-kill fling enabled, kill then fling
+            if clickToolFlingEnabled then
+                -- Kill
+                pcall(function() humanoid.Health = 0 end)
+                -- compute fling velocity away from local player
+                local playerPos = nil
+                if player.Character and player.Character.PrimaryPart then
+                    pcall(function() playerPos = player.Character.PrimaryPart.Position end)
+                end
+                local pwr = tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200
+                -- apply velocity to all parts away from player
+                iterateParts(npcModel, function(p)
+                    if p and p:IsA("BasePart") and not p.Anchored then
+                        pcall(function()
+                            local dir = Vector3.new(0,1,0)
+                            if playerPos then
+                                local ok, pos = pcall(function() return p.Position end)
+                                if ok and pos then
+                                    dir = (pos - playerPos)
+                                    if dir.Magnitude <= 0.001 then
+                                        dir = Vector3.new(0,1,0)
+                                    else
+                                        dir = dir.Unit
+                                    end
+                                end
+                            end
+                            local velocity = dir * pwr + Vector3.new(0, pwr * 0.45, 0)
+                            if p.AssemblyLinearVelocity ~= nil then p.AssemblyLinearVelocity = velocity else p.Velocity = velocity end
+                        end)
+                    end
+                end)
+            else
+                -- Default simple kill sequence if fling not enabled
+                pcall(function() humanoid.Health = 0 end)
+                pcall(function() humanoid.Health = 1 end)
+                pcall(function() humanoid.Health = 0 end)
+            end
         end
     end)
 end
@@ -1170,6 +1307,40 @@ end)
 
 flingBtn.MouseButton1Click:Connect(function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end)
 flingLoopBtn.MouseButton1Click:Connect(function() loops.flingAll = not loops.flingAll; flingLoopBtn.Text = "Loop: " .. (loops.flingAll and "On" or "Off"); if loops.flingAll then startLoop("flingAll", function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end) else stopLoop("flingAll") end end)
+
+-- Kill+Fling behavior: kills and then flings all NPCs using flingBox value
+killFlingBtn.MouseButton1Click:Connect(function()
+    local p = tonumber(flingBox.Text) or 200
+    for _,m in ipairs(getNPCsArray()) do
+        if isAllowed(m, "Kill") then
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            if hum then
+                pcall(function() hum.Health = 0 end)
+            end
+        end
+        pcall(function() flingModel(m, p) end)
+    end
+end)
+killFlingLoopBtn.MouseButton1Click:Connect(function()
+    loops.killFlingAll = not loops.killFlingAll
+    killFlingLoopBtn.Text = "Loop: " .. (loops.killFlingAll and "On" or "Off")
+    if loops.killFlingAll then
+        startLoop("killFlingAll", function()
+            local p = tonumber(flingBox.Text) or 200
+            for _,m in ipairs(getNPCsArray()) do
+                pcall(function()
+                    if isAllowed(m, "Kill") then
+                        local hum = m:FindFirstChildOfClass("Humanoid")
+                        if hum then pcall(function() hum.Health = 0 end) end
+                    end
+                    flingModel(m, p)
+                end)
+            end
+        end)
+    else
+        stopLoop("killFlingAll")
+    end
+end)
 
 psBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do platformStand(m) end end)
 psLoopBtn.MouseButton1Click:Connect(function() loops.ps = not loops.ps; psLoopBtn.Text = "Loop: " .. (loops.ps and "On" or "Off"); if loops.ps then startLoop("ps", function() for _,m in ipairs(getNPCsArray()) do platformStand(m) end end) else stopLoop("ps") end end)
