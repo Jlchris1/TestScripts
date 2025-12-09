@@ -1,0 +1,610 @@
+-- Blackhole Tendril Mode v2 (client)
+-- Guarantees:
+--  * Uses only existing BaseParts for tendrils (no new parts besides invisible BH centers)
+--  * BHs follow local player's back; only claim & keep parts behind the player
+--  * Movement patterns are completely random per-frame (Random:NextNumber)
+--  * When disabled, absolutely everything created by the script is removed and threads stopped
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+
+local localPlayer = Players.LocalPlayer
+local RandomGen = Random.new(tick())
+
+-- ====== CONFIG ======
+local SCAN_INTERVAL = 0.35
+local BH_OSC_AMPLITUDE = 4.5     -- how far BH attachment can wander (m)
+local BH_BACK_OFFSET = Vector3.new(0, 0.6, -1.2)
+local BH_SPAWN_ON_CLAIM = true
+local MAX_INITIAL_BHS = 1
+local MAX_BHS = 55
+local TENDRIL_MAX_LINKS = 8
+local TENDRIL_SEARCH_RADIUS = 6
+local PART_MIN_MASS = 0.001
+local PART_NAME_BLOCKLIST = { "Handle" }
+local PULSE_INTERVAL = 0.45
+local PULSE_INTENSITY = 120 -- high for "god-tier"
+local TORQUE_INTENSITY = 6e6
+local CHAOTIC_ANGULAR = true
+local SCAN_EXCLUDE_LOCALCHAR = true
+local ALLOW_NPCS = true
+local DEBUG_PRINT = false
+
+-- Important: require dot(product) with lookVector < BEHIND_THRESHOLD to be considered "behind"
+local BEHIND_THRESHOLD = -0.15
+
+-- ====== STATE ======
+local tendrilModeActive = false
+local extraBlackHoles = {}       -- list of BH objects
+local processedParts = {}        -- map[BasePart] = bhOwner
+local descendantAddedConn = nil
+local backgroundAssignThread = nil
+local sweepThread = nil
+
+-- Folder name constant so we can find/destroy BH anchors
+local FOLDER_NAME = "ÆS_BlackHole_Folder"
+
+-- Helper: create/find folder
+local function getOrCreateFolder()
+    local folder = Workspace:FindFirstChild(FOLDER_NAME)
+    if not folder then
+        folder = Instance.new("Folder", Workspace)
+        folder.Name = FOLDER_NAME
+    end
+    return folder
+end
+
+-- Fallback attachment (rarely used)
+local function setupFallbackCenter()
+    local folder = getOrCreateFolder()
+    local existing = folder:FindFirstChild("BH_Center_Part")
+    if existing and existing:IsA("BasePart") then
+        local att = existing:FindFirstChildOfClass("Attachment")
+        if att then return att end
+        local newAtt = Instance.new("Attachment", existing)
+        return newAtt
+    end
+    -- create minimal invisible part as fallback (we will destroy on disable)
+    local part = Instance.new("Part", folder)
+    part.Name = "BH_Center_Part"
+    part.Anchored = true
+    part.CanCollide = false
+    part.Transparency = 1
+    part.Size = Vector3.new(1,1,1)
+    local att = Instance.new("Attachment", part)
+    return att
+end
+local FallbackAttachment = setupFallbackCenter()
+
+-- Utilities
+local function isNameBlocked(name)
+    if not name then return false end
+    for _, v in ipairs(PART_NAME_BLOCKLIST) do if v == name then return true end end
+    return false
+end
+
+local function isPartPlayerCharacter(part)
+    if not part then return false end
+    for _, pl in ipairs(Players:GetPlayers()) do
+        local c = pl.Character
+        if c and part:IsDescendantOf(c) then return true end
+    end
+    return false
+end
+
+local function isSmallPart(p)
+    if not p or not p:IsA("BasePart") then return true end
+    if p.Anchored then return true end
+    if isNameBlocked(p.Name) then return true end
+    if SCAN_EXCLUDE_LOCALCHAR and isPartPlayerCharacter(p) then return true end
+    local parentHum = p.Parent and p.Parent:FindFirstChildOfClass("Humanoid")
+    if parentHum and not ALLOW_NPCS then return true end
+    if p:GetMass() <= PART_MIN_MASS then return true end
+    return false
+end
+
+-- nearest unprocessed part search but ensure the candidate is behind the local player's HRP (if available)
+local function nearestUnprocessedPartFrom(originPos, maxDist)
+    local best = nil
+    local bestDist = maxDist or 1e9
+    local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart") and not processedParts[v] and v.Parent and v:IsDescendantOf(Workspace) then
+            if not isSmallPart(v) then
+                local d = (v.Position - originPos).Magnitude
+                if d <= bestDist then
+                    -- if we have HRP, require "behind"
+                    if hrp then
+                        local dir = (v.Position - hrp.Position)
+                        if dir.Magnitude > 0.001 then
+                            local dot = hrp.CFrame.LookVector:Dot(dir.Unit)
+                            if dot >= BEHIND_THRESHOLD then
+                                -- not behind enough, skip
+                                goto continue_loop
+                            end
+                        end
+                    end
+                    best = v
+                    bestDist = d
+                end
+            end
+        end
+        ::continue_loop::
+    end
+    return best, bestDist
+end
+
+-- Remove all motion objects we create on a part
+local function cleanupPartMeta(part)
+    if not part then return end
+    for _, child in ipairs(part:GetChildren()) do
+        if child.Name == "ÆS_BH_Attachment" or child.Name == "ÆS_BH_Align" or child.Name == "ÆS_BH_AlignOri" or child.Name == "ÆS_BH_Torque" then
+            pcall(function() child:Destroy() end)
+        elseif child:IsA("AlignPosition") and child.Name ~= "ÆS_BH_Align" then
+            -- do not aggressively remove other AlignPosition if we didn't create them — but we created ours named ÆS...
+            -- leave others alone
+        end
+    end
+    -- also remove any AlignPosition/AlignOrientation/Torque we created under standard names
+    -- (we named them explicitly above)
+end
+
+-- Claim part for bh: adds Attachment (named), AlignPosition, AlignOrientation, Torque, marks processedParts
+local function claimPartForBH(bh, part, attachTo)
+    if not bh or not part or processedParts[part] then return false end
+    if isPartPlayerCharacter(part) then return false end
+    processedParts[part] = bh
+    bh.AssignedParts = bh.AssignedParts or {}
+    table.insert(bh.AssignedParts, part)
+
+    -- cleanup potential previous motion objects from previous runs if any
+    cleanupPartMeta(part)
+
+    -- attachment
+    local att = part:FindFirstChild("ÆS_BH_Attachment")
+    if not att then
+        att = Instance.new("Attachment")
+        att.Name = "ÆS_BH_Attachment"
+        att.Parent = part
+    end
+    pcall(function() att.WorldCFrame = part.CFrame end)
+
+    -- AlignPosition
+    local ap = Instance.new("AlignPosition")
+    ap.Name = "ÆS_BH_Align"
+    ap.Attachment0 = att
+    ap.Attachment1 = (attachTo and attachTo:IsA("Attachment")) and attachTo or FallbackAttachment
+    ap.MaxForce = 9e9
+    ap.MaxVelocity = math.huge
+    ap.Responsiveness = 800 + RandomGen:NextInteger(0, 800)
+    ap.Parent = part
+
+    -- AlignOrientation
+    local ao = Instance.new("AlignOrientation")
+    ao.Name = "ÆS_BH_AlignOri"
+    ao.Attachment0 = att
+    ao.Attachment1 = ap.Attachment1 or FallbackAttachment
+    ao.MaxTorque = 9e7
+    ao.Responsiveness = 500 + RandomGen:NextInteger(0, 800)
+    ao.Parent = part
+
+    -- Torque
+    local torque = Instance.new("Torque")
+    torque.Name = "ÆS_BH_Torque"
+    torque.Attachment0 = att
+    torque.Torque = Vector3.new(TORQUE_INTENSITY, TORQUE_INTENSITY, TORQUE_INTENSITY)
+    torque.Parent = part
+
+    -- per-part meta
+    bh._partMeta = bh._partMeta or {}
+    bh._partMeta[part] = {
+        attachment = att,
+        alignPos = ap,
+        alignOri = ao,
+        torque = torque,
+        rndSeed = RandomGen:NextNumber() * 10
+    }
+
+    return true
+end
+
+-- Grow tendril from a primary part using only existing unprocessed parts within radius and behind player
+local function growTendrilFromPrimary(bh, primaryPart)
+    if not bh or not primaryPart then return end
+    local chain = { primaryPart }
+    local prevPart = primaryPart
+    for i = 2, TENDRIL_MAX_LINKS do
+        local best = nil
+        local bestd = TENDRIL_SEARCH_RADIUS + 0.001
+        for _, v in ipairs(Workspace:GetDescendants()) do
+            if v:IsA("BasePart") and not processedParts[v] and v.Parent and v ~= prevPart then
+                if not isSmallPart(v) then
+                    local d = (v.Position - prevPart.Position).Magnitude
+                    if d < bestd then
+                        -- ensure v is behind hrp if hrp exists
+                        local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+                        if hrp then
+                            local dir = (v.Position - hrp.Position)
+                            if dir.Magnitude > 0.001 then
+                                local dot = hrp.CFrame.LookVector:Dot(dir.Unit)
+                                if dot >= BEHIND_THRESHOLD then
+                                    goto continue_grow
+                                end
+                            end
+                        end
+
+                        best = v
+                        bestd = d
+                    end
+                end
+            end
+            ::continue_grow::
+        end
+        if not best then break end
+        local prevMeta = bh._partMeta and bh._partMeta[prevPart]
+        local attachTo = prevMeta and prevMeta.attachment or (prevPart:FindFirstChildOfClass("Attachment") or FallbackAttachment)
+        local ok = claimPartForBH(bh, best, attachTo)
+        if not ok then break end
+        table.insert(chain, best)
+        prevPart = best
+    end
+    return chain
+end
+
+-- Create BH anchor (small invisible anchored Part + Attachment). BH follows local player's back.
+local function createExtraBlackHole()
+    if #extraBlackHoles >= MAX_BHS then
+        if DEBUG_PRINT then warn("Max BHs hit") end
+        return nil
+    end
+    local folder = getOrCreateFolder()
+    local part = Instance.new("Part", folder)
+    part.Name = "ExtraBH_Center"
+    part.Size = Vector3.new(1,1,1)
+    part.Anchored = true
+    part.CanCollide = false
+    part.Transparency = 1
+
+    local att = Instance.new("Attachment", part)
+    att.Name = "ÆS_BH_CenterAtt"
+
+    local bh = {
+        Part = part,
+        Attachment = att,
+        AssignedParts = {},
+        _running = true,
+        _partMeta = {},
+        id = RandomGen:NextInteger(1, 1e8)
+    }
+    table.insert(extraBlackHoles, bh)
+
+    spawn(function()
+        local t = 0
+        local pulseTimer = 0
+        while bh._running and tendrilModeActive do
+            local dt = RunService.Heartbeat:Wait()
+            t = t + dt
+            pulseTimer = pulseTimer + dt
+
+            -- BH follows local player's back with completely random offset each frame (absolutely random)
+            if localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                local hrp = localPlayer.Character.HumanoidRootPart
+                local baseCF = hrp.CFrame * CFrame.new(BH_BACK_OFFSET)
+                -- random offset vector
+                local rx = RandomGen:NextNumber(-1, 1) * BH_OSC_AMPLITUDE
+                local ry = RandomGen:NextNumber(-1, 1) * (BH_OSC_AMPLITUDE * 0.6)
+                local rz = RandomGen:NextNumber(-1, 1) * (BH_OSC_AMPLITUDE * 0.9)
+                local rawOffset = Vector3.new(rx, ry, rz)
+                -- ensure forward (relative to player) component is not in front: dot with lookVector must be <= 0
+                local forwardComp = hrp.CFrame.LookVector:Dot(rawOffset)
+                if forwardComp > 0 then
+                    -- remove forward component so offset is behind or lateral only
+                    rawOffset = rawOffset - hrp.CFrame.LookVector * (forwardComp + 0.02)
+                end
+                local targetCF = baseCF * CFrame.new(rawOffset)
+                local ok, cur = pcall(function() return bh.Attachment.WorldCFrame end)
+                local curCF = ok and cur or bh.Part.CFrame
+                -- smoothing so it doesn't teleport (lerp using dt)
+                bh.Attachment.WorldCFrame = curCF:Lerp(targetCF, math.clamp(dt * 6, 0, 1))
+                pcall(function() bh.Part.CFrame = bh.Attachment.WorldCFrame end)
+            end
+
+            -- claim primary if BH has none: pick nearest unprocessed part behind player
+            if #bh.AssignedParts == 0 then
+                local origin = (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character.HumanoidRootPart.Position) or bh.Part.Position
+                local candidate, d = nearestUnprocessedPartFrom(origin, 55)
+                if candidate and not processedParts[candidate] then
+                    local ok = claimPartForBH(bh, candidate, bh.Attachment)
+                    if ok then
+                        growTendrilFromPrimary(bh, candidate)
+                        if BH_SPAWN_ON_CLAIM and #extraBlackHoles < MAX_BHS then
+                            createExtraBlackHole()
+                        end
+                    end
+                end
+            end
+
+            -- pulses: constrained so forward component relative to local player is NEVER positive
+            if pulseTimer >= PULSE_INTERVAL then
+                pulseTimer = 0
+                for _, part in ipairs(bh.AssignedParts) do
+                    if part and part.Parent and not part.Anchored then
+                        local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+                        local dir
+                        if hrp then
+                            dir = (part.Position - bh.Attachment.WorldPosition)
+                            if dir.Magnitude < 0.001 then dir = -hrp.CFrame.LookVector end
+                            dir = dir.Unit
+                            local forwardComp = hrp.CFrame.LookVector:Dot(dir)
+                            if forwardComp >= 0 then
+                                -- force backward-ish direction
+                                dir = (-hrp.CFrame.LookVector + Vector3.new(RandomGen:NextNumber(-0.4,0.4), RandomGen:NextNumber(-0.4,0.4), RandomGen:NextNumber(-0.4,0.4))).Unit
+                            end
+                        else
+                            -- no hrp, random direction but bias backward in world -Z
+                            dir = Vector3.new(RandomGen:NextNumber(-0.5,0.5), RandomGen:NextNumber(-0.5,0.5), RandomGen:NextNumber(-1, -0.1)).Unit
+                        end
+
+                        local randComp = Vector3.new(RandomGen:NextNumber(-1,1), RandomGen:NextNumber(-1,1), RandomGen:NextNumber(-1,1))
+                        local pulse = (dir * (PULSE_INTENSITY + RandomGen:NextNumber(0, PULSE_INTENSITY))) + (randComp * (PULSE_INTENSITY*0.45))
+                        -- clamp forward component one more time
+                        if localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                            local hrp2 = localPlayer.Character.HumanoidRootPart
+                            local fwd = hrp2.CFrame.LookVector
+                            local fwdComp = fwd:Dot(pulse)
+                            if fwdComp > 0 then
+                                pulse = pulse - fwd * (fwdComp + 0.02)
+                            end
+                        end
+                        pcall(function() part.AssemblyLinearVelocity = pulse end)
+                        if CHAOTIC_ANGULAR then
+                            pcall(function() part.AssemblyAngularVelocity = Vector3.new(RandomGen:NextNumber(-120,120), RandomGen:NextNumber(-120,120), RandomGen:NextNumber(-120,120)) end)
+                        end
+                    end
+                end
+            end
+
+            -- per-frame random micro-wobble for each part's attachment (no deterministic math)
+            for part, meta in pairs(bh._partMeta) do
+                if part and part.Parent and meta and meta.attachment then
+                    local r1 = Vector3.new(RandomGen:NextNumber(-1,1), RandomGen:NextNumber(-1,1), RandomGen:NextNumber(-1,1)) * 0.04
+                    -- ensure micro-nudge doesn't send attachment forward relative to player
+                    if localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                        local hrp = localPlayer.Character.HumanoidRootPart
+                        local fwdComp = hrp.CFrame.LookVector:Dot(r1)
+                        if fwdComp > 0 then
+                            r1 = r1 - hrp.CFrame.LookVector * (fwdComp + 0.001)
+                        end
+                    end
+                    local ok, cur = pcall(function() return meta.attachment.WorldCFrame end)
+                    if ok and cur then
+                        local target = cur * CFrame.new(r1)
+                        pcall(function() meta.attachment.WorldCFrame = cur:Lerp(target, math.clamp(dt*10,0,1)) end)
+                    end
+                    -- randomize torque a little
+                    if meta.torque and meta.torque.Parent then
+                        local noise = Vector3.new(RandomGen:NextNumber(-1,1), RandomGen:NextNumber(-1,1), RandomGen:NextNumber(-1,1)) * (TORQUE_INTENSITY * 0.5)
+                        pcall(function() meta.torque.Torque = Vector3.new(TORQUE_INTENSITY, TORQUE_INTENSITY, TORQUE_INTENSITY) + noise end)
+                    end
+                end
+            end
+
+            -- cleanup dead parts from list
+            for i = #bh.AssignedParts, 1, -1 do
+                local p = bh.AssignedParts[i]
+                if not p or not p.Parent then
+                    table.remove(bh.AssignedParts, i)
+                    if bh._partMeta and bh._partMeta[p] then bh._partMeta[p] = nil end
+                end
+            end
+        end
+
+        -- stop BH: clear its AssignedParts map (we do not remove parts themselves here — cleanupAll will)
+        bh._running = false
+        if bh.Part and bh.Part.Parent then pcall(function() bh.Part:Destroy() end) end
+    end)
+
+    return bh
+end
+
+-- Destroy all BH anchors and stop BH threads
+local function destroyAllBHs()
+    for _, bh in ipairs(extraBlackHoles) do
+        bh._running = false
+        if bh.Part and bh.Part.Parent then
+            pcall(function() bh.Part:Destroy() end)
+        end
+    end
+    extraBlackHoles = {}
+end
+
+-- Cleanup everything created by this script so nothing lingers
+local function cleanupAll()
+    -- stop background threads by flipping toggle flag
+    tendrilModeActive = false
+
+    -- disconnect scanner
+    if descendantAddedConn then
+        pcall(function() descendantAddedConn:Disconnect() end)
+        descendantAddedConn = nil
+    end
+
+    -- stop sweep thread
+    if sweepThread then
+        sweepThread = nil
+    end
+
+    -- stop BHs
+    destroyAllBHs()
+
+    -- remove all Attach/Align/Torque created on parts and clear processedParts
+    for part, owner in pairs(processedParts) do
+        if part and part.Parent then
+            -- destroy our attachments and alignment objects
+            for _, c in ipairs(part:GetChildren()) do
+                if c.Name == "ÆS_BH_Attachment" or c.Name == "ÆS_BH_Align" or c.Name == "ÆS_BH_AlignOri" or c.Name == "ÆS_BH_Torque" then
+                    pcall(function() c:Destroy() end)
+                end
+            end
+            -- try to reset velocities
+            pcall(function()
+                part.AssemblyLinearVelocity = Vector3.new()
+                part.AssemblyAngularVelocity = Vector3.new()
+            end)
+        end
+    end
+    processedParts = {}
+
+    -- remove fallback BH center
+    local folder = Workspace:FindFirstChild(FOLDER_NAME)
+    if folder then
+        pcall(function() folder:Destroy() end)
+    end
+
+    -- re-setup minimal fallback attachment for future runs
+    FallbackAttachment = setupFallbackCenter()
+end
+
+-- Scanner: when new parts are created, try to assign them to idle BHs (but only behind player)
+local function continuousWorkspaceScanner()
+    if descendantAddedConn then
+        pcall(function() descendantAddedConn:Disconnect() end)
+        descendantAddedConn = nil
+    end
+    descendantAddedConn = Workspace.DescendantAdded:Connect(function(obj)
+        if not tendrilModeActive then return end
+        if obj and obj:IsA("BasePart") and not processedParts[obj] and not isSmallPart(obj) then
+            -- let an idle BH claim it (the BH loop also picks parts proactively)
+            for _, bh in ipairs(extraBlackHoles) do
+                if bh and bh._running and #bh.AssignedParts == 0 then
+                    local dist = (bh.Part.Position - obj.Position).Magnitude
+                    if dist < 60 then
+                        if claimPartForBH(bh, obj, bh.Attachment) then
+                            growTendrilFromPrimary(bh, obj)
+                            if BH_SPAWN_ON_CLAIM and #extraBlackHoles < MAX_BHS then createExtraBlackHole() end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- Sweep: attempt to assign unclaimed parts to idle BHs (used by loop-check)
+local function sweepAssign()
+    if #extraBlackHoles == 0 then return end
+    local candidates = {}
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart") and not processedParts[v] and not isSmallPart(v) then
+            table.insert(candidates, v)
+        end
+    end
+    if #candidates == 0 then return end
+    -- randomize order
+    for i = #candidates, 2, -1 do
+        local j = RandomGen:NextInteger(1, i)
+        candidates[i], candidates[j] = candidates[j], candidates[i]
+    end
+
+    for _, bh in ipairs(extraBlackHoles) do
+        if bh and bh._running and #bh.AssignedParts == 0 then
+            local best = nil
+            local bestd = 1e9
+            for _, c in ipairs(candidates) do
+                if c and not processedParts[c] then
+                    local d = (c.Position - bh.Part.Position).Magnitude
+                    if d < bestd then best = c bestd = d end
+                end
+            end
+            if best then
+                if claimPartForBH(bh, best, bh.Attachment) then
+                    growTendrilFromPrimary(bh, best)
+                    if BH_SPAWN_ON_CLAIM and #extraBlackHoles < MAX_BHS then createExtraBlackHole() end
+                end
+            end
+        end
+    end
+end
+
+-- GUI (TurtleLib minimal)
+local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/miroeramaa/TurtleLib/main/TurtleUiLib.lua"))()
+local window = library:Window("TurtleHub — Tendril Mode (safe)")
+
+window:Button("telekinesis/fix target", function()
+    pcall(function()
+        loadstring(game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true))()
+    end)
+end)
+
+-- Continuous Loop Check toggle (kept) - will run sweepAssign periodically
+local loopCheckActive = false
+window:Toggle("Continuous Loop Check", false, function(val)
+    loopCheckActive = val
+    if loopCheckActive then
+        sweepThread = spawn(function()
+            while loopCheckActive and tendrilModeActive do
+                sweepAssign()
+                wait(0.55)
+            end
+            sweepThread = nil
+        end)
+    else
+        sweepThread = nil
+    end
+end)
+
+-- Tendril Mode toggle
+window:Toggle("Blackhole Tendril Mode", false, function(Value)
+    if Value then
+        -- enable
+        -- ensure any previous artifacts are cleaned
+        cleanupAll()
+
+        tendrilModeActive = true
+        -- initial BH(s)
+        for i = 1, MAX_INITIAL_BHS do createExtraBlackHole() end
+        continuousWorkspaceScanner()
+
+        -- background thread to let BHs try to pick primaries if idle (random search)
+        backgroundAssignThread = spawn(function()
+            while tendrilModeActive do
+                for _, bh in ipairs(extraBlackHoles) do
+                    if not tendrilModeActive then break end
+                    if bh and bh._running and #bh.AssignedParts == 0 then
+                        local origin = (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character.HumanoidRootPart.Position) or bh.Part.Position
+                        local candidate, d = nearestUnprocessedPartFrom(origin, 55)
+                        if candidate then
+                            if claimPartForBH(bh, candidate, bh.Attachment) then
+                                growTendrilFromPrimary(bh, candidate)
+                                if BH_SPAWN_ON_CLAIM and #extraBlackHoles < MAX_BHS then createExtraBlackHole() end
+                            end
+                        end
+                    end
+                end
+                wait(SCAN_INTERVAL)
+            end
+            backgroundAssignThread = nil
+        end)
+    else
+        -- disable: absolute cleanup
+        cleanupAll()
+    end
+end)
+
+-- Ensure complete shutdown on character removal or when script unloads
+local function onCharacterAdded(char)
+    -- if mode active, rebind scanner; if disabled nothing to do
+    if tendrilModeActive then
+        continuousWorkspaceScanner()
+    end
+end
+Players.LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+
+-- safe shutdown binding
+game:BindToClose(function()
+    cleanupAll()
+end)
+
+if DEBUG_PRINT then print("Blackhole Tendril Mode v2 loaded") end
