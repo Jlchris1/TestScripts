@@ -38,11 +38,15 @@ local prevSelectedType = nil
 local cancelChaseEnabled = false
 local trackerScanRunning = false
 
+-- For equip-only hide toggle
+local hideOnEquipEnabled = false
+local prevMainVisible = false
+
 -- make weak-keyed so removed models can be GC'd
 setmetatable(NPCs, { __mode = "k" })
 setmetatable(trackedNPCs, { __mode = "k" })
 
--- EFFECTS list
+-- EFFECTS list (removed "Void" and "Void3"; added "VoidV4"; removed "HPNaN" and "Heal")
 local EFFECTS = {
     "Kill","Fling","PlatformStand","Sit","Anchor","CancelChase","GetRid","Erase",
     "Spasm","Jump","Speed","JumpPower","HipHeight","Tracker","VoidV4"
@@ -132,10 +136,9 @@ end
 -- ACTIONS
 
 -- Reusable damage sequence helper (0 -> wait -> 1 -> wait -> heavy kill)
+-- Note: this helper does not touch BreakJointsOnDeath; callers decide break-joints behavior
 local function applyDamageSequence(hum)
     if not hum then return end
-    -- Ensure BreakJointsOnDeath enabled for normal kills (defensive)
-    pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end)
     pcall(function() hum.Health = 0 end)
     task.wait(0.01)
     pcall(function() hum.Health = 1 end)
@@ -151,15 +154,18 @@ local function killAllSimultaneousForList(models)
     for _,model in ipairs(models) do
         if isAllowed(model, "Kill") then
             local hum = model:FindFirstChildOfClass("Humanoid")
-            if hum then
-                -- Always enable BreakJointsOnDeath on normal kills
-                pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end)
-                table.insert(humanoids, hum)
-            end
+            if hum then table.insert(humanoids, hum) end
         end
     end
     if #humanoids == 0 then return end
-    for _,hum in ipairs(humanoids) do pcall(function() hum.Health = 100 end) end
+
+    -- Ensure BreakJointsOnDeath is enabled for normal (non-click) kills:
+    for _,hum in ipairs(humanoids) do
+        pcall(function()
+            if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end
+            hum.Health = 100
+        end)
+    end
     task.wait(0.04)
     for _,hum in ipairs(humanoids) do
         pcall(function()
@@ -296,6 +302,7 @@ end
 local function removeTrackerFromModel(model)
     if not model then return end
     local data = trackedNPCs[model]
+    -- Destroy objects referenced in trackedNPCs table
     if data then
         if data.gui then
             pcall(function() data.gui:Destroy() end)
@@ -303,6 +310,7 @@ local function removeTrackerFromModel(model)
         if data.highlight then
             pcall(function() data.highlight:Destroy() end)
         end
+        -- disconnect stored connections
         if data._connections then
             for _,c in ipairs(data._connections) do
                 pcall(function() c:Disconnect() end)
@@ -310,6 +318,7 @@ local function removeTrackerFromModel(model)
         end
     end
 
+    -- Also attempt to remove any stray BillboardGui/Highlight in current PlayerGui that refer to the model
     local pg = getPlayerGui()
     if pg then
         for _,desc in ipairs(pg:GetDescendants()) do
@@ -338,6 +347,7 @@ local function addTrackerToModel(model)
     if not model then return end
     if not isAllowed(model, "Tracker") then return end
 
+    -- Remove any previous leftover trackers for this model first (defensive)
     removeTrackerFromModel(model)
 
     local part = getBestPartForModel(model)
@@ -371,8 +381,10 @@ local function addTrackerToModel(model)
     highlight.OutlineColor = Color3.fromRGB(80,200,120)
     highlight.OutlineTransparency = 0
 
+    -- connection table for cleanup
     local conns = {}
 
+    -- Humanoid death should remove tracker
     local hum = model:FindFirstChildOfClass("Humanoid")
     if hum and hum:IsA("Humanoid") then
         table.insert(conns, hum.Died:Connect(function()
@@ -380,12 +392,14 @@ local function addTrackerToModel(model)
         end))
     end
 
+    -- If model is removed from workspace (Parent changes), remove tracker
     table.insert(conns, model.AncestryChanged:Connect(function(_, newParent)
         if not model.Parent or not isNPC(model) then
             removeTrackerFromModel(model)
         end
     end))
 
+    -- Monitor the adornee part: if its position goes to zero or below void threshold, remove the tracker
     if part and part:IsA("BasePart") then
         local function checkPartPos()
             if not part or not part.Parent then
@@ -401,6 +415,7 @@ local function addTrackerToModel(model)
             end
         end
         table.insert(conns, part:GetPropertyChangedSignal("Position"):Connect(checkPartPos))
+        -- Also run initial check
         checkPartPos()
     end
 
@@ -479,22 +494,26 @@ SmallToggle.Text = "NPC"
 SmallToggle.Parent = ScreenGui
 SmallToggle.ZIndex = 10
 
--- Small hide-on-equip toggle (appears only when tool is equipped)
-local smallHideToggle = Instance.new("TextButton")
-smallHideToggle.Name = "SmallHideOnEquip"
-smallHideToggle.Size = UDim2.new(0, SMALL_TOGGLE_W, 0, SMALL_TOGGLE_H)
-smallHideToggle.AnchorPoint = Vector2.new(0.5, 0)
--- place to the right of SmallToggle
-smallHideToggle.Position = UDim2.new(0.5, SMALL_TOGGLE_W + 8, 0, CENTER_TOP_Y)
-smallHideToggle.BackgroundColor3 = Color3.fromRGB(44,44,44)
-smallHideToggle.BorderSizePixel = 0
-smallHideToggle.Font = Enum.Font.GothamBold
-smallHideToggle.TextSize = 11
-smallHideToggle.TextColor3 = Color3.new(1,1,1)
-smallHideToggle.Text = "Hide: Off"
-smallHideToggle.Parent = ScreenGui
-smallHideToggle.Visible = false
-smallHideToggle.ZIndex = 11
+-- New: small equip-only toggle (same size, placed to the right)
+local smallEquipToggle = Instance.new("TextButton")
+smallEquipToggle.Name = "SmallEquipToggle"
+smallEquipToggle.Size = UDim2.new(0, SMALL_TOGGLE_W, 0, SMALL_TOGGLE_H)
+smallEquipToggle.AnchorPoint = Vector2.new(0.5,0)
+smallEquipToggle.Position = UDim2.new(0.5, 40, 0, CENTER_TOP_Y) -- offset to right from center toggle
+smallEquipToggle.BackgroundColor3 = Color3.fromRGB(44,44,44)
+smallEquipToggle.BorderSizePixel = 0
+smallEquipToggle.Font = Enum.Font.GothamBold
+smallEquipToggle.TextSize = 11
+smallEquipToggle.TextColor3 = Color3.new(1,1,1)
+smallEquipToggle.Text = "HideOnEquip: Off"
+smallEquipToggle.Parent = ScreenGui
+smallEquipToggle.Visible = false -- only visible while tool equipped
+smallEquipToggle.ZIndex = 11
+
+smallEquipToggle.MouseButton1Click:Connect(function()
+    hideOnEquipEnabled = not hideOnEquipEnabled
+    smallEquipToggle.Text = "HideOnEquip: " .. (hideOnEquipEnabled and "On" or "Off")
+end)
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
@@ -824,12 +843,9 @@ local clickToolConn = nil
 local clickToolFlingEnabled = false
 local clickToolFlingPower = 200
 local breakRestoreDelay = 1 -- seconds (default). adjustable via equip GUI textbox
-local clickToolFlingOnly = false -- NEW: if true, tool will only fling on click (no kill)
 
--- NEW: Hide-on-equip behavior vars
-local hideGuiWhenEquipped = false
-local guiHiddenByTool = false
-local prevIsOpenBeforeTool = nil
+-- New: disable kill on click (only fling)
+local clickToolKillEnabled = true -- true by default (click does kill unless turned off)
 
 -- We'll create a GUI that appears when the tool is equipped.
 local function ensureClickKillGui()
@@ -846,9 +862,9 @@ local function ensureClickKillGui()
     sg.Enabled = false
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 220, 0, 130) -- increased height to fit restore-delay + fling-only button
+    frame.Size = UDim2.new(0, 220, 0, 132) -- increased height to fit restore-delay box + extra toggle
     -- Start on left side, middle of the screen
-    frame.Position = UDim2.new(0, 8, 0.5, -65)
+    frame.Position = UDim2.new(0, 8, 0.5, -66)
     frame.AnchorPoint = Vector2.new(0, 0)
     frame.BackgroundColor3 = Color3.fromRGB(30,30,30)
     frame.BorderSizePixel = 0
@@ -956,16 +972,16 @@ local function ensureClickKillGui()
     toggleBtn.Text = "Click-Kill Fling: Off"
     toggleBtn.Parent = frame
 
-    -- NEW: fling-only toggle below the click-kill toggle
-    local flingOnlyBtn = Instance.new("TextButton")
-    flingOnlyBtn.Size = UDim2.new(1, -8, 0, 20)
-    flingOnlyBtn.Position = UDim2.new(0, 4, 0, 108)
-    flingOnlyBtn.BackgroundColor3 = Color3.fromRGB(58,58,58)
-    flingOnlyBtn.Font = Enum.Font.Gotham
-    flingOnlyBtn.TextSize = 12
-    flingOnlyBtn.TextColor3 = Color3.new(1,1,1)
-    flingOnlyBtn.Text = "Fling Only: Off"
-    flingOnlyBtn.Parent = frame
+    -- New: Only-Fling (no kill) toggle (placed below the main toggle)
+    local onlyFlingBtn = Instance.new("TextButton")
+    onlyFlingBtn.Size = UDim2.new(1, -8, 0, 20)
+    onlyFlingBtn.Position = UDim2.new(0, 4, 0, 108)
+    onlyFlingBtn.BackgroundColor3 = Color3.fromRGB(58,58,58)
+    onlyFlingBtn.Font = Enum.Font.Gotham
+    onlyFlingBtn.TextSize = 12
+    onlyFlingBtn.TextColor3 = Color3.new(1,1,1)
+    onlyFlingBtn.Text = "Only Fling (no Kill): Off"
+    onlyFlingBtn.Parent = frame
 
     -- Wire up interactions
     pBox.FocusLost:Connect(function()
@@ -991,9 +1007,9 @@ local function ensureClickKillGui()
         toggleBtn.Text = "Click-Kill Fling: " .. (clickToolFlingEnabled and "On" or "Off")
     end)
 
-    flingOnlyBtn.MouseButton1Click:Connect(function()
-        clickToolFlingOnly = not clickToolFlingOnly
-        flingOnlyBtn.Text = "Fling Only: " .. (clickToolFlingOnly and "On" or "Off")
+    onlyFlingBtn.MouseButton1Click:Connect(function()
+        clickToolKillEnabled = not clickToolKillEnabled
+        onlyFlingBtn.Text = "Only Fling (no Kill): " .. (not clickToolKillEnabled and "On" or "Off")
     end)
 
     return sg
@@ -1040,66 +1056,29 @@ local function createClickKillTool()
         local sg = getPlayerGui() and getPlayerGui():FindFirstChild("NPCKillToolGUI")
         if sg then sg.Enabled = true end
 
-        -- show the smallHideToggle button while tool is equipped
-        smallHideToggle.Visible = true
+        -- show small equip toggle
+        smallEquipToggle.Visible = true
 
-        -- if hide-on-equip is ON, hide main GUI frames (but keep small toggles visible)
-        if hideGuiWhenEquipped then
-            -- save previous open state
-            prevIsOpenBeforeTool = isOpen
-            if isOpen then
-                -- hide main UI
-                isOpen = false
-                MainFrame.Visible = false
-                Content.Visible = false
-                ExclusionPanel.Visible = false
-                FeaturesPanel.Visible = false
-                leftPanel.Visible = false
-                guiHiddenByTool = true
-            end
+        -- if hideOnEquipEnabled, hide main GUI but keep toggles visible
+        if hideOnEquipEnabled then
+            prevMainVisible = MainFrame.Visible
+            MainFrame.Visible = false
+            Content.Visible = false
+            ExclusionPanel.Visible = false
+            FeaturesPanel.Visible = false
+            leftPanel.Visible = false
         end
     end)
     tool.Unequipped:Connect(function()
         local sg = getPlayerGui() and getPlayerGui():FindFirstChild("NPCKillToolGUI")
         if sg then sg.Enabled = false end
 
-        -- hide the smallHideToggle button when unequipped
-        smallHideToggle.Visible = false
-
-        -- restore GUI visibility if it was hidden by the tool
-        if guiHiddenByTool then
-            if prevIsOpenBeforeTool then
-                isOpen = true
-                SmallToggle.Text = "X"
-                MainFrame.Visible = true
-                Content.Visible = true
-                showTab("Controls")
-            else
-                -- remain closed if it was closed before
-                isOpen = false
-            end
-            guiHiddenByTool = false
-            prevIsOpenBeforeTool = nil
-        end
-    end)
-
-    -- Ensure smallHideToggle can change hideGuiWhenEquipped while tool is equipped
-    smallHideToggle.MouseButton1Click:Connect(function()
-        hideGuiWhenEquipped = not hideGuiWhenEquipped
-        smallHideToggle.Text = "Hide: " .. (hideGuiWhenEquipped and "On" or "Off")
-        -- if enabling while tool already equipped and main GUI is open -> hide now
-        if hideGuiWhenEquipped and tool and tool.Parent and tool.Parent:IsA("Backpack") == false then
-            -- if tool is currently equipped (we're likely in Equipped handler), hide main UI now
-            prevIsOpenBeforeTool = isOpen
-            if isOpen then
-                isOpen = false
-                MainFrame.Visible = false
-                Content.Visible = false
-                ExclusionPanel.Visible = false
-                FeaturesPanel.Visible = false
-                leftPanel.Visible = false
-                guiHiddenByTool = true
-            end
+        -- hide small equip toggle and restore main GUI visibility
+        smallEquipToggle.Visible = false
+        if hideOnEquipEnabled then
+            -- restore previous main visibility
+            MainFrame.Visible = prevMainVisible or false
+            Content.Visible = prevMainVisible or false
         end
     end)
 
@@ -1113,17 +1092,26 @@ local function createClickKillTool()
 
         local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
         if humanoid then
-            -- For click-tool: disable BreakJointsOnDeath first (defensive)
-            pcall(function()
-                if humanoid.BreakJointsOnDeath ~= nil then
-                    humanoid.BreakJointsOnDeath = false
-                end
-            end)
-            -- small delay before applying kill/fling
+            -- Only disable BreakJointsOnDeath if we're going to perform a kill via click (user requested this for click-kill)
+            if clickToolKillEnabled then
+                pcall(function()
+                    if humanoid.BreakJointsOnDeath ~= nil then
+                        humanoid.BreakJointsOnDeath = false
+                    end
+                end)
+            end
+
+            -- small delay as requested before applying kill/fling
             task.wait(0.1)
 
-            -- If Fling-Only is enabled, only fling (no kill)
-            if clickToolFlingOnly then
+            -- If click-kill fling enabled and we are allowed to fling, perform fling logic
+            if clickToolFlingEnabled then
+                -- If killing is enabled for click, do the kill sequence first (but ensure normal-kill rule not applied here)
+                if clickToolKillEnabled then
+                    -- apply click-specific kill (uses same damage sequence) - do NOT force BreakJointsOnDeath to true here (we intentionally disabled it above)
+                    applyDamageSequence(humanoid)
+                end
+
                 -- Make NPC massless before fling (defensive)
                 iterateParts(npcModel, function(p)
                     pcall(function()
@@ -1137,6 +1125,7 @@ local function createClickKillTool()
                     pcall(function() playerPos = player.Character.PrimaryPart.Position end)
                 end
                 local pwr = tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200
+                -- apply velocity to all parts away from player
                 iterateParts(npcModel, function(p)
                     if p and p:IsA("BasePart") and not p.Anchored then
                         pcall(function()
@@ -1158,16 +1147,18 @@ local function createClickKillTool()
                     end
                 end)
 
-                -- restore after delay
+                -- Re-enable BreakJointsOnDeath and restore mass after configured delay (defensive)
+                -- Only re-enable BreakJoints if we had disabled it (i.e., clickToolKillEnabled was true)
                 local humRef = humanoid
                 local modelRef = npcModel
                 local delaySec = tonumber(breakRestoreDelay) or 1
                 task.delay(delaySec, function()
                     pcall(function()
-                        if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil then
+                        if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil and clickToolKillEnabled then
                             humRef.BreakJointsOnDeath = true
                         end
                     end)
+                    -- restore massless -> false
                     if modelRef then
                         iterateParts(modelRef, function(p)
                             pcall(function()
@@ -1176,50 +1167,13 @@ local function createClickKillTool()
                         end)
                     end
                 end)
-
             else
-                -- If click-kill fling enabled -> kill then fling; else default kill-only sequence
-                if clickToolFlingEnabled then
-                    -- kill using sequence
+                -- If fling not enabled, but kill is enabled, just perform the click kill sequence
+                if clickToolKillEnabled then
                     applyDamageSequence(humanoid)
 
-                    -- Make NPC massless before fling (defensive)
-                    iterateParts(npcModel, function(p)
-                        pcall(function()
-                            if p.Massless ~= nil then p.Massless = true end
-                        end)
-                    end)
-
-                    -- compute fling velocity away from local player
-                    local playerPos = nil
-                    if player.Character and player.Character.PrimaryPart then
-                        pcall(function() playerPos = player.Character.PrimaryPart.Position end)
-                    end
-                    local pwr = tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200
-                    iterateParts(npcModel, function(p)
-                        if p and p:IsA("BasePart") and not p.Anchored then
-                            pcall(function()
-                                local dir = Vector3.new(0,1,0)
-                                if playerPos then
-                                    local ok, pos = pcall(function() return p.Position end)
-                                    if ok and pos then
-                                        dir = (pos - playerPos)
-                                        if dir.Magnitude <= 0.001 then
-                                            dir = Vector3.new(0,1,0)
-                                        else
-                                            dir = dir.Unit
-                                        end
-                                    end
-                                end
-                                local velocity = dir * pwr + Vector3.new(0, pwr * 0.45, 0)
-                                if p.AssemblyLinearVelocity ~= nil then p.AssemblyLinearVelocity = velocity else p.Velocity = velocity end
-                            end)
-                        end
-                    end)
-
-                    -- Re-enable BreakJointsOnDeath and restore mass after configured delay (defensive)
+                    -- Re-enable BreakJoints after configured delay (because click flow disabled it earlier)
                     local humRef = humanoid
-                    local modelRef = npcModel
                     local delaySec = tonumber(breakRestoreDelay) or 1
                     task.delay(delaySec, function()
                         pcall(function()
@@ -1227,19 +1181,7 @@ local function createClickKillTool()
                                 humRef.BreakJointsOnDeath = true
                             end
                         end)
-                        if modelRef then
-                            iterateParts(modelRef, function(p)
-                                pcall(function()
-                                    if p.Massless ~= nil then p.Massless = false end
-                                end)
-                            end)
-                        end
                     end)
-
-                else
-                    -- Default sequence: just perform the damage sequence (normal kill)
-                    applyDamageSequence(humanoid)
-                    -- Ensure BreakJointsOnDeath is enabled (applyDamageSequence sets it defensively)
                 end
             end
         end
@@ -1332,6 +1274,11 @@ local function ensureTypeLeftPage(typeName)
     btnKill.MouseButton1Click:Connect(function()
         if not selectedType then return end
         if excluded[selectedType] and excluded[selectedType]["Kill"] then return end
+        -- ensure BreakJoints enabled for normal kills
+        for _,m in ipairs(getNPCsByName(selectedType)) do
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            if hum then pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end) end
+        end
         killAllSimultaneousForList(getNPCsByName(selectedType))
     end)
 
@@ -1442,7 +1389,13 @@ local function ensureTypeFeaturePage(typeName)
         btn.MouseButton1Click:Connect(function()
             if not selectedType then return end
             local list = getNPCsByName(selectedType)
-            if eff == "Kill" then killAllSimultaneousForList(list)
+            if eff == "Kill" then
+                -- ensure BreakJoints enabled for normal kills
+                for _,m in ipairs(list) do
+                    local hum = m:FindFirstChildOfClass("Humanoid")
+                    if hum then pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end) end
+                end
+                killAllSimultaneousForList(list)
             elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
             elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
             elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
@@ -1474,7 +1427,13 @@ local function ensureTypeFeaturePage(typeName)
                     startLoop(key, function()
                         if excluded[selectedType] and excluded[selectedType][eff] then return end
                         local list = getNPCsByName(selectedType)
-                        if eff == "Kill" then killAllSimultaneousForList(list)
+                        if eff == "Kill" then
+                            -- ensure BreakJoints enabled for normal kills in loop
+                            for _,m in ipairs(list) do
+                                local hum = m:FindFirstChildOfClass("Humanoid")
+                                if hum then pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end) end
+                            end
+                            killAllSimultaneousForList(list)
                         elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
                         elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
                         elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
@@ -1482,7 +1441,7 @@ local function ensureTypeFeaturePage(typeName)
                         elseif eff == "CancelChase" then for _,m in ipairs(list) do cancelChaseForModel(m) end
                         elseif eff == "GetRid" then for _,m in ipairs(list) do local p = getBestPartForModel(m) if p then p.CFrame = CFrame.new(9e37,9e37,9e37) end end
                         elseif eff == "Erase" then for _,m in ipairs(list) do eraseModel(m) end
-                        elseif eff == "Spasm" then for_,m in ipairs(list) do spasmModel(m) end
+                        elseif eff == "Spasm" then for _,m in ipairs(list) do spasmModel(m) end
                         elseif eff == "Jump" then for _,m in ipairs(list) do jumpModel(m) end
                         elseif eff == "VoidV4" then for _,m in ipairs(list) do voidV4Model(m) end
                         elseif eff == "Speed" then local v = tonumber(input and input.Text) or 16 for _,m in ipairs(list) do setSpeed(m, v) end
@@ -1581,11 +1540,29 @@ local function rebuildGroupedList()
 end
 
 -- Main UI behaviors & loops (compact)
-killBtn.MouseButton1Click:Connect(function() killAllSimultaneousForList(getNPCsArray()) end)
+killBtn.MouseButton1Click:Connect(function()
+    -- ensure BreakJoints enabled for normal kills
+    for _,m in ipairs(getNPCsArray()) do
+        local hum = m:FindFirstChildOfClass("Humanoid")
+        if hum then pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end) end
+    end
+    killAllSimultaneousForList(getNPCsArray())
+end)
 killLoopBtn.MouseButton1Click:Connect(function()
     loops.killAll = not loops.killAll
     killLoopBtn.Text = "Loop: " .. (loops.killAll and "On" or "Off")
-    if loops.killAll then startLoop("killAll", function() killAllSimultaneousForList(getNPCsArray()) end) else stopLoop("killAll") end
+    if loops.killAll then
+        startLoop("killAll", function()
+            -- ensure BreakJoints enabled for normal kills in loop
+            for _,m in ipairs(getNPCsArray()) do
+                local hum = m:FindFirstChildOfClass("Humanoid")
+                if hum then pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end) end
+            end
+            killAllSimultaneousForList(getNPCsArray())
+        end)
+    else
+        stopLoop("killAll")
+    end
 end)
 
 flingBtn.MouseButton1Click:Connect(function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end)
@@ -1598,6 +1575,8 @@ killFlingBtn.MouseButton1Click:Connect(function()
         if isAllowed(m, "Kill") then
             local hum = m:FindFirstChildOfClass("Humanoid")
             if hum then
+                -- ensure BreakJoints enabled for normal kills
+                pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end)
                 -- perform 0 -> 1 -> heavy kill sequence each time (per your request)
                 applyDamageSequence(hum)
             end
@@ -1642,7 +1621,10 @@ killFlingLoopBtn.MouseButton1Click:Connect(function()
                 pcall(function()
                     if isAllowed(m, "Kill") then
                         local hum = m:FindFirstChildOfClass("Humanoid")
-                        if hum then applyDamageSequence(hum) end
+                        if hum then
+                            pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end)
+                            applyDamageSequence(hum)
+                        end
                     end
                     -- Make massless defensively
                     iterateParts(m, function(pp) pcall(function() if pp.Massless ~= nil then pp.Massless = true end end) end)
@@ -1888,6 +1870,7 @@ player.CharacterAdded:Connect(function(char)
         if data then
             local okGui = data.gui and data.gui.Parent and data.gui.Adornee and data.gui.Adornee.Parent
             local okHighlight = data.highlight and data.highlight.Parent
+            -- if both gui and highlight still exist and adornee part is valid, reparent to current PlayerGui
             if (okGui or okHighlight) then
                 if data.gui and pg then
                     pcall(function() data.gui.Parent = pg end)
@@ -1896,7 +1879,9 @@ player.CharacterAdded:Connect(function(char)
                     pcall(function() data.highlight.Parent = pg end)
                 end
             else
+                -- gui/highlight were destroyed (likely due to PlayerGui recreation). Remove and recreate tracker.
                 removeTrackerFromModel(m)
+                -- if Tracker is allowed for this model's type, re-add
                 if m and m.Parent and not (excluded[m.Name] and excluded[m.Name]["Tracker"]) then
                     addTrackerToModel(m)
                 end
@@ -1908,8 +1893,10 @@ end)
 -- Also watch PlayerGui being removed/added (defensive): when PlayerGui is recreated, reattach or recreate trackers
 player.ChildAdded:Connect(function(child)
     if child.Name == "PlayerGui" then
+        -- small delay to allow other ScreenGuis to be created
         task.delay(0.1, function()
             local pg = getPlayerGui()
+            -- reattach existing trackers to new PlayerGui or recreate
             for m,_ in pairs(trackedNPCs) do
                 local data = trackedNPCs[m]
                 if data then
