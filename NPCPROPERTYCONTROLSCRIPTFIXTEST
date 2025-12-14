@@ -38,7 +38,7 @@ local prevSelectedType = nil
 local cancelChaseEnabled = false
 local trackerScanRunning = false
 
--- For equip-only hide toggle
+-- For equip-only hide toggle (keeps existing feature, separate from the small equip open/close)
 local hideOnEquipEnabled = false
 local prevMainVisible = false
 
@@ -494,7 +494,7 @@ SmallToggle.Text = "NPC"
 SmallToggle.Parent = ScreenGui
 SmallToggle.ZIndex = 10
 
--- New: small equip-only toggle (same size, placed to the right)
+-- Small equip toggle: now controls showing/hiding the NPCKillToolGUI (equip GUI)
 local smallEquipToggle = Instance.new("TextButton")
 smallEquipToggle.Name = "SmallEquipToggle"
 smallEquipToggle.Size = UDim2.new(0, SMALL_TOGGLE_W, 0, SMALL_TOGGLE_H)
@@ -503,16 +503,30 @@ smallEquipToggle.Position = UDim2.new(0.5, 40, 0, CENTER_TOP_Y) -- offset to rig
 smallEquipToggle.BackgroundColor3 = Color3.fromRGB(44,44,44)
 smallEquipToggle.BorderSizePixel = 0
 smallEquipToggle.Font = Enum.Font.GothamBold
-smallEquipToggle.TextSize = 11
+smallEquipToggle.TextSize = 14
 smallEquipToggle.TextColor3 = Color3.new(1,1,1)
-smallEquipToggle.Text = "HideOnEquip: Off"
+smallEquipToggle.Text = "+" -- closed by default
 smallEquipToggle.Parent = ScreenGui
 smallEquipToggle.Visible = false -- only visible while tool equipped
 smallEquipToggle.ZIndex = 11
 
+-- Clicking this toggles the NPCKillToolGUI (equip GUI) open/close:
 smallEquipToggle.MouseButton1Click:Connect(function()
-    hideOnEquipEnabled = not hideOnEquipEnabled
-    smallEquipToggle.Text = "HideOnEquip: " .. (hideOnEquipEnabled and "On" or "Off")
+    local pg = getPlayerGui()
+    if not pg then return end
+    local sg = pg:FindFirstChild("NPCKillToolGUI")
+    if sg and sg:IsA("ScreenGui") then
+        sg.Enabled = not sg.Enabled
+        if sg.Enabled then
+            smallEquipToggle.Text = "×"
+        else
+            smallEquipToggle.Text = "+"
+        end
+    else
+        -- If the GUI doesn't exist yet, try to create it (createClickKillTool ensures it will exist)
+        -- but don't error; set toggle symbol to × as opened attempt
+        smallEquipToggle.Text = "×"
+    end
 end)
 
 local MainFrame = Instance.new("Frame")
@@ -1054,7 +1068,11 @@ local function createClickKillTool()
     -- equipped/unequipped show/hide GUI
     tool.Equipped:Connect(function()
         local sg = getPlayerGui() and getPlayerGui():FindFirstChild("NPCKillToolGUI")
-        if sg then sg.Enabled = true end
+        if sg then
+            -- start closed on equip, small toggle shows "+"; user opens with small toggle
+            sg.Enabled = false
+            smallEquipToggle.Text = "+"
+        end
 
         -- show small equip toggle
         smallEquipToggle.Visible = true
@@ -1071,10 +1089,13 @@ local function createClickKillTool()
     end)
     tool.Unequipped:Connect(function()
         local sg = getPlayerGui() and getPlayerGui():FindFirstChild("NPCKillToolGUI")
-        if sg then sg.Enabled = false end
+        if sg then
+            sg.Enabled = false
+        end
 
         -- hide small equip toggle and restore main GUI visibility
         smallEquipToggle.Visible = false
+        smallEquipToggle.Text = "+" -- reset
         if hideOnEquipEnabled then
             -- restore previous main visibility
             MainFrame.Visible = prevMainVisible or false
