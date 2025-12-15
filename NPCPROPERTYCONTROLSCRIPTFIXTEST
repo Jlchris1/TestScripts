@@ -1,4 +1,4 @@
--- Unified NPC GUI (full script) - updated with draggable Click-Kill equip GUI (starts left-middle)
+-- Unified NPC GUI (full script) - updated with draggable Click-Kill equip GUI + Horde Mode box
 -- Place as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
@@ -172,11 +172,14 @@ local function killAllSimultaneousForList(models)
     end
 end
 
-local function flingModel(model, power)
+local function flingModel(model, power, playerPos)
     if not isAllowed(model, "Fling") then return end
     power = tonumber(power) or 200
     local localHRP = player.Character and (player.Character:FindFirstChild("HumanoidRootPart") or player.Character.PrimaryPart)
-    if not localHRP then return end
+    if not playerPos then
+        playerPos = localHRP and localHRP.Position or nil
+    end
+    if not playerPos then return end
     local targetPos
     local hrp = model:FindFirstChild("HumanoidRootPart")
     if hrp and hrp:IsA("BasePart") then targetPos = hrp.Position end
@@ -186,7 +189,7 @@ local function flingModel(model, power)
         if anyPart then targetPos = anyPart.Position end
     end
     if not targetPos then return end
-    local dir = targetPos - localHRP.Position
+    local dir = targetPos - playerPos
     local dirUnit = (dir.Magnitude <= 0.001) and Vector3.new(0,1,0) or dir.Unit
     local velocity = dirUnit * power + Vector3.new(0, power * 0.45, 0)
     iterateParts(model, function(p)
@@ -854,7 +857,146 @@ local killThroughWalls = false
 local lastClickTime = 0
 local CLICK_DEBOUNCE = 0.12
 
--- We'll create a GUI that appears when the tool is equipped.
+-- Horde mode state + box params
+local hordeModeEnabled = false
+local hordeSizeX = 20
+local hordeSizeY = 6
+local hordeSizeZ = 8
+local hordeMaxDistance = 200 -- if no hit, use this distance for the aim point
+local hordeBoxPart = nil
+local hordeRenderConn = nil
+
+-- Utility: create or update a client-side box part used to visualize the Horde area.
+local function ensureHordeBox()
+    if hordeBoxPart and hordeBoxPart.Parent then return hordeBoxPart end
+    -- create anchored transparent part (client will create in workspace; it's visible to everyone but it's easiest).
+    -- If you'd rather a purely GUI representation, we can switch — but this is a 3D world box as requested.
+    local p = Instance.new("Part")
+    p.Name = "NPC_HordeBox_" .. player.Name
+    p.Anchored = true
+    p.CanCollide = false
+    p.Transparency = 0.6
+    p.Material = Enum.Material.Glass
+    p.Color = Color3.fromRGB(180, 40, 40)
+    p.CastShadow = false
+    p.Size = Vector3.new(hordeSizeX, hordeSizeY, hordeSizeZ)
+    p.Parent = Workspace
+    p.Locked = true
+    hordeBoxPart = p
+    return p
+end
+
+local function destroyHordeBox()
+    if hordeBoxPart then
+        pcall(function() hordeBoxPart:Destroy() end)
+        hordeBoxPart = nil
+    end
+end
+
+-- Given a CFrame and size (Vector3), returns models (unique) that have any part in that box
+local function getModelsInBox(boxCFrame, boxSize)
+    local parts = {}
+    -- Use GetPartBoundsInBox if available (fast)
+    local ok, found = pcall(function()
+        return Workspace:GetPartBoundsInBox(boxCFrame, boxSize)
+    end)
+    if ok and found and #found > 0 then
+        for _,p in ipairs(found) do
+            if p and p:IsA("BasePart") then
+                local model = p:FindFirstAncestorOfClass("Model")
+                if model and isNPC(model) then
+                    parts[model] = true
+                end
+            end
+        end
+    end
+    -- convert table keys to list
+    local models = {}
+    for m,_ in pairs(parts) do table.insert(models, m) end
+    return models
+end
+
+-- Processing functions for click behavior (single model)
+local function processModelForClick(model, pwrOverride, playerPos)
+    if not model or not isNPC(model) then return end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    -- disable BreakJointsOnDeath for click-kills
+    if clickToolKillEnabled then
+        pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = false end end)
+    end
+
+    task.wait(0.1)
+
+    if clickToolFlingEnabled then
+        if clickToolKillEnabled then
+            applyDamageSequence(hum)
+        elseif not clickToolKillEnabled then
+            -- no kill, only fling (do nothing to HP)
+        end
+
+        -- make massless before fling
+        iterateParts(model, function(p)
+            pcall(function() if p.Massless ~= nil then p.Massless = true end end)
+        end)
+
+        -- compute fling
+        flingModel(model, pwrOverride or clickToolFlingPower or tonumber(flingBox.Text) or 200, playerPos)
+
+        -- schedule restore
+        local humRef = hum
+        local modelRef = model
+        local delaySec = tonumber(breakRestoreDelay) or 1
+        task.delay(delaySec, function()
+            pcall(function()
+                if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil and clickToolKillEnabled then
+                    humRef.BreakJointsOnDeath = true
+                end
+            end)
+            if modelRef then
+                iterateParts(modelRef, function(p)
+                    pcall(function()
+                        if p.Massless ~= nil then p.Massless = false end
+                    end)
+                end)
+            end
+        end)
+    else
+        -- no fling enabled: just kill if allowed
+        if clickToolKillEnabled then
+            applyDamageSequence(hum)
+            local humRef = hum
+            local delaySec = tonumber(breakRestoreDelay) or 1
+            task.delay(delaySec, function()
+                pcall(function()
+                    if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil then
+                        humRef.BreakJointsOnDeath = true
+                    end
+                end)
+            end)
+        end
+    end
+end
+
+local function processModelsForHorde(models, pwrOverride)
+    if not models then return end
+    local playerPos = nil
+    if player.Character and player.Character.PrimaryPart then
+        pcall(function() playerPos = player.Character.PrimaryPart.Position end)
+    end
+    for _,m in ipairs(models) do
+        -- don't apply to players
+        if m and isNPC(m) then
+            -- run each in its own coroutine so they act simultaneously
+            coroutine.wrap(function()
+                processModelForClick(m, pwrOverride, playerPos)
+            end)()
+        end
+    end
+end
+
+-- UI for click-kill tool (equip)
 local function ensureClickKillGui()
     -- If already exists, return it
     local pg = getPlayerGui()
@@ -869,9 +1011,9 @@ local function ensureClickKillGui()
     sg.Enabled = false
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 220, 0, 152) -- increased height for extra toggles
+    frame.Size = UDim2.new(0, 220, 0, 220) -- expanded for new controls
     -- Start on left side, middle of the screen
-    frame.Position = UDim2.new(0, 8, 0.5, -76)
+    frame.Position = UDim2.new(0, 8, 0.5, -110)
     frame.AnchorPoint = Vector2.new(0, 0)
     frame.BackgroundColor3 = Color3.fromRGB(30,30,30)
     frame.BorderSizePixel = 0
@@ -1001,6 +1143,77 @@ local function ensureClickKillGui()
     onlyFlingBtn.Text = "Only Fling (no Kill): Off"
     onlyFlingBtn.Parent = frame
 
+    -- Add Horde controls: size X,Y,Z and Horde toggle
+    local hxLabel = Instance.new("TextLabel")
+    hxLabel.Size = UDim2.new(0.32, -6, 0, 20)
+    hxLabel.Position = UDim2.new(0,4,0,156)
+    hxLabel.BackgroundTransparency = 1
+    hxLabel.Font = Enum.Font.Gotham
+    hxLabel.TextSize = 12
+    hxLabel.TextColor3 = Color3.new(1,1,1)
+    hxLabel.Text = "Size X"
+    hxLabel.Parent = frame
+
+    local sxBox = Instance.new("TextBox")
+    sxBox.Size = UDim2.new(0.2, 0, 0, 20)
+    sxBox.Position = UDim2.new(0.32, 2, 0, 156)
+    sxBox.BackgroundColor3 = Color3.fromRGB(50,50,50)
+    sxBox.TextColor3 = Color3.new(1,1,1)
+    sxBox.Font = Enum.Font.Gotham
+    sxBox.TextSize = 12
+    sxBox.Text = tostring(hordeSizeX)
+    sxBox.Parent = frame
+
+    local hyLabel = Instance.new("TextLabel")
+    hyLabel.Size = UDim2.new(0.18, -6, 0, 20)
+    hyLabel.Position = UDim2.new(0.52, 2, 0, 156)
+    hyLabel.BackgroundTransparency = 1
+    hyLabel.Font = Enum.Font.Gotham
+    hyLabel.TextSize = 12
+    hyLabel.TextColor3 = Color3.new(1,1,1)
+    hyLabel.Text = "Y"
+    hyLabel.Parent = frame
+
+    local syBox = Instance.new("TextBox")
+    syBox.Size = UDim2.new(0.2, 0, 0, 20)
+    syBox.Position = UDim2.new(0.70, 2, 0, 156)
+    syBox.BackgroundColor3 = Color3.fromRGB(50,50,50)
+    syBox.TextColor3 = Color3.new(1,1,1)
+    syBox.Font = Enum.Font.Gotham
+    syBox.TextSize = 12
+    syBox.Text = tostring(hordeSizeY)
+    syBox.Parent = frame
+
+    local hzLabel = Instance.new("TextLabel")
+    hzLabel.Size = UDim2.new(0.18, -6, 0, 20)
+    hzLabel.Position = UDim2.new(0,4,0,180)
+    hzLabel.BackgroundTransparency = 1
+    hzLabel.Font = Enum.Font.Gotham
+    hzLabel.TextSize = 12
+    hzLabel.TextColor3 = Color3.new(1,1,1)
+    hzLabel.Text = "Z"
+    hzLabel.Parent = frame
+
+    local szBox = Instance.new("TextBox")
+    szBox.Size = UDim2.new(0.2, 0, 0, 20)
+    szBox.Position = UDim2.new(0.18, 2, 0, 180)
+    szBox.BackgroundColor3 = Color3.fromRGB(50,50,50)
+    szBox.TextColor3 = Color3.new(1,1,1)
+    szBox.Font = Enum.Font.Gotham
+    szBox.TextSize = 12
+    szBox.Text = tostring(hordeSizeZ)
+    szBox.Parent = frame
+
+    local hordeBtn = Instance.new("TextButton")
+    hordeBtn.Size = UDim2.new(0.56, 0, 0, 20)
+    hordeBtn.Position = UDim2.new(0.42, 2, 0, 180)
+    hordeBtn.BackgroundColor3 = Color3.fromRGB(58,58,58)
+    hordeBtn.Font = Enum.Font.Gotham
+    hordeBtn.TextSize = 12
+    hordeBtn.TextColor3 = Color3.new(1,1,1)
+    hordeBtn.Text = "Horde Mode: Off"
+    hordeBtn.Parent = frame
+
     -- Wire up interactions
     pBox.FocusLost:Connect(function()
         local v = tonumber(pBox.Text)
@@ -1033,6 +1246,45 @@ local function ensureClickKillGui()
     onlyFlingBtn.MouseButton1Click:Connect(function()
         clickToolKillEnabled = not clickToolKillEnabled
         onlyFlingBtn.Text = "Only Fling (no Kill): " .. (not clickToolKillEnabled and "On" or "Off")
+    end)
+
+    -- Horde UI wiring
+    sxBox.FocusLost:Connect(function()
+        local v = tonumber(sxBox.Text)
+        if v and v > 0 then
+            hordeSizeX = v
+            if hordeBoxPart then hordeBoxPart.Size = Vector3.new(hordeSizeX, hordeSizeY, hordeSizeZ) end
+        else
+            sxBox.Text = tostring(hordeSizeX)
+        end
+    end)
+    syBox.FocusLost:Connect(function()
+        local v = tonumber(syBox.Text)
+        if v and v > 0 then
+            hordeSizeY = v
+            if hordeBoxPart then hordeBoxPart.Size = Vector3.new(hordeSizeX, hordeSizeY, hordeSizeZ) end
+        else
+            syBox.Text = tostring(hordeSizeY)
+        end
+    end)
+    szBox.FocusLost:Connect(function()
+        local v = tonumber(szBox.Text)
+        if v and v > 0 then
+            hordeSizeZ = v
+            if hordeBoxPart then hordeBoxPart.Size = Vector3.new(hordeSizeX, hordeSizeY, hordeSizeZ) end
+        else
+            szBox.Text = tostring(hordeSizeZ)
+        end
+    end)
+
+    hordeBtn.MouseButton1Click:Connect(function()
+        hordeModeEnabled = not hordeModeEnabled
+        hordeBtn.Text = "Horde Mode: " .. (hordeModeEnabled and "On" or "Off")
+        if hordeModeEnabled then
+            ensureHordeBox()
+        else
+            destroyHordeBox()
+        end
     end)
 
     return sg
@@ -1097,7 +1349,6 @@ local function createClickKillTool()
             local ray = cam:ScreenPointToRay(sx, sy)
             local origin = ray.Origin
             local dir = ray.Direction
-            -- dir might be a scaled vector; normalize to unit
             local dirUnit = dir.Unit
 
             local bestModel = nil
@@ -1136,6 +1387,83 @@ local function createClickKillTool()
     -- local reference for mouse button1 handler
     local boundMouseConn = nil
 
+    -- helper to compute aim point (mouse may be nil)
+    local function computeAimPointFromMouse(mouse, defaultDist)
+        local cam = Workspace.CurrentCamera
+        if not cam then return nil end
+        defaultDist = defaultDist or 50
+        local sx, sy = nil, nil
+        pcall(function() sx = mouse.X; sy = mouse.Y end)
+        if not sx or not sy or sx == 0 then
+            local vs = cam.ViewportSize
+            sx = vs.X * 0.5
+            sy = vs.Y * 0.5
+        end
+        -- prefer mouse.Hit when present (work in many setups)
+        local successPos, hitPos = pcall(function() return mouse.Hit and mouse.Hit.p end)
+        if successPos and hitPos and typeof(hitPos) == "Vector3" then
+            return hitPos
+        end
+        -- fallback to a screen ray point
+        local ray = cam:ScreenPointToRay(sx, sy)
+        local origin = ray.Origin
+        local dir = ray.Direction
+        return origin + dir.Unit * (defaultDist or hordeMaxDistance)
+    end
+
+    -- function to update the horde box position while tool equipped + horde enabled
+    local function startHordeRenderLoop(mouse)
+        if hordeRenderConn then return end
+        ensureHordeBox()
+        hordeBoxPart.Size = Vector3.new(hordeSizeX, hordeSizeY, hordeSizeZ)
+        hordeRenderConn = RunService.RenderStepped:Connect(function()
+            if not hordeBoxPart or not hordeBoxPart.Parent then return end
+            local playerPos = nil
+            if player.Character and player.Character.PrimaryPart then
+                pcall(function() playerPos = player.Character.PrimaryPart.Position end)
+            end
+            if not playerPos then
+                -- if no char, hide box
+                hordeBoxPart.Transparency = 1
+                return
+            else
+                hordeBoxPart.Transparency = 0.6
+            end
+            local aim = computeAimPointFromMouse(mouse, math.min(hordeMaxDistance, 50))
+            if not aim then return end
+
+            -- direction from player to aim
+            local dir = aim - playerPos
+            local dirMag = dir.Magnitude
+            if dirMag <= 0.001 then
+                dir = Vector3.new(0,0,1)
+            else
+                dir = dir.Unit
+            end
+
+            -- We want the long side (X) to extend from the player's position outward toward aim,
+            -- with the box "touching" the player at its near-side. So compute center = playerPos + dir * (sizeX/2)
+            local halfX = (hordeSizeX or 1) * 0.5
+            local centerPos = playerPos + dir * halfX
+            -- Build CFrame oriented so that its lookVector follows dir.
+            local boxCFrame = CFrame.lookAt(centerPos, centerPos + dir)
+            -- Rotate so that X axis aligns with forward direction (CFrame.lookAt aligns -Z to target), so rotate 90 degrees around Y
+            boxCFrame = boxCFrame * CFrame.Angles(0, math.pi/2, 0)
+
+            -- Apply to the visual part
+            hordeBoxPart.Size = Vector3.new(hordeSizeX, hordeSizeY, hordeSizeZ)
+            hordeBoxPart.CFrame = boxCFrame
+        end)
+    end
+
+    local function stopHordeRenderLoop()
+        if hordeRenderConn then
+            pcall(function() hordeRenderConn:Disconnect() end)
+            hordeRenderConn = nil
+        end
+        destroyHordeBox()
+    end
+
     -- equipped/unequipped show/hide GUI and manage mouse connections
     tool.Equipped:Connect(function()
         local sg = getPlayerGui() and getPlayerGui():FindFirstChild("NPCKillToolGUI")
@@ -1162,90 +1490,30 @@ local function createClickKillTool()
             pcall(function() boundMouseConn:Disconnect() end)
             boundMouseConn = nil
         end
+
+        -- If horde mode is enabled when equipped, start rendering box
+        if hordeModeEnabled then
+            startHordeRenderLoop(mouse)
+        end
+
         boundMouseConn = mouse.Button1Down:Connect(function()
-            -- run a small wrapper similar to Activated
             local now = tick()
             if now - lastClickTime < CLICK_DEBOUNCE then return end
             lastClickTime = now
-            -- attempt to find NPC model using the same logic
-            local model = getNPCModelFromMouse(mouse)
-            if not model then return end
-            local humanoid = model:FindFirstChildOfClass("Humanoid")
-            if humanoid then
-                -- handle BreakJoints disabling for click kill
-                if clickToolKillEnabled then
-                    pcall(function() if humanoid.BreakJointsOnDeath ~= nil then humanoid.BreakJointsOnDeath = false end end)
-                end
 
-                task.wait(0.1)
-
-                if clickToolFlingEnabled then
-                    if clickToolKillEnabled then
-                        applyDamageSequence(humanoid)
-                    end
-
-                    -- Make NPC massless before fling
-                    iterateParts(model, function(p)
-                        pcall(function() if p.Massless ~= nil then p.Massless = true end end)
-                    end)
-
-                    local playerPos = nil
-                    if player.Character and player.Character.PrimaryPart then pcall(function() playerPos = player.Character.PrimaryPart.Position end) end
-                    local pwr = tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200
-                    iterateParts(model, function(p)
-                        if p and p:IsA("BasePart") and not p.Anchored then
-                            pcall(function()
-                                local dir = Vector3.new(0,1,0)
-                                if playerPos then
-                                    local ok, pos = pcall(function() return p.Position end)
-                                    if ok and pos then
-                                        dir = (pos - playerPos)
-                                        if dir.Magnitude <= 0.001 then
-                                            dir = Vector3.new(0,1,0)
-                                        else
-                                            dir = dir.Unit
-                                        end
-                                    end
-                                end
-                                local velocity = dir * pwr + Vector3.new(0, pwr * 0.45, 0)
-                                if p.AssemblyLinearVelocity ~= nil then p.AssemblyLinearVelocity = velocity else p.Velocity = velocity end
-                            end)
-                        end
-                    end)
-
-                    -- schedule restore
-                    local humRef = humanoid
-                    local modelRef = model
-                    local delaySec = tonumber(breakRestoreDelay) or 1
-                    task.delay(delaySec, function()
-                        pcall(function()
-                            if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil and clickToolKillEnabled then
-                                humRef.BreakJointsOnDeath = true
-                            end
-                        end)
-                        if modelRef then
-                            iterateParts(modelRef, function(p)
-                                pcall(function()
-                                    if p.Massless ~= nil then p.Massless = false end
-                                end)
-                            end)
-                        end
-                    end)
-                else
-                    if clickToolKillEnabled then
-                        applyDamageSequence(humanoid)
-                        local humRef = humanoid
-                        local delaySec = tonumber(breakRestoreDelay) or 1
-                        task.delay(delaySec, function()
-                            pcall(function()
-                                if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil then
-                                    humRef.BreakJointsOnDeath = true
-                                end
-                            end)
-                        end)
-                    end
+            -- If Horde Mode active, click should process all NPCs inside the box
+            if hordeModeEnabled and hordeBoxPart and hordeBoxPart.Parent then
+                local models = getModelsInBox(hordeBoxPart.CFrame, hordeBoxPart.Size)
+                if #models > 0 then
+                    processModelsForHorde(models, tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200)
+                    return
                 end
             end
+
+            -- Otherwise fallback to single-target behavior
+            local model = getNPCModelFromMouse(mouse)
+            if not model then return end
+            processModelForClick(model)
         end)
     end)
 
@@ -1264,6 +1532,8 @@ local function createClickKillTool()
             pcall(function() boundMouseConn:Disconnect() end)
             boundMouseConn = nil
         end
+        -- stop horde render when unequipped
+        stopHordeRenderLoop()
     end)
 
     -- The Activated event (mobile and tool activation)
@@ -1272,147 +1542,19 @@ local function createClickKillTool()
         if now - lastClickTime < CLICK_DEBOUNCE then return end
         lastClickTime = now
 
-        local mouse = player:GetMouse()
-        local targetPart = mouse.Target
-
-        local model = nil
-        -- attempt to get model via the helper that will fallback to killThroughWalls logic
-        model = (function()
-            -- use getNPCModelFromMouse helper defined earlier, but it's local in createClickKillTool scope. Recreate minimal call:
-            -- try direct target
-            local function quickGet()
-                local tp = nil
-                pcall(function() tp = mouse.Target end)
-                if tp then
-                    local cur = tp
-                    while cur do
-                        if cur:IsA("Model") and isNPC_model(cur) then return cur end
-                        cur = cur.Parent
-                    end
-                end
-                return nil
-            end
-            local m = quickGet()
-            if m then return m end
-            if killThroughWalls then
-                local cam = Workspace.CurrentCamera
-                if not cam then return nil end
-                local sx, sy
-                pcall(function() sx = mouse.X; sy = mouse.Y end)
-                if not sx or not sy or sx == 0 then
-                    local vs = cam.ViewportSize
-                    sx = vs.X * 0.5
-                    sy = vs.Y * 0.5
-                end
-                local ray = cam:ScreenPointToRay(sx, sy)
-                local origin = ray.Origin
-                local dir = ray.Direction
-                local dirUnit = dir.Unit
-
-                local bestModel = nil
-                local bestAlong = math.huge
-                local maxAlong = 2000
-                local maxClosestDist = 6
-                for mm,_ in pairs(NPCs) do
-                    if mm and mm.Parent and isNPC(mm) then
-                        local part = getBestPartForModel(mm)
-                        if part and part:IsA("BasePart") then
-                            local pos = part.Position
-                            local v = pos - origin
-                            local along = v:Dot(dirUnit)
-                            if along > 0 and along < maxAlong then
-                                local closest = origin + dirUnit * along
-                                local dist = (pos - closest).Magnitude
-                                if dist <= maxClosestDist then
-                                    if along < bestAlong then
-                                        bestAlong = along
-                                        bestModel = mm
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-                return bestModel
-            end
-            return nil
-        end)()
-
-        if not model then return end
-        local humanoid = model:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            if clickToolKillEnabled then
-                pcall(function() if humanoid.BreakJointsOnDeath ~= nil then humanoid.BreakJointsOnDeath = false end end)
-            end
-
-            task.wait(0.1)
-
-            if clickToolFlingEnabled then
-                if clickToolKillEnabled then
-                    applyDamageSequence(humanoid)
-                end
-
-                iterateParts(model, function(p)
-                    pcall(function() if p.Massless ~= nil then p.Massless = true end end)
-                end)
-
-                local playerPos = nil
-                if player.Character and player.Character.PrimaryPart then pcall(function() playerPos = player.Character.PrimaryPart.Position end) end
-                local pwr = tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200
-                iterateParts(model, function(p)
-                    if p and p:IsA("BasePart") and not p.Anchored then
-                        pcall(function()
-                            local dir = Vector3.new(0,1,0)
-                            if playerPos then
-                                local ok, pos = pcall(function() return p.Position end)
-                                if ok and pos then
-                                    dir = (pos - playerPos)
-                                    if dir.Magnitude <= 0.001 then
-                                        dir = Vector3.new(0,1,0)
-                                    else
-                                        dir = dir.Unit
-                                    end
-                                end
-                            end
-                            local velocity = dir * pwr + Vector3.new(0, pwr * 0.45, 0)
-                            if p.AssemblyLinearVelocity ~= nil then p.AssemblyLinearVelocity = velocity else p.Velocity = velocity end
-                        end)
-                    end
-                end)
-
-                local humRef = humanoid
-                local modelRef = model
-                local delaySec = tonumber(breakRestoreDelay) or 1
-                task.delay(delaySec, function()
-                    pcall(function()
-                        if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil and clickToolKillEnabled then
-                            humRef.BreakJointsOnDeath = true
-                        end
-                    end)
-                    if modelRef then
-                        iterateParts(modelRef, function(p)
-                            pcall(function()
-                                if p.Massless ~= nil then p.Massless = false end
-                            end)
-                        end)
-                    end
-                end)
-            else
-                if clickToolKillEnabled then
-                    applyDamageSequence(humanoid)
-
-                    local humRef = humanoid
-                    local delaySec = tonumber(breakRestoreDelay) or 1
-                    task.delay(delaySec, function()
-                        pcall(function()
-                            if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil then
-                                humRef.BreakJointsOnDeath = true
-                            end
-                        end)
-                    end)
-                end
+        -- If Horde Mode active, use box
+        if hordeModeEnabled and hordeBoxPart and hordeBoxPart.Parent then
+            local models = getModelsInBox(hordeBoxPart.CFrame, hordeBoxPart.Size)
+            if #models > 0 then
+                processModelsForHorde(models, tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200)
+                return
             end
         end
+
+        local mouse = player:GetMouse()
+        local model = getNPCModelFromMouse(mouse)
+        if not model then return end
+        processModelForClick(model)
     end)
 end
 
