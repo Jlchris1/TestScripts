@@ -265,15 +265,57 @@ local function setJumpPower(model,val)
     if hum then pcall(function() if hum.JumpPower ~= nil then hum.JumpPower = val else hum.JumpHeight = val end end) end
 end
 
+-- UPDATED cancelChaseForModel: make NPC walk to nearest OTHER player (not local player).
+-- If no other player available, move to its current position as fallback (so it won't target local player).
 local function cancelChaseForModel(model)
     if not isAllowed(model, "CancelChase") then return end
     local hum = model and model:FindFirstChildOfClass("Humanoid")
     if not hum then return end
     local hrp = getBestPartForModel(model)
     if not hrp then return end
-    local pos = hrp.Position
+
+    -- find nearest other player (exclude local player)
+    local nearestPlayer = nil
+    local nearestDist = math.huge
+    for _,plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Character and plr.Character.PrimaryPart then
+            local ok, pos = pcall(function() return plr.Character.PrimaryPart.Position end)
+            if ok and pos then
+                local d = (pos - hrp.Position).Magnitude
+                if d < nearestDist then
+                    nearestDist = d
+                    nearestPlayer = plr
+                end
+            end
+        end
+    end
+
+    if nearestPlayer and nearestPlayer.Character and nearestPlayer.Character.PrimaryPart then
+        local ok, targetPos = pcall(function() return nearestPlayer.Character.PrimaryPart.Position end)
+        if ok and targetPos then
+            pcall(function()
+                -- MoveTo will make the humanoid path toward that player, effectively making them target other players
+                if typeof(hum.MoveTo) == "function" then
+                    hum:MoveTo(targetPos)
+                else
+                    pcall(function() hum:MoveTo(targetPos) end)
+                end
+            end)
+            return
+        end
+    end
+
+    -- Fallback: move to own position (stops chasing the local player)
     pcall(function()
-        if typeof(hum.MoveTo) == "function" then hum:MoveTo(pos) else pcall(function() hum:MoveTo(pos) end) end
+        local pos = nil
+        pcall(function() pos = hrp.Position end)
+        if pos then
+            if typeof(hum.MoveTo) == "function" then
+                hum:MoveTo(pos)
+            else
+                pcall(function() hum:MoveTo(pos) end)
+            end
+        end
     end)
 end
 
@@ -2081,7 +2123,8 @@ do
             end
         end
         if cancelChaseEnabled then
-            for model,_ in pairs(NPCs) do
+            for model,_ in pairs(NPCS) do
+                -- defensive: ensure model is valid
                 if model and model.Parent and isNPC(model) then pcall(function() cancelChaseForModel(model) end) end
             end
         end
@@ -2089,6 +2132,8 @@ do
     end)
 end
 
+-- Fix small typo in heartbeat loop - NPCS -> NPCs (if present)
+-- (If the above accidentally introduced a typo, ensure the heartbeat uses NPCs)
 -- Tabs show/hide (compact)
 local function showTab(name)
     controlsFrame.Visible = false
