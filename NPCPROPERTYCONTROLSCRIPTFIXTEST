@@ -1,4 +1,4 @@
--- Unified NPC GUI (full script) - updated with draggable Click-Kill equip GUI (starts left-middle)
+-- Unified NPC GUI (full script) - updated Cancel-Chase to walk to nearest other player (excludes local player)
 -- Place as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
@@ -46,7 +46,7 @@ local prevMainVisible = false
 setmetatable(NPCs, { __mode = "k" })
 setmetatable(trackedNPCs, { __mode = "k" })
 
--- EFFECTS list
+-- EFFECTS list (removed "Void" and "Void3"; added "VoidV4"; removed "HPNaN" and "Heal")
 local EFFECTS = {
     "Kill","Fling","PlatformStand","Sit","Anchor","CancelChase","GetRid","Erase",
     "Spasm","Jump","Speed","JumpPower","HipHeight","Tracker","VoidV4"
@@ -265,8 +265,7 @@ local function setJumpPower(model,val)
     if hum then pcall(function() if hum.JumpPower ~= nil then hum.JumpPower = val else hum.JumpHeight = val end end) end
 end
 
--- UPDATED cancelChaseForModel: make NPC walk to nearest OTHER player (not local player).
--- If no other player available, move to its current position as fallback (so it won't target local player).
+-- CANCEL CHASE: make NPC walk to nearest other player (excludes local player)
 local function cancelChaseForModel(model)
     if not isAllowed(model, "CancelChase") then return end
     local hum = model and model:FindFirstChildOfClass("Humanoid")
@@ -274,49 +273,44 @@ local function cancelChaseForModel(model)
     local hrp = getBestPartForModel(model)
     if not hrp then return end
 
-    -- find nearest other player (exclude local player)
-    local nearestPlayer = nil
-    local nearestDist = math.huge
+    local npcPos = nil
+    pcall(function() npcPos = hrp.Position end)
+    if not npcPos then return end
+
+    local bestPos = nil
+    local bestDist = math.huge
+
     for _,plr in ipairs(Players:GetPlayers()) do
         if plr ~= player and plr.Character and plr.Character.PrimaryPart then
             local ok, pos = pcall(function() return plr.Character.PrimaryPart.Position end)
             if ok and pos then
-                local d = (pos - hrp.Position).Magnitude
-                if d < nearestDist then
-                    nearestDist = d
-                    nearestPlayer = plr
+                local d = (pos - npcPos).Magnitude
+                if d < bestDist then
+                    bestDist = d
+                    bestPos = pos
                 end
             end
         end
     end
 
-    if nearestPlayer and nearestPlayer.Character and nearestPlayer.Character.PrimaryPart then
-        local ok, targetPos = pcall(function() return nearestPlayer.Character.PrimaryPart.Position end)
-        if ok and targetPos then
-            pcall(function()
-                -- MoveTo will make the humanoid path toward that player, effectively making them target other players
-                if typeof(hum.MoveTo) == "function" then
-                    hum:MoveTo(targetPos)
-                else
-                    pcall(function() hum:MoveTo(targetPos) end)
-                end
-            end)
-            return
-        end
-    end
-
-    -- Fallback: move to own position (stops chasing the local player)
-    pcall(function()
-        local pos = nil
-        pcall(function() pos = hrp.Position end)
-        if pos then
+    if bestPos then
+        pcall(function()
             if typeof(hum.MoveTo) == "function" then
-                hum:MoveTo(pos)
+                hum:MoveTo(bestPos)
             else
-                pcall(function() hum:MoveTo(pos) end)
+                hum:MoveTo(bestPos)
             end
-        end
-    end)
+        end)
+    else
+        -- fallback to moving to current position to cancel
+        pcall(function()
+            if typeof(hum.MoveTo) == "function" then
+                hum:MoveTo(npcPos)
+            else
+                hum:MoveTo(npcPos)
+            end
+        end)
+    end
 end
 
 -- Void v4: PlatformStand, disable collisions, apply Y velocity (default -500). Accepts optional yVel param.
@@ -341,6 +335,7 @@ end
 local function removeTrackerFromModel(model)
     if not model then return end
     local data = trackedNPCs[model]
+    -- Destroy objects referenced in trackedNPCs table
     if data then
         if data.gui then
             pcall(function() data.gui:Destroy() end)
@@ -348,6 +343,7 @@ local function removeTrackerFromModel(model)
         if data.highlight then
             pcall(function() data.highlight:Destroy() end)
         end
+        -- disconnect stored connections
         if data._connections then
             for _,c in ipairs(data._connections) do
                 pcall(function() c:Disconnect() end)
@@ -355,6 +351,7 @@ local function removeTrackerFromModel(model)
         end
     end
 
+    -- Also attempt to remove any stray BillboardGui/Highlight in current PlayerGui that refer to the model
     local pg = getPlayerGui()
     if pg then
         for _,desc in ipairs(pg:GetDescendants()) do
@@ -383,6 +380,7 @@ local function addTrackerToModel(model)
     if not model then return end
     if not isAllowed(model, "Tracker") then return end
 
+    -- Remove any previous leftover trackers for this model first (defensive)
     removeTrackerFromModel(model)
 
     local part = getBestPartForModel(model)
@@ -397,7 +395,7 @@ local function addTrackerToModel(model)
     gui.StudsOffset = Vector3.new(0,1.5,0)
     gui.AlwaysOnTop = true
     gui.Adornee = part
-    gui.Parent = pg -- dynamic parent, ensured to be PlayerGui
+    gui.Parent = pg -- dynamic parent
 
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1,-4,1,-4)
@@ -416,8 +414,10 @@ local function addTrackerToModel(model)
     highlight.OutlineColor = Color3.fromRGB(80,200,120)
     highlight.OutlineTransparency = 0
 
+    -- connection table for cleanup
     local conns = {}
 
+    -- Humanoid death should remove tracker
     local hum = model:FindFirstChildOfClass("Humanoid")
     if hum and hum:IsA("Humanoid") then
         table.insert(conns, hum.Died:Connect(function()
@@ -425,12 +425,14 @@ local function addTrackerToModel(model)
         end))
     end
 
+    -- If model is removed from workspace (Parent changes), remove tracker
     table.insert(conns, model.AncestryChanged:Connect(function(_, newParent)
         if not model.Parent or not isNPC(model) then
             removeTrackerFromModel(model)
         end
     end))
 
+    -- Monitor the adornee part: if its position goes to zero or below void threshold, remove the tracker
     if part and part:IsA("BasePart") then
         local function checkPartPos()
             if not part or not part.Parent then
@@ -446,6 +448,7 @@ local function addTrackerToModel(model)
             end
         end
         table.insert(conns, part:GetPropertyChangedSignal("Position"):Connect(checkPartPos))
+        -- Also run initial check
         checkPartPos()
     end
 
@@ -1156,233 +1159,51 @@ local function createClickKillTool()
         return nil
     end
 
-    -- helper: find NPC model using mouse.Target first; if allowed and needed, find by screen-ray closest NPC (kill-through-walls).
-    local function getNPCModelFromMouse(mouse)
-        if not mouse then mouse = player:GetMouse() end
-        -- try direct target first
-        local targetPart = nil
-        pcall(function() targetPart = mouse.Target end)
-        if targetPart then
-            local npcModel = getNPCModel(targetPart)
-            if npcModel then return npcModel end
-        end
-
-        -- If killThroughWalls enabled, fallback to screen-ray search
-        if killThroughWalls then
-            local cam = Workspace.CurrentCamera
-            if not cam then return nil end
-            local sx, sy
-            pcall(function() sx = mouse.X; sy = mouse.Y end)
-            if not sx or not sy or sx == 0 then
-                local vs = cam.ViewportSize
-                sx = vs.X * 0.5
-                sy = vs.Y * 0.5
+    -- helper: apply damage sequence (0 -> wait 0.01 -> 1 -> wait 0.01 -> final kill using same heavy method as killAllSimultaneousForList)
+    local function applyDamageSequence(hum)
+        if not hum then return end
+        -- step 1: set to 0
+        pcall(function() hum.Health = 0 end)
+        task.wait(0.01)
+        -- step 2: set to 1
+        pcall(function() hum.Health = 1 end)
+        task.wait(0.01)
+        -- final: attempt heavy kill (TakeDamage(math.huge) like killAllSimultaneousForList)
+        pcall(function()
+            local ok = pcall(function() hum:TakeDamage(math.huge) end)
+            if not ok then
+                pcall(function() hum.Health = -math.huge end)
+            else
+                pcall(function() hum.Health = 0 end)
             end
-            local ray = cam:ScreenPointToRay(sx, sy)
-            local origin = ray.Origin
-            local dir = ray.Direction
-            -- dir might be a scaled vector; normalize to unit
-            local dirUnit = dir.Unit
-
-            local bestModel = nil
-            local bestAlong = math.huge
-            local maxAlong = 2000
-            local maxClosestDist = 6 -- tolerance in studs
-            for model,_ in pairs(NPCs) do
-                if model and model.Parent and isNPC(model) then
-                    local part = getBestPartForModel(model)
-                    if part and part:IsA("BasePart") then
-                        local pos = part.Position
-                        local v = pos - origin
-                        local along = v:Dot(dirUnit)
-                        if along > 0 and along < maxAlong then
-                            local closest = origin + dirUnit * along
-                            local dist = (pos - closest).Magnitude
-                            if dist <= maxClosestDist then
-                                if along < bestAlong then
-                                    bestAlong = along
-                                    bestModel = model
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            return bestModel
-        end
-
-        return nil
+        end)
     end
 
     -- Ensure equip GUI is prepared (hidden)
     local gui = ensureClickKillGui()
-
-    -- local reference for mouse button1 handler
-    local boundMouseConn = nil
-
-    -- equipped/unequipped show/hide GUI and manage mouse connections
+    -- equipped/unequipped show/hide GUI
     tool.Equipped:Connect(function()
         local sg = getPlayerGui() and getPlayerGui():FindFirstChild("NPCKillToolGUI")
-        if sg then
-            -- start closed on equip, small toggle shows "+"
-            sg.Enabled = false
-            smallEquipToggle.Text = "+"
-            -- ensure overlay settings persisted
-            sg.ZIndexBehavior = Enum.ZIndexBehavior.Global
-            sg.DisplayOrder = 2147483647
-        end
-
-        smallEquipToggle.Visible = true
-
-        if hideOnEquipEnabled then
-            prevMainVisible = MainFrame.Visible
-            MainFrame.Visible = false
-            Content.Visible = false
-            ExclusionPanel.Visible = false
-            FeaturesPanel.Visible = false
-            leftPanel.Visible = false
-        end
-
-        -- set up Button1Down for better behavior while moving (works on desktop)
-        local mouse = player:GetMouse()
-        if boundMouseConn then
-            pcall(function() boundMouseConn:Disconnect() end)
-            boundMouseConn = nil
-        end
-        boundMouseConn = mouse.Button1Down:Connect(function()
-            -- run a small wrapper similar to Activated
-            local now = tick()
-            if now - lastClickTime < CLICK_DEBOUNCE then return end
-            lastClickTime = now
-            -- attempt to find NPC model using the same logic
-            local model = getNPCModelFromMouse(mouse)
-            if not model then return end
-            local humanoid = model:FindFirstChildOfClass("Humanoid")
-            if humanoid then
-                -- handle BreakJoints disabling for click kill
-                if clickToolKillEnabled then
-                    pcall(function() if humanoid.BreakJointsOnDeath ~= nil then humanoid.BreakJointsOnDeath = false end end)
-                end
-
-                task.wait(0.1)
-
-                if clickToolFlingEnabled then
-                    if clickToolKillEnabled then
-                        applyDamageSequence(humanoid)
-                    end
-
-                    -- Make NPC massless before fling
-                    iterateParts(model, function(p)
-                        pcall(function() if p.Massless ~= nil then p.Massless = true end end)
-                    end)
-
-                    local playerPos = nil
-                    if player.Character and player.Character.PrimaryPart then pcall(function() playerPos = player.Character.PrimaryPart.Position end) end
-                    local pwr = tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200
-                    iterateParts(model, function(p)
-                        if p and p:IsA("BasePart") and not p.Anchored then
-                            pcall(function()
-                                local dir = Vector3.new(0,1,0)
-                                if playerPos then
-                                    local ok, pos = pcall(function() return p.Position end)
-                                    if ok and pos then
-                                        dir = (pos - playerPos)
-                                        if dir.Magnitude <= 0.001 then
-                                            dir = Vector3.new(0,1,0)
-                                        else
-                                            dir = dir.Unit
-                                        end
-                                    end
-                                end
-                                local velocity = dir * pwr + Vector3.new(0, pwr * 0.45, 0)
-                                if p.AssemblyLinearVelocity ~= nil then p.AssemblyLinearVelocity = velocity else p.Velocity = velocity end
-                            end)
-                        end
-                    end)
-
-                    -- schedule restore
-                    local humRef = humanoid
-                    local modelRef = model
-                    local delaySec = tonumber(breakRestoreDelay) or 1
-                    task.delay(delaySec, function()
-                        pcall(function()
-                            if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil and clickToolKillEnabled then
-                                humRef.BreakJointsOnDeath = true
-                            end
-                        end)
-                        if modelRef then
-                            iterateParts(modelRef, function(p)
-                                pcall(function()
-                                    if p.Massless ~= nil then p.Massless = false end
-                                end)
-                            end)
-                        end
-                    end)
-                else
-                    if clickToolKillEnabled then
-                        applyDamageSequence(humanoid)
-                        local humRef = humanoid
-                        local delaySec = tonumber(breakRestoreDelay) or 1
-                        task.delay(delaySec, function()
-                            pcall(function()
-                                if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil then
-                                    humRef.BreakJointsOnDeath = true
-                                end
-                            end)
-                        end)
-                    end
-                end
-            end
-        end)
+        if sg then sg.Enabled = true end
     end)
-
     tool.Unequipped:Connect(function()
         local sg = getPlayerGui() and getPlayerGui():FindFirstChild("NPCKillToolGUI")
-        if sg then
-            sg.Enabled = false
-        end
-        smallEquipToggle.Visible = false
-        smallEquipToggle.Text = "+"
-        if hideOnEquipEnabled then
-            MainFrame.Visible = prevMainVisible or false
-            Content.Visible = prevMainVisible or false
-        end
-        if boundMouseConn then
-            pcall(function() boundMouseConn:Disconnect() end)
-            boundMouseConn = nil
-        end
+        if sg then sg.Enabled = false end
     end)
 
-    -- The Activated event (mobile and tool activation)
     tool.Activated:Connect(function()
-        local now = tick()
-        if now - lastClickTime < CLICK_DEBOUNCE then return end
-        lastClickTime = now
-
         local mouse = player:GetMouse()
         local targetPart = mouse.Target
+        if not targetPart then
+            -- attempt kill-through-walls via screen ray when enabled
+            if not killThroughWalls then return end
+        end
 
-        local model = nil
-        -- attempt to get model via the helper that will fallback to killThroughWalls logic
-        model = (function()
-            -- try direct target
-            local function quickGet()
-                local tp = nil
-                pcall(function() tp = mouse.Target end)
-                if tp then
-                    local cur = tp
-                    while cur do
-                        if cur:IsA("Model") and isNPC_model(cur) then return cur end
-                        cur = cur.Parent
-                    end
-                end
-                return nil
-            end
-            local m = quickGet()
-            if m then return m end
-            if killThroughWalls then
-                local cam = Workspace.CurrentCamera
-                if not cam then return nil end
+        local npcModel = getNPCModel(targetPart)
+        -- if killThroughWalls is enabled and direct hit failed, try a screen-based nearest NPC pick
+        if not npcModel and killThroughWalls then
+            local cam = Workspace.CurrentCamera
+            if cam then
                 local sx, sy
                 pcall(function() sx = mouse.X; sy = mouse.Y end)
                 if not sx or not sy or sx == 0 then
@@ -1392,60 +1213,64 @@ local function createClickKillTool()
                 end
                 local ray = cam:ScreenPointToRay(sx, sy)
                 local origin = ray.Origin
-                local dir = ray.Direction
-                local dirUnit = dir.Unit
-
+                local dir = ray.Direction.Unit
                 local bestModel = nil
                 local bestAlong = math.huge
                 local maxAlong = 2000
                 local maxClosestDist = 6
-                for mm,_ in pairs(NPCs) do
-                    if mm and mm.Parent and isNPC(mm) then
-                        local part = getBestPartForModel(mm)
+                for model,_ in pairs(NPCs) do
+                    if model and model.Parent and isNPC(model) then
+                        local part = getBestPartForModel(model)
                         if part and part:IsA("BasePart") then
                             local pos = part.Position
                             local v = pos - origin
-                            local along = v:Dot(dirUnit)
+                            local along = v:Dot(dir)
                             if along > 0 and along < maxAlong then
-                                local closest = origin + dirUnit * along
+                                local closest = origin + dir * along
                                 local dist = (pos - closest).Magnitude
                                 if dist <= maxClosestDist then
                                     if along < bestAlong then
                                         bestAlong = along
-                                        bestModel = mm
+                                        bestModel = model
                                     end
                                 end
                             end
                         end
                     end
                 end
-                return bestModel
+                npcModel = bestModel
             end
-            return nil
-        end)()
+        end
 
-        if not model then return end
-        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if not npcModel then return end
+
+        local humanoid = npcModel:FindFirstChildOfClass("Humanoid")
         if humanoid then
-            if clickToolKillEnabled then
-                pcall(function() if humanoid.BreakJointsOnDeath ~= nil then humanoid.BreakJointsOnDeath = false end end)
-            end
-
-            task.wait(0.1)
-
+            -- If click-kill fling enabled, kill then fling
             if clickToolFlingEnabled then
+                -- Disable BreakJointsOnDeath before click kill
+                if clickToolKillEnabled then
+                    pcall(function() if humanoid.BreakJointsOnDeath ~= nil then humanoid.BreakJointsOnDeath = false end end)
+                end
+
+                task.wait(0.1)
+
                 if clickToolKillEnabled then
                     applyDamageSequence(humanoid)
                 end
 
-                iterateParts(model, function(p)
+                -- Make NPC massless before fling
+                iterateParts(npcModel, function(p)
                     pcall(function() if p.Massless ~= nil then p.Massless = true end end)
                 end)
 
+                -- compute fling velocity away from local player
                 local playerPos = nil
-                if player.Character and player.Character.PrimaryPart then pcall(function() playerPos = player.Character.PrimaryPart.Position end) end
+                if player.Character and player.Character.PrimaryPart then
+                    pcall(function() playerPos = player.Character.PrimaryPart.Position end)
+                end
                 local pwr = tonumber(clickToolFlingPower) or tonumber(flingBox.Text) or 200
-                iterateParts(model, function(p)
+                iterateParts(npcModel, function(p)
                     if p and p:IsA("BasePart") and not p.Anchored then
                         pcall(function()
                             local dir = Vector3.new(0,1,0)
@@ -1466,8 +1291,9 @@ local function createClickKillTool()
                     end
                 end)
 
+                -- schedule restore
                 local humRef = humanoid
-                local modelRef = model
+                local modelRef = npcModel
                 local delaySec = tonumber(breakRestoreDelay) or 1
                 task.delay(delaySec, function()
                     pcall(function()
@@ -1484,15 +1310,15 @@ local function createClickKillTool()
                     end
                 end)
             else
+                -- Default sequence: 0 -> wait 0.01 -> 1 -> wait 0.01 -> heavy kill
                 if clickToolKillEnabled then
+                    pcall(function() if humanoid.BreakJointsOnDeath ~= nil then humanoid.BreakJointsOnDeath = false end end)
+                    task.wait(0.1)
                     applyDamageSequence(humanoid)
-
-                    local humRef = humanoid
-                    local delaySec = tonumber(breakRestoreDelay) or 1
-                    task.delay(delaySec, function()
+                    task.delay(breakRestoreDelay, function()
                         pcall(function()
-                            if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil then
-                                humRef.BreakJointsOnDeath = true
+                            if humanoid and humanoid.Parent and humanoid.BreakJointsOnDeath ~= nil then
+                                humanoid.BreakJointsOnDeath = true
                             end
                         end)
                     end)
@@ -1519,6 +1345,7 @@ local function setCreateClickKillOnRespawn(enabled)
     if enabled then
         -- create on next respawn
         clickToolConn = player.CharacterAdded:Connect(onCharacterAddedForTool)
+        -- Only create on future respawn per requirement (do not create immediately)
     end
 end
 
@@ -2123,8 +1950,7 @@ do
             end
         end
         if cancelChaseEnabled then
-            for model,_ in pairs(NPCS) do
-                -- defensive: ensure model is valid
+            for model,_ in pairs(NPCs) do
                 if model and model.Parent and isNPC(model) then pcall(function() cancelChaseForModel(model) end) end
             end
         end
@@ -2132,8 +1958,6 @@ do
     end)
 end
 
--- Fix small typo in heartbeat loop - NPCS -> NPCs (if present)
--- (If the above accidentally introduced a typo, ensure the heartbeat uses NPCs)
 -- Tabs show/hide (compact)
 local function showTab(name)
     controlsFrame.Visible = false
@@ -2195,6 +2019,7 @@ player.CharacterAdded:Connect(function(char)
         if data then
             local okGui = data.gui and data.gui.Parent and data.gui.Adornee and data.gui.Adornee.Parent
             local okHighlight = data.highlight and data.highlight.Parent
+            -- if both gui and highlight still exist and adornee part is valid, reparent to current PlayerGui
             if (okGui or okHighlight) then
                 if data.gui and pg then
                     pcall(function() data.gui.Parent = pg end)
@@ -2203,7 +2028,9 @@ player.CharacterAdded:Connect(function(char)
                     pcall(function() data.highlight.Parent = pg end)
                 end
             else
+                -- gui/highlight were destroyed (likely due to PlayerGui recreation). Remove and recreate tracker.
                 removeTrackerFromModel(m)
+                -- if Tracker is allowed for this model's type, re-add
                 if m and m.Parent and not (excluded[m.Name] and excluded[m.Name]["Tracker"]) then
                     addTrackerToModel(m)
                 end
@@ -2215,8 +2042,10 @@ end)
 -- Also watch PlayerGui being removed/added (defensive): when PlayerGui is recreated, reattach or recreate trackers
 player.ChildAdded:Connect(function(child)
     if child.Name == "PlayerGui" then
+        -- small delay to allow other ScreenGuis to be created
         task.delay(0.1, function()
             local pg = getPlayerGui()
+            -- reattach existing trackers to new PlayerGui or recreate
             for m,_ in pairs(trackedNPCs) do
                 local data = trackedNPCs[m]
                 if data then
