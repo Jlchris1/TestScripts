@@ -1,7 +1,10 @@
--- Tornado (Friendly / Nightmare) LocalScript — FULL (with funnel + sub-vortex teleport)
--- Teleport behavior: parts that reach tornadoPosition.Y + funnelHeight are teleported down
--- to local player's HRP.Y + funnelTeleportYOffset and continue moving upward.
--- Applies to: main funnel parts, satellite parts, and vertical/noodle chain parts.
+-- Tornado (Friendly / Nightmare) LocalScript — FULL (with funnel + satellites + noodle -> fling logic)
+-- Features:
+--  * Satellites spawn in Friendly mode (visual), attack only in Nightmare.
+--  * 1/4 of satellite parts become "noodles" (vertical chains) that stretch toward target players.
+--  * When a noodle reaches a player it triggers the noodle attack: only noodle parts fling that player until they leave windfield.
+--  * Main funnel can spawn noodles based on number of main-funnel parts; main-noodles don't attack unless the player is inside the inner 1/3 radius.
+--  * GUI tuning controls included.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -18,25 +21,21 @@ local tornadoInwardPullSpeed = 50
 
 local baseplateName = "Baseplate"
 
--- Satellite (sub-vortex) global default settings (adjustable via UI)
+-- Satellite (sub-vortex) settings
 local maxPartsPerSatellite = 6
 local maxSubVortices = 3
 local satelliteChaseSpeed = 20 -- studs/sec (only in NIGHTMARE)
 local satelliteOrbitRadius = 10
-local satelliteRotationSpeed = 3.5 -- base rotation speed (per-satellite meta.speed will be derived)
+local satelliteRotationSpeed = 3.5
 local horizontalVortexAttachRadius = 30
 local satelliteMainOrbitAttackCount = 3
 local satelliteMainOrbitAttackRate = 1
 
--- New: Sub-vortex adjustable parameters (UI)
-local subVortexSpinSpeed = 3.5      -- multiplier for part angular speed inside satellites
-local subVortexHeight = 18          -- vertical range (top - floor) for sub-vortex parts
-local subVortexBobFreqMin = 0.7     -- minimum period (seconds) for each part's vertical oscillation
-local subVortexBobFreqMax = 2.4     -- maximum period (seconds)
-local subVortexBobAmplitude = 1.0   -- extra amplitude scaling for vertical pattern (affects variation)
-
--- Vertical vortex (noodle) settings
-local verticalChainMinParts = 3
+-- Sub-vortex / noodle parameters
+local subVortexSpinSpeed = 3.5      -- per-part multiplier
+local subVortexHeight = 18          -- top height for sub-vortex parts (studs above tornado base)
+local noodleFraction = 0.25         -- 1/4 of satellite parts become noodle chains
+local verticalChainMinParts = 2
 local verticalChainMaxParts = 6
 local verticalChainSpeed = 0.7
 local verticalChainAmplitude = 4
@@ -44,43 +43,40 @@ local verticalChainFrequency = 6
 local verticalChainSegmentDelay = 0.12
 local verticalAttachDistance = 2.0
 
+-- Main-tornado noodle spawn
+local mainNoodleEnabled = true
+local mainNoodleSpawnCooldown = 2.0  -- seconds between main noodle spawn attempts
+local mainNoodleMinParts = 4         -- min number of main-funnel parts required to spawn a main noodle
+
 -- Noodle fling settings (velocity-based)
 local noodleFlingInterval = 0.6  -- seconds between noodle flings at a targeted player
 local noodleLaunchBaseSpeed = 300
 local noodleLaunchRandomAdd = 200
-local noodleLaunchAngular = 80   -- magnitude applied to AssemblyAngularVelocity for visual spin on fling
+local noodleLaunchAngular = 80
 
 -- Orbit smoothing / cap
 local orbitVelocityMinCap = 200
 local orbitVelocityMultiplier = 2.5
 
 -- Funnel-specific
-local funnelReserveCount = 8        -- how many parts to reserve for main funnel (UI adjustable)
-local funnelHeight = 60             -- vertical threshold (relative to tornadoPosition.Y) for teleport
-local funnelTeleportYOffset = 5     -- teleport target Y = player's HRP.Y + funnelTeleportYOffset
-local funnelBobAmplitude = 2.5      -- vertical bob amplitude inside main funnel
+local funnelReserveCount = 8
+local funnelHeight = 60
+local funnelTeleportYOffset = 5
+
+-- How much of available parts reserved for main funnel by default
+local mainFunnelShare = 0.7
 
 -- ========== Runtime State ==========
 local tornadoPosition = nil
-local pickedUpByFunnel = {}      -- part -> true (picked)
-local whitelistedParts = {}      -- part -> true (available pool)
+local pickedUpByFunnel = {}      -- part -> true
+local whitelistedParts = {}      -- part -> true
 local assignedToSatellite = {}   -- part -> satelliteId or true
 local debrisAttachedToPlayer = {}-- part -> player
 
-local mainFunnelParts = {}       -- list of parts reserved for the main funnel (fast lookup below)
-local mainFunnelSet = {}         -- part -> true for quick checks
+local mainFunnelParts = {}       -- list of main funnel parts
+local mainFunnelSet = {}         -- set for quick checks
 
--- Satellite structure:
--- satelliteVortices[id] = {
---   id = id,
---   pos = Vector3,
---   angleOffset = number,
---   parts = { [part] = { radius, speed, phase, bobPeriod, bobPhase, bobFloorOffset, bobTopOffset }, ... },
---   target = Player or nil,
---   verticalChains = { ... },
---   lastVortexSpawnTick = tick()
--- }
-local satelliteVortices = {}
+local satelliteVortices = {}     -- id -> sat table
 local satelliteAttackState = {}
 local nextSatelliteId = 1
 
@@ -89,11 +85,14 @@ local playerTargetThreads = {}   -- player -> boolean
 
 local nightmareMode = false
 
--- Noodle tracking: parts that were selected to form noodle(s)
-local noodlePools = {}
-local noodlePartSet = {}
+local noodlePools = {}           -- satId -> set of parts belonging to noodle chains
+local noodlePartSet = {}         -- part -> true
 
--- ========== UI ==========
+-- For main funnel vertical chains (ownerSatellite = 0)
+local mainVerticalChains = {}
+local lastMainNoodleTick = 0
+
+-- ========== UI (keeps your old GUI; added relevant inputs) ==========
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "TornadoBlastGUI"
 screenGui.ResetOnSpawn = false
@@ -110,21 +109,6 @@ hideToggle.Font = Enum.Font.SourceSansBold
 hideToggle.TextSize = 14
 hideToggle.Text = "Hide"
 hideToggle.Parent = screenGui
-
-local inputsVisible = true
-local function toggleInputs()
-    inputsVisible = not inputsVisible
-    for _, child in ipairs(screenGui:GetChildren()) do
-        if (child:IsA("TextBox") or child:IsA("TextLabel")) and not (child == hideToggle or child == toggleBtn or child == modeToggle) then
-            child.Visible = inputsVisible
-        end
-    end
-end
-
-hideToggle.MouseButton1Click:Connect(function()
-    toggleInputs()
-    hideToggle.Text = inputsVisible and "Hide" or "Show"
-end)
 
 local function createLabeledTextbox(labelText, default, index)
     local perRow = 4
@@ -162,18 +146,15 @@ local inputBoxes = {
     {"Spin Speed", tornadoSpinSpeed},
     {"Upward Speed", tornadoUpwardSpeed},
     {"Windfield Radius", tornadoWindfield},
-    {"Tornado Movement Speed", tornadoMoveSpeed},
+    {"Tornado Move Speed", tornadoMoveSpeed},
     {"Inward Pull Speed", tornadoInwardPullSpeed},
     {"Max Parts / Satellite", maxPartsPerSatellite},
     {"Max Sub-Vortices", maxSubVortices},
     {"Funnel Reserve Count", funnelReserveCount},
     {"Funnel Height", funnelHeight},
-    -- New sub-vortex controls
     {"Sub Vortex Spin Speed", subVortexSpinSpeed},
     {"Sub Vortex Height", subVortexHeight},
-    {"Bob Period Min (s)", subVortexBobFreqMin},
-    {"Bob Period Max (s)", subVortexBobFreqMax},
-    {"Bob Amplitude", subVortexBobAmplitude}
+    {"Main Funnel Share (%)", mainFunnelShare * 100}
 }
 
 local references = {}
@@ -213,71 +194,15 @@ references[2].FocusLost:Connect(function() local v = tonumber(references[2].Text
 references[3].FocusLost:Connect(function() local v = tonumber(references[3].Text); if v then tornadoWindfield = v end end)
 references[4].FocusLost:Connect(function() local v = tonumber(references[4].Text); if v then tornadoMoveSpeed = v end end)
 references[5].FocusLost:Connect(function() local v = tonumber(references[5].Text); if v then tornadoInwardPullSpeed = v end end)
-references[6].FocusLost:Connect(function()
-    local v = tonumber(references[6].Text)
-    if v then maxPartsPerSatellite = math.max(1, math.floor(v)) end
-end)
-references[7].FocusLost:Connect(function()
-    local v = tonumber(references[7].Text)
-    if v then
-        maxSubVortices = math.max(0, math.floor(v))
-        references[7].Text = tostring(maxSubVortices)
-        if enabled then formSatellitesInstant() end
-    end
-end)
-references[8].FocusLost:Connect(function()
-    local v = tonumber(references[8].Text)
-    if v then
-        funnelReserveCount = math.max(0, math.floor(v))
-        references[8].Text = tostring(funnelReserveCount)
-    end
-end)
-references[9].FocusLost:Connect(function()
-    local v = tonumber(references[9].Text)
-    if v then
-        funnelHeight = math.max(0, v)
-        references[9].Text = tostring(funnelHeight)
-    end
-end)
+references[6].FocusLost:Connect(function() local v = tonumber(references[6].Text); if v then maxPartsPerSatellite = math.max(1, math.floor(v)) end end)
+references[7].FocusLost:Connect(function() local v = tonumber(references[7].Text); if v then maxSubVortices = math.max(0, math.floor(v)); references[7].Text = tostring(maxSubVortices); if enabled then formSatellitesInstant() end end)
+references[8].FocusLost:Connect(function() local v = tonumber(references[8].Text); if v then funnelReserveCount = math.max(0, math.floor(v)); references[8].Text = tostring(funnelReserveCount) end end)
+references[9].FocusLost:Connect(function() local v = tonumber(references[9].Text); if v then funnelHeight = math.max(0, v); references[9].Text = tostring(funnelHeight) end end)
+references[10].FocusLost:Connect(function() local v = tonumber(references[10].Text); if v then subVortexSpinSpeed = math.max(0, v); references[10].Text = tostring(subVortexSpinSpeed) end end)
+references[11].FocusLost:Connect(function() local v = tonumber(references[11].Text); if v then subVortexHeight = math.max(0, v); references[11].Text = tostring(subVortexHeight) end end)
+references[12].FocusLost:Connect(function() local v = tonumber(references[12].Text); if v then mainFunnelShare = math.clamp(v / 100, 0, 0.98); references[12].Text = tostring(mainFunnelShare * 100) end end)
 
--- Sub-vortex UI binds
-references[10].FocusLost:Connect(function()
-    local v = tonumber(references[10].Text)
-    if v then
-        subVortexSpinSpeed = math.max(0, v)
-        references[10].Text = tostring(subVortexSpinSpeed)
-    end
-end)
-references[11].FocusLost:Connect(function()
-    local v = tonumber(references[11].Text)
-    if v then
-        subVortexHeight = math.max(0, v)
-        references[11].Text = tostring(subVortexHeight)
-    end
-end)
-references[12].FocusLost:Connect(function()
-    local v = tonumber(references[12].Text)
-    if v then
-        subVortexBobFreqMin = math.max(0.05, v)
-        references[12].Text = tostring(subVortexBobFreqMin)
-    end
-end)
-references[13].FocusLost:Connect(function()
-    local v = tonumber(references[13].Text)
-    if v then
-        subVortexBobFreqMax = math.max(subVortexBobFreqMin, v)
-        references[13].Text = tostring(subVortexBobFreqMax)
-    end
-end)
-references[14].FocusLost:Connect(function()
-    local v = tonumber(references[14].Text)
-    if v then
-        subVortexBobAmplitude = math.max(0, v)
-        references[14].Text = tostring(subVortexBobAmplitude)
-    end
-end)
-
--- ========== Helper functions ==========
+-- ========== Helpers ==========
 local function isPlayerPart(part)
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr.Character and part:IsDescendantOf(plr.Character) then
@@ -394,12 +319,10 @@ local function cleanupDebrisForPlayer(targetPlayer)
     end
 end
 
--- ========== Tornado (main funnel) handling ==========
+-- ========== Main funnel reservation ==========
 local function reserveMainFunnelParts()
     mainFunnelParts = {}
     mainFunnelSet = {}
-
-    if funnelReserveCount <= 0 then return end
 
     local candidates = {}
     for p in pairs(whitelistedParts) do
@@ -410,8 +333,14 @@ local function reserveMainFunnelParts()
         end
     end
 
+    if #candidates == 0 then return end
+
     table.sort(candidates, function(a,b) return a.dist < b.dist end)
-    local take = math.min(funnelReserveCount, #candidates)
+
+    local available = #candidates
+    local desiredByShare = math.floor(available * mainFunnelShare + 0.5)
+    local take = math.min(available, math.max(funnelReserveCount, desiredByShare))
+
     for i = 1, take do
         local p = candidates[i].part
         if p then
@@ -426,12 +355,10 @@ end
 
 local function teleportPartToPlayerLevel(part, currentDesiredVel)
     if not part or not part.Parent then return end
-    if debrisAttachedToPlayer[part] then return end -- don't teleport parts attached to players
+    if debrisAttachedToPlayer[part] then return end
     if not localPlayer or not localPlayer.Character or not localPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
     local targetY = localPlayer.Character.HumanoidRootPart.Position.Y + funnelTeleportYOffset
-    -- teleport preserving X/Z
     part.CFrame = CFrame.new(part.Position.X, targetY, part.Position.Z)
-    -- give upward velocity so it continues rising again
     if currentDesiredVel then
         part.AssemblyLinearVelocity = Vector3.new(currentDesiredVel.X, math.max(math.abs(currentDesiredVel.Y), tornadoUpwardSpeed * 0.6), currentDesiredVel.Z)
     else
@@ -453,14 +380,12 @@ local function updateMainFunnel(delta)
             local inwardPull = -dirToCenter * (tornadoInwardPullSpeed * 0.8)
             local upward = Vector3.new(0, tornadoUpwardSpeed, 0)
             local rotational = spinDir * (tornadoSpinSpeed * (1 + (distance / tornadoWindfield)))
-            local bob = math.sin(tick() * 4 + i) * funnelBobAmplitude * (1 - distance / math.max(1, tornadoWindfield))
-            local finalVelocity = rotational + inwardPull + upward + Vector3.new(0, bob, 0)
+            local finalVelocity = rotational + inwardPull + upward
             if not p.Anchored then
                 p.AssemblyLinearVelocity = finalVelocity
                 p.CanCollide = false
             end
 
-            -- teleport main funnel parts when they reach funnelHeight
             if p.Position.Y >= (tornadoPosition.Y + funnelHeight) then
                 teleportPartToPlayerLevel(p, finalVelocity)
             end
@@ -486,10 +411,8 @@ local function applyTornadoFriendly(position)
                 local inwardPull = (distance > 0) and (-dirToCenter * tornadoInwardPullSpeed) or Vector3.zero
                 local upward = Vector3.new(0, tornadoUpwardSpeed, 0)
                 local rotational = spinDir * tornadoSpinSpeed
-                local bob = math.sin(tick()*3) * (2 * (1 - (distance / math.max(1, tornadoWindfield))))
                 obj.CanCollide = false
-                obj.AssemblyLinearVelocity = rotational + inwardPull + upward + Vector3.new(0, bob, 0)
-                -- teleport check for generic funnel parts (non-reserved) as well
+                obj.AssemblyLinearVelocity = rotational + inwardPull + upward
                 if obj.Position.Y >= (tornadoPosition.Y + funnelHeight) and not debrisAttachedToPlayer[obj] then
                     teleportPartToPlayerLevel(obj, obj.AssemblyLinearVelocity)
                 end
@@ -512,9 +435,8 @@ local function applyTornadoNightmare(position)
                 local inwardPull = (distance > 0) and (-dirToCenter * (tornadoInwardPullSpeed * 1.1)) or Vector3.zero
                 local upward = Vector3.new(0, tornadoUpwardSpeed * 1.0, 0)
                 local rotational = spinDir * (tornadoSpinSpeed * 1.2)
-                local bob = math.sin(tick()*4) * (2.5 * (1 - (distance / math.max(1, tornadoWindfield))))
                 obj.CanCollide = false
-                obj.AssemblyLinearVelocity = rotational + inwardPull + upward + Vector3.new(0, bob, 0)
+                obj.AssemblyLinearVelocity = rotational + inwardPull + upward
                 if obj.Position.Y >= (tornadoPosition.Y + funnelHeight) and not debrisAttachedToPlayer[obj] then
                     teleportPartToPlayerLevel(obj, obj.AssemblyLinearVelocity)
                 end
@@ -551,7 +473,7 @@ local function startFiringAtPlayer(targetPlayer)
             local dist = (hrp.Position - tornadoPosition).Magnitude
             if dist > tornadoWindfield then break end
 
-            -- prefer noodle parts
+            -- prefer noodle parts for attaching
             local candidate = nil
             for sid, pool in pairs(noodlePools) do
                 for part, _ in pairs(pool) do
@@ -626,39 +548,87 @@ end
 
 local function doFlingVelocity(part, targetPos)
     if not part or not part.Parent then return end
-    -- compute desired velocity vector
     local dir = (targetPos - part.Position)
     local mag = dir.Magnitude
     if mag <= 0 then return end
     local unit = dir.Unit
     local launchSpeed = noodleLaunchBaseSpeed + math.random(0, noodleLaunchRandomAdd)
-    -- Apply assembly velocity (gives immediate fling)
     part.AssemblyLinearVelocity = unit * launchSpeed + Vector3.new(0, 50, 0)
-    -- Give it angular velocity to look like a fling (visual)
-    local ang = Vector3.new(math.random()-0.5, math.random()-0.5, math.random()-0.5).Unit * noodleLaunchAngular
+    local ang = Vector3.new(math.random()-0.5, math.random()-0.5, math.random()-0.5)
+    if ang.Magnitude > 0 then ang = ang.Unit * noodleLaunchAngular else ang = Vector3.new(0,1,0) * noodleLaunchAngular end
     pcall(function() part.AssemblyAngularVelocity = ang end)
+end
+
+-- Modified: only noodlePools[satId] parts attempt to fling; attackable flag controls main-noodles vs satellite-noodles
+local function startNoodleFlingAtPlayer(targetPlayer, satId, attackable)
+    if not targetPlayer or not targetPlayer.Character then return end
+    spawn(function()
+        -- continue while: tornado enabled AND target inside tornado windfield AND either (nightmareMode && sat is satellite) OR attackable is true
+        while enabled and targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") and noodlePools[satId] do
+            local hrp = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+            local dist = (hrp.Position - (tornadoPosition or hrp.Position)).Magnitude
+            -- condition whether this noodle pool may attack:
+            local mayAttack = false
+            if satId ~= 0 then
+                -- satellite noodles: only attack in Nightmare
+                mayAttack = nightmareMode
+            else
+                -- main funnel noodles: attack if attackable flag set OR player is in inner 1/3 radius OR nightmareMode (if you want main to attack in nightmare too)
+                local innerRadius = tornadoWindfield / 3
+                if attackable or dist <= innerRadius or nightmareMode then mayAttack = true end
+            end
+
+            if not mayAttack or dist > tornadoWindfield then
+                -- stop attacking if the player is outside the windfield or not attackable now
+                break
+            end
+
+            -- pick a noodle part from this pool and fling at player
+            local pool = noodlePools[satId]
+            local candidate = nil
+            for part, _ in pairs(pool) do
+                if part and part.Parent and not part.Anchored and not debrisAttachedToPlayer[part] then
+                    candidate = part
+                    break
+                end
+            end
+
+            if candidate then
+                doFlingVelocity(candidate, hrp.Position)
+                -- remove from noodle sets so it won't be reused
+                noodlePartSet[candidate] = nil
+                pool[candidate] = nil
+            end
+
+            -- if no parts left in the pool, exit
+            local anyLeft = false
+            for _ in pairs(pool or {}) do anyLeft = true; break end
+            if not anyLeft then break end
+
+            -- wait between flings
+            local waited = 0
+            while waited < noodleFlingInterval and enabled and targetPlayer and targetPlayer.Character do
+                task.wait(0.1)
+                waited = waited + 0.1
+            end
+        end
+    end)
 end
 
 local function nightmareLauncherLoop()
     while true do
         if enabled and nightmareMode and tornadoPosition then
-            local pool = {}
+            -- general fallback flings (if some noodle pools remain but weren't triggered)
             for sid, pset in pairs(noodlePools) do
                 for part, _ in pairs(pset) do
                     if part and part.Parent and not debrisAttachedToPlayer[part] and not assignedToSatellite[part] and not part.Anchored and not mainFunnelSet[part] then
-                        table.insert(pool, part)
-                    end
-                end
-            end
-
-            if #pool > 0 then
-                local part = pool[math.random(1, #pool)]
-                local targetPlr, d = findNearestOtherPlayer(part.Position)
-                if targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart") then
-                    doFlingVelocity(part, targetPlr.Character.HumanoidRootPart.Position)
-                    if noodlePartSet[part] then
-                        noodlePartSet[part] = nil
-                        for sid, pset in pairs(noodlePools) do pset[part] = nil end
+                        -- find nearest player to fling at
+                        local targetPlr, d = findNearestOtherPlayer(part.Position)
+                        if targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart") then
+                            doFlingVelocity(part, targetPlr.Character.HumanoidRootPart.Position)
+                            noodlePartSet[part] = nil
+                            pset[part] = nil
+                        end
                     end
                 end
             end
@@ -675,23 +645,18 @@ local function spawnSatelliteWithParts(pos, partsList, idOverride)
     local partsMap = {}
     for _, p in ipairs(partsList) do
         if p and p.Parent then
-            -- Each part gets meta including vertical oscillation parameters (unique per part)
-            local bobPeriod = math.random() * (subVortexBobFreqMax - subVortexBobFreqMin) + subVortexBobFreqMin
-            local bobPhase = math.random() * math.pi * 2
             local radius = satelliteOrbitRadius + math.random(-3, 6)
-            local speed = (subVortexSpinSpeed or satelliteRotationSpeed) * (1 + math.random()*0.6 - 0.3) -- slight per-part variation
+            local speed = (subVortexSpinSpeed or satelliteRotationSpeed) * (1 + math.random()*0.6 - 0.3)
             partsMap[p] = {
                 radius = radius,
                 speed = speed,
                 phase = math.random() * math.pi * 2,
-                bobPeriod = bobPeriod,
-                bobPhase = bobPhase,
-                -- floor and top of the per-part vertical movement relative to tornado base
-                bobFloorOffset = 2 + math.random()*2, -- small random offset above tornado base
-                bobTopOffset = (subVortexHeight or 12) + math.random()*4 -- top offset relative to tornado base
+                floorOffset = 2 + math.random()*2,
+                topOffset = (subVortexHeight or 12) + math.random()*4,
+                verticalTarget = nil,
+                currentY = nil
             }
             assignedToSatellite[p] = id
-            -- clear main funnel flags if any
             mainFunnelSet[p] = nil
         end
     end
@@ -706,6 +671,7 @@ local function spawnSatelliteWithParts(pos, partsList, idOverride)
         lastVortexSpawnTick = tick()
     }
     satelliteAttackState[id] = {attackingPlayers = {}, attackThreads = {}}
+    noodlePools[id] = noodlePools[id] or {}
     return id
 end
 
@@ -734,21 +700,22 @@ function despawnSatellite(id)
     noodlePools[id] = nil
 end
 
--- vertical chain (noodle) builder (1/4 parts)
-local function spawnVerticalChain(sat, targetPlayer)
+-- vertical chain (noodle) builder for satellites (1/4 parts)
+local function spawnVerticalChain(sat, targetPlayer, attackable)
     if not sat or not targetPlayer or not targetPlayer.Character then return end
 
     local availableParts = {}
     for part, _ in pairs(sat.parts) do
-        if part and part.Parent and not part.Anchored and not debrisAttachedToPlayer[part] and not mainFunnelSet[part] then
+        if part and part.Parent and not part.Anchored and not debrisAttachedToPlayer[part] and not mainFunnelSet[part] and not noodlePartSet[part] then
             table.insert(availableParts, part)
         end
     end
     local availableCount = #availableParts
     if availableCount == 0 then return end
 
-    local needed = math.max(1, math.floor(availableCount * 0.25))
+    local needed = math.max(1, math.floor(availableCount * noodleFraction))
     needed = math.clamp(needed, verticalChainMinParts, math.max(verticalChainMaxParts, needed))
+    needed = math.min(needed, availableCount)
 
     local chainParts = {}
     for i = 1, needed do
@@ -758,15 +725,14 @@ local function spawnVerticalChain(sat, targetPlayer)
         if p and p.Parent then
             table.insert(chainParts, p)
             assignedToSatellite[p] = sat.id
-            -- ensure meta present
             sat.parts[p] = sat.parts[p] or {
                 radius = satelliteOrbitRadius + math.random(-3, 6),
                 speed = satelliteRotationSpeed + math.random() * 1.5,
                 phase = math.random() * math.pi * 2,
-                bobPeriod = math.random()*(subVortexBobFreqMax-subVortexBobFreqMin)+subVortexBobFreqMin,
-                bobPhase = math.random()*math.pi*2,
-                bobFloorOffset = 2,
-                bobTopOffset = subVortexHeight
+                floorOffset = 2,
+                topOffset = subVortexHeight,
+                verticalTarget = nil,
+                currentY = nil
             }
         end
     end
@@ -790,47 +756,63 @@ local function spawnVerticalChain(sat, targetPlayer)
         frequency = verticalChainFrequency * (0.8 + math.random()*0.8),
         segmentDelay = verticalChainSegmentDelay,
         ownerSatellite = sat.id,
+        attackable = attackable or false,
         created = tick()
     }
 
     table.insert(sat.verticalChains, chain)
 end
 
-local function startNoodleFlingAtPlayer(targetPlayer, satId)
-    if not targetPlayer or not targetPlayer.Character or not noodlePools[satId] then return end
-    spawn(function()
-        while nightmareMode and enabled and targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") and noodlePools[satId] do
-            local pool = noodlePools[satId]
-            local candidate = nil
-            for part, _ in pairs(pool) do
-                if part and part.Parent and not part.Anchored and not debrisAttachedToPlayer[part] then
-                    candidate = part
-                    break
-                end
-            end
-
-            if candidate then
-                local hrp = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    doFlingVelocity(candidate, hrp.Position)
-                    if noodlePartSet[candidate] then
-                        noodlePartSet[candidate] = nil
-                    end
-                    pool[candidate] = nil
-                end
-            end
-
-            local anyLeft = false
-            for _ in pairs(pool) do anyLeft = true; break end
-            if not anyLeft then break end
-
-            local waited = 0
-            while waited < noodleFlingInterval and nightmareMode and enabled do
-                task.wait(0.1)
-                waited = waited + 0.1
-            end
+-- main-tornado noodle chain spawner (ownerSatellite = 0)
+local function spawnMainNoodleChain(targetPlayer, numParts, attackable)
+    if not targetPlayer or not targetPlayer.Character then return end
+    if numParts <= 0 then return end
+    -- gather candidate parts from mainFunnelParts
+    local availableParts = {}
+    for _, p in ipairs(mainFunnelParts) do
+        if p and p.Parent and not p.Anchored and not noodlePartSet[p] then
+            table.insert(availableParts, p)
         end
-    end)
+    end
+    if #availableParts == 0 then return end
+
+    local chainParts = {}
+    for i = 1, math.min(numParts, #availableParts) do
+        local idx = math.random(1, #availableParts)
+        local p = table.remove(availableParts, idx)
+        if p and p.Parent then
+            table.insert(chainParts, p)
+            -- mark as main-funnel assigned temporarily
+            assignedToSatellite[p] = 0
+        end
+    end
+
+    if #chainParts == 0 then return end
+
+    noodlePools[0] = noodlePools[0] or {}
+    for _, p in ipairs(chainParts) do
+        noodlePools[0][p] = true
+        noodlePartSet[p] = true
+        whitelistedParts[p] = nil
+        pickedUpByFunnel[p] = nil
+        -- remove from mainFunnelParts list so main funnel doesn't fight for them
+        for idx, q in ipairs(mainFunnelParts) do if q == p then table.remove(mainFunnelParts, idx); break end end
+    end
+
+    local chain = {
+        parts = chainParts,
+        target = targetPlayer,
+        progress = 0,
+        speed = verticalChainSpeed * (0.8 + math.random()*0.8),
+        amplitude = verticalChainAmplitude * (0.6 + math.random()*0.8),
+        frequency = verticalChainFrequency * (0.8 + math.random()*0.8),
+        segmentDelay = verticalChainSegmentDelay,
+        ownerSatellite = 0,
+        attackable = attackable or false,
+        created = tick()
+    }
+
+    table.insert(mainVerticalChains, chain)
 end
 
 -- ========== Satellites update (per-heartbeat) ==========
@@ -869,7 +851,7 @@ local function updateSatellites(delta)
             sat.pos = pos + dir * math.min(1, delta * 1.5)
         end
 
-        -- update parts: orbital + per-part vertical between floor and top with unique period & phase
+        -- update parts: orbital + per-part vertical between floor and top with target-based non-bob motion
         for part, meta in pairs(sat.parts) do
             if part and part.Parent then
                 local center = sat.pos
@@ -877,26 +859,27 @@ local function updateSatellites(delta)
                 local radiusPulse = meta.radius * (1 + 0.06 * math.sin(tick() * (0.5 + meta.speed * 0.05) + meta.phase))
                 local horizTarget = center + Vector3.new(math.cos(angle) * radiusPulse, 0, math.sin(angle) * radiusPulse)
 
-                -- per-part vertical movement: smooth sine between floor and top
-                local floorY = tornadoPosition.Y + (meta.bobFloorOffset or 2)
-                local topY = tornadoPosition.Y + (meta.bobTopOffset or subVortexHeight)
-                local t = tick()
-                local period = math.max(0.001, meta.bobPeriod or (subVortexBobFreqMin + (math.random()*(subVortexBobFreqMax-subVortexBobFreqMin))))
-                local s = 0.5 * (1 + math.sin((2 * math.pi / period) * t + (meta.bobPhase or 0)))
-                local y = floorY + (topY - floorY) * s * (1 + (meta.bobAmplitudeOffset or 0))
-                local targetPos = Vector3.new(horizTarget.X, y + 8, horizTarget.Z) -- keep +8 for orbit offset
+                local floorY = tornadoPosition.Y + (meta.floorOffset or 2)
+                local topY = tornadoPosition.Y + (meta.topOffset or subVortexHeight)
+                if not meta.currentY then meta.currentY = math.clamp(part.Position.Y, floorY, topY) end
+                if not meta.verticalTarget then meta.verticalTarget = (floorY + topY) / 2 end
+                if math.abs(meta.currentY - meta.verticalTarget) < 0.5 then
+                    meta.verticalTarget = floorY + math.random() * (math.max(0, topY - floorY))
+                end
+                local interpSpeed = math.max(0.15, (meta.speed or 1) * 0.25)
+                meta.currentY = meta.currentY + (meta.verticalTarget - meta.currentY) * math.clamp(delta * interpSpeed, 0, 1)
+
+                local targetPos = Vector3.new(horizTarget.X, meta.currentY, horizTarget.Z)
 
                 if not part.Anchored then
                     local desiredVel = (targetPos - part.Position) / math.max(delta, 0.016)
-                    local maxVel = math.max(orbitVelocityMinCap, math.abs(radiusPulse * meta.speed * orbitVelocityMultiplier))
+                    local maxVel = math.max(orbitVelocityMinCap, math.abs(radiusPulse * (meta.speed or 1) * orbitVelocityMultiplier))
                     if desiredVel.Magnitude > maxVel then desiredVel = desiredVel.Unit * maxVel end
                     part.AssemblyLinearVelocity = Vector3.new(desiredVel.X, math.clamp(desiredVel.Y, -140, 140), desiredVel.Z)
                     part.CanCollide = false
                 end
 
-                -- teleport satellite part if it reaches the funnelHeight threshold
                 if part.Position.Y >= (tornadoPosition.Y + funnelHeight) and not debrisAttachedToPlayer[part] then
-                    -- teleport it down to local player's level and give upward velocity
                     teleportPartToPlayerLevel(part, part.AssemblyLinearVelocity)
                 end
 
@@ -917,13 +900,14 @@ local function updateSatellites(delta)
             end
         end
 
-        -- occasionally spawn vertical noodle chains toward target in NIGHTMARE
+        -- occasionally spawn vertical noodle chains toward target in NIGHTMARE (satellites only spawn noodles in Nightmare)
         if nightmareMode and sat.target and (tick() - sat.lastVortexSpawnTick) >= (1.5 + math.random()*2.0) then
             sat.lastVortexSpawnTick = tick()
-            spawnVerticalChain(sat, sat.target)
+            -- Satellite noodles should be attackable (satellites attack in Nightmare)
+            spawnVerticalChain(sat, sat.target, true)
         end
 
-        -- update vertical chains
+        -- update vertical chains for this satellite
         for ci = #sat.verticalChains, 1, -1 do
             local chain = sat.verticalChains[ci]
             if not chain or not chain.target or not chain.target.Character then
@@ -948,15 +932,13 @@ local function updateSatellites(delta)
                             part.AssemblyLinearVelocity = Vector3.new(vel.X, math.clamp(vel.Y, -140, 140), vel.Z)
                             part.CanCollide = false
 
-                            -- teleport chain part if it reaches funnelHeight (and not attached)
-                            if part.Position.Y >= (tornadoPosition.Y + funnelHeight) and not debrisAttachedToPlayer[part] then
-                                teleportPartToPlayerLevel(part, part.AssemblyLinearVelocity)
-                            end
-
+                            -- when the noodle part reaches the player, remove it from chain and trigger noodle attack
                             local distToHRP = (part.Position - targetHRP.Position).Magnitude
                             if distToHRP <= verticalAttachDistance then
+                                -- remove that part and start attack for the noodle pool
                                 chain.parts[idx] = nil
-                                startNoodleFlingAtPlayer(chain.target, chain.ownerSatellite)
+                                -- Trigger attack for the noodle pool for this satellite (attackable true for satellite noodles)
+                                startNoodleFlingAtPlayer(chain.target, chain.ownerSatellite, chain.attackable)
                             end
                         else
                             chain.parts[idx] = nil
@@ -1014,10 +996,10 @@ local function updateSatellites(delta)
                                                     radius = satelliteOrbitRadius + math.random(-3, 6),
                                                     speed = satelliteRotationSpeed + math.random() * 1.5,
                                                     phase = math.random() * math.pi * 2,
-                                                    bobPeriod = math.random()*(subVortexBobFreqMax-subVortexBobFreqMin)+subVortexBobFreqMin,
-                                                    bobPhase = math.random()*math.pi*2,
-                                                    bobFloorOffset = 2,
-                                                    bobTopOffset = subVortexHeight
+                                                    floorOffset = 2,
+                                                    topOffset = subVortexHeight,
+                                                    verticalTarget = nil,
+                                                    currentY = nil
                                                 }
                                                 assignedToSatellite[p] = id
                                             end
@@ -1045,14 +1027,11 @@ local function updateSatellites(delta)
             end
         end
 
-        -- cleanup: despawn empty satellites
-        local partCount = 0
-        for p, _ in pairs(sat.parts) do if p and p.Parent then partCount = partCount + 1 end end
-        if partCount == 0 then despawnSatellite(id) end
+        -- keep satellites visually even if empty (do not auto-despawn)
     end
 end
 
--- ========== Satellite formation helpers (equal division with funnel reserve) ==========
+-- ========== Satellite formation helpers (always spawn satellites) ==========
 function formSatellitesInstant()
     for id, _ in pairs(satelliteVortices) do despawnSatellite(id) end
 
@@ -1069,7 +1048,6 @@ function formSatellitesInstant()
         if not tornadoPosition then return end
     end
 
-    -- gather candidates
     local candidateParts = {}
     local allParts = Workspace:GetPartBoundsInRadius(tornadoPosition, tornadoWindfield)
     for _, p in ipairs(allParts) do
@@ -1078,16 +1056,26 @@ function formSatellitesInstant()
         end
     end
 
-    -- reserve funnel parts first
-    local total = #candidateParts
-    local toReserve = math.min(funnelReserveCount, total)
     table.sort(candidateParts, function(a,b)
         return (a.Position - tornadoPosition).Magnitude < (b.Position - tornadoPosition).Magnitude
     end)
 
+    local total = #candidateParts
+    local desiredByShare = math.floor(total * mainFunnelShare + 0.5)
+    local mainReserve = math.clamp(desiredByShare, 0, total)
+    local remainingCount = total - mainReserve
+
+    while remainingCount < count and mainReserve > math.min(funnelReserveCount, total) do
+        mainReserve = mainReserve - 1
+        remainingCount = total - mainReserve
+    end
+
+    mainReserve = math.clamp(mainReserve, 0, total)
+    remainingCount = total - mainReserve
+
     mainFunnelParts = {}
     mainFunnelSet = {}
-    for i = 1, toReserve do
+    for i = 1, mainReserve do
         local p = candidateParts[i]
         if p then
             mainFunnelParts[#mainFunnelParts+1] = p
@@ -1098,40 +1086,43 @@ function formSatellitesInstant()
         end
     end
 
-    -- remaining candidateParts
-    local remaining = {}
-    for i = toReserve + 1, #candidateParts do remaining[#remaining+1] = candidateParts[i] end
-    candidateParts = remaining
-    total = #candidateParts
-
-    if total == 0 then
-        local orbitRad = math.clamp(tornadoWindfield * 0.3, 8, tornadoWindfield * 0.7)
-        for i = 1, count do
-            local angle = (2 * math.pi * (i - 1) / count) + (math.random() * 0.2 - 0.1)
-            local pos = tornadoPosition + Vector3.new(math.cos(angle) * orbitRad, 10 + math.random()*6, math.sin(angle) * orbitRad)
-            spawnSatelliteWithParts(pos, {})
-        end
-        return
-    end
-
-    local basePer = math.floor(total / count)
-    local remainder = total - (basePer * count)
+    local remainingParts = {}
+    for i = mainReserve + 1, #candidateParts do remainingParts[#remainingParts+1] = candidateParts[i] end
+    local totalRem = #remainingParts
 
     local partitions = {}
-    local idx = 1
-    for i = 1, count do
-        local take = basePer
-        if remainder > 0 then take = take + 1; remainder = remainder - 1 end
-        partitions[i] = {}
-        for j = 1, take do
-            if candidateParts[idx] then
-                local p = candidateParts[idx]
-                assignedToSatellite[p] = true
-                whitelistedParts[p] = nil
-                pickedUpByFunnel[p] = nil
-                table.insert(partitions[i], p)
-                idx = idx + 1
+    for i = 1, count do partitions[i] = {} end
+
+    if totalRem > 0 then
+        local basePer = math.floor(totalRem / count)
+        if basePer == 0 then basePer = 1 end
+        local remainder = totalRem - (basePer * count)
+        local idx = 1
+        for i = 1, count do
+            local take = math.min(basePer, maxPartsPerSatellite)
+            if remainder > 0 and take < maxPartsPerSatellite then
+                take = take + 1
+                remainder = remainder - 1
             end
+            for j = 1, take do
+                if remainingParts[idx] then
+                    local p = remainingParts[idx]
+                    assignedToSatellite[p] = true
+                    whitelistedParts[p] = nil
+                    pickedUpByFunnel[p] = nil
+                    table.insert(partitions[i], p)
+                    idx = idx + 1
+                end
+            end
+        end
+        while idx <= #remainingParts do
+            local p = remainingParts[idx]
+            if p then
+                mainFunnelParts[#mainFunnelParts+1] = p
+                mainFunnelSet[p] = true
+                assignedToSatellite[p] = nil
+            end
+            idx = idx + 1
         end
     end
 
@@ -1139,16 +1130,15 @@ function formSatellitesInstant()
     for i = 1, count do
         local angle = (2 * math.pi * (i - 1) / count) + (math.random() * 0.2 - 0.1)
         local pos = tornadoPosition + Vector3.new(math.cos(angle) * orbitRad, 10 + math.random()*6, math.sin(angle) * orbitRad)
-        spawnSatelliteWithParts(pos, partitions[i])
+        spawnSatelliteWithParts(pos, partitions[i] or {})
     end
 
-    -- ensure mainFunnelParts reserved
     for _, p in ipairs(mainFunnelParts) do
         if p then mainFunnelSet[p] = true; whitelistedParts[p] = nil; assignedToSatellite[p] = nil; pickedUpByFunnel[p] = nil end
     end
 end
 
--- ========== Workspace scanning & DescendantAdded ==========
+-- ========== Workspace scanning & periodic tasks ==========
 Workspace.DescendantAdded:Connect(function(desc)
     if desc and desc:IsA("BasePart") then
         task.defer(function()
@@ -1159,7 +1149,7 @@ Workspace.DescendantAdded:Connect(function(desc)
     end
 end)
 
--- periodic scan to keep funnel stocked
+-- periodic scan to keep funnel stocked and spawn main noodles
 spawn(function()
     while true do
         if enabled and tornadoPosition then
@@ -1167,17 +1157,94 @@ spawn(function()
             for _, p in ipairs(parts) do
                 if p and p:IsA("BasePart") and not p.Anchored then processPartForFunnel(p) end
             end
+
             reserveMainFunnelParts()
+
+            -- spawn main noodles if conditions met
+            if mainNoodleEnabled and (tick() - lastMainNoodleTick) >= mainNoodleSpawnCooldown then
+                lastMainNoodleTick = tick()
+                -- spawn a main noodle targeted at nearest player inside tornado (if any)
+                local bestPlr, bestDist = nil, math.huge
+                for _, pl in ipairs(Players:GetPlayers()) do
+                    if pl ~= localPlayer and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+                        local d = (pl.Character.HumanoidRootPart.Position - tornadoPosition).Magnitude
+                        if d <= tornadoWindfield and d < bestDist then
+                            bestDist = d
+                            bestPlr = pl
+                        end
+                    end
+                end
+                if bestPlr and #mainFunnelParts >= mainNoodleMinParts then
+                    -- number of parts depends on count of mainFunnelParts
+                    local num = math.max(verticalChainMinParts, math.floor(#mainFunnelParts * 0.2))
+                    -- attackable only if player inside inner 1/3 radius
+                    local attackable = (bestDist <= (tornadoWindfield / 3))
+                    -- main noodles shouldn't attack if Friendly and not inner region
+                    spawnMainNoodleChain(bestPlr, num, attackable)
+                end
+            end
         end
         task.wait(1)
     end
 end)
+
+-- ========== Main vertical chains update (same logic as satellites) ==========
+local function updateMainVerticalChains(delta)
+    if not tornadoPosition then return end
+    for ci = #mainVerticalChains, 1, -1 do
+        local chain = mainVerticalChains[ci]
+        if not chain or not chain.target or not chain.target.Character then
+            table.remove(mainVerticalChains, ci)
+        else
+            chain.progress = math.min(1.5, chain.progress + chain.speed * delta)
+            local targetHRP = chain.target.Character:FindFirstChild("HumanoidRootPart")
+            if targetHRP then
+                for idx, part in ipairs(chain.parts) do
+                    if part and part.Parent and not part.Anchored then
+                        local segT = math.clamp(chain.progress - ((idx - 1) * chain.segmentDelay), 0, 1)
+                        local basePos = tornadoPosition + Vector3.new(0, 10, 0)
+                        local goalPos = basePos:Lerp(targetHRP.Position + Vector3.new(0, 6, 0), segT)
+                        local toTarget = (targetHRP.Position - basePos)
+                        local horiz = Vector3.new(toTarget.X, 0, toTarget.Z)
+                        local perp = (horiz.Magnitude > 0.1) and Vector3.new(-horiz.Z, 0, horiz.X).Unit or Vector3.new(1,0,0)
+                        local wiggle = perp * math.sin((segT * chain.frequency) + idx) * (chain.amplitude * (1 - segT))
+                        local finalPos = goalPos + wiggle + Vector3.new(0, segT * 6, 0)
+                        local vel = (finalPos - part.Position) / math.max(delta, 0.016)
+                        local maxVel = math.max(orbitVelocityMinCap, chain.speed * 100)
+                        if vel.Magnitude > maxVel then vel = vel.Unit * maxVel end
+                        part.AssemblyLinearVelocity = Vector3.new(vel.X, math.clamp(vel.Y, -140, 140), vel.Z)
+                        part.CanCollide = false
+
+                        local distToHRP = (part.Position - targetHRP.Position).Magnitude
+                        if distToHRP <= verticalAttachDistance then
+                            chain.parts[idx] = nil
+                            startNoodleFlingAtPlayer(chain.target, chain.ownerSatellite, chain.attackable)
+                        end
+                    else
+                        chain.parts[idx] = nil
+                    end
+                end
+
+                local newParts = {}
+                for _, p in ipairs(chain.parts) do if p then table.insert(newParts, p) end end
+                chain.parts = newParts
+
+                if #chain.parts == 0 or chain.progress >= 1.4 then
+                    table.remove(mainVerticalChains, ci)
+                end
+            else
+                table.remove(mainVerticalChains, ci)
+            end
+        end
+    end
+end
 
 -- ========== Heartbeat & loops ==========
 RunService.Heartbeat:Connect(function(delta)
     if enabled then
         updateSatellites(delta)
         updateMainFunnel(delta)
+        updateMainVerticalChains(delta)
     end
 end)
 
@@ -1218,6 +1285,7 @@ toggleBtn.MouseButton1Click:Connect(function()
         noodlePartSet = {}
         mainFunnelParts = {}
         mainFunnelSet = {}
+        mainVerticalChains = {}
 
         spawn(tornadoLoop)
         task.wait(0.05)
@@ -1264,6 +1332,7 @@ toggleBtn.MouseButton1Click:Connect(function()
         noodlePartSet = {}
         mainFunnelParts = {}
         mainFunnelSet = {}
+        mainVerticalChains = {}
     end
 end)
 
