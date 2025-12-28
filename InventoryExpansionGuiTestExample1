@@ -1,0 +1,503 @@
+-- Inventory Expansion GUI (fixed init + immediate enable)
+-- Put this LocalScript in StarterPlayer > StarterPlayerScripts
+-- Pure client-side; does not require RemoteEvents / ServerScripts
+
+local Players = game:GetService("Players")
+local StarterGui = game:GetService("StarterGui")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+	Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+	LocalPlayer = Players.LocalPlayer
+end
+
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ensure core backpack hidden on start
+pcall(function()
+	StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+end)
+
+-- State
+local state = {
+	mode = "shrink", -- "shrink" | "scroll" | "regular"
+	savedLoadout = {},
+	hotbarMax = math.huge,
+	hotbarHidden = false,
+	useCore = false,
+	slots = {}, -- tool -> slot frame
+	dropButton = nil,
+}
+
+-- UI constants
+local GUI_Z = 9999
+local HOTBAR_HEIGHT = 64
+local SLOT_W = 64
+local ICON_PLACEHOLDER = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+
+-- Build top-level ScreenGui (ResetOnSpawn = false)
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "InventoryExpansionGui"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.DisplayOrder = GUI_Z
+screenGui.Parent = PlayerGui
+screenGui.Enabled = true -- <--- IMPORTANT: enable immediately on script run
+
+-- Top buttons (backpack circle + options gear)
+local topFrame = Instance.new("Frame", screenGui)
+topFrame.Size = UDim2.new(0,220,0,56)
+topFrame.Position = UDim2.new(0,12,0,12)
+topFrame.BackgroundTransparency = 1
+
+local function makeCircle(parent, posX, labelOrImage)
+	local btn = Instance.new("ImageButton", parent)
+	btn.Size = UDim2.new(0,48,0,48)
+	btn.Position = UDim2.new(0,posX,0,0)
+	btn.BackgroundColor3 = Color3.fromRGB(25,25,25)
+	btn.BackgroundTransparency = 0.15
+	btn.AutoButtonColor = true
+	btn.BorderSizePixel = 0
+	btn.Name = "Btn"
+	btn.ClipsDescendants = true
+	local uic = Instance.new("UICorner", btn); uic.CornerRadius = UDim.new(1,0)
+	local txt = Instance.new("TextLabel", btn)
+	txt.Size = UDim2.new(1,1,1,1)
+	txt.BackgroundTransparency = 1
+	txt.TextScaled = true
+	txt.Font = Enum.Font.SourceSansBold
+	txt.TextColor3 = Color3.new(1,1,1)
+	if type(labelOrImage) == "string" and labelOrImage:match("^rbxasset") then
+		local img = Instance.new("ImageLabel", btn)
+		img.Size = UDim2.new(0.7,0,0.7,0)
+		img.Position = UDim2.new(0.15,0,0.15,0)
+		img.BackgroundTransparency = 1
+		img.Image = labelOrImage
+		img.ScaleType = Enum.ScaleType.Fit
+		txt.Text = ""
+	else
+		txt.Text = labelOrImage or ""
+	end
+	return btn
+end
+
+local backpackBtn = makeCircle(topFrame, 0, "🧰")
+local optionsBtn   = makeCircle(topFrame, 62, "⚙")
+
+-- Options pane (hidden by default)
+local optionsPane = Instance.new("Frame", screenGui)
+optionsPane.Size = UDim2.new(0,320,0,360)
+optionsPane.Position = UDim2.new(0,12,0,12+56+8)
+optionsPane.BackgroundColor3 = Color3.fromRGB(20,20,20)
+optionsPane.BorderSizePixel = 0
+optionsPane.Visible = false
+Instance.new("UICorner", optionsPane)
+local title = Instance.new("TextLabel", optionsPane)
+title.Size = UDim2.new(1,-12,0,28); title.Position = UDim2.new(0,6,0,6)
+title.BackgroundTransparency = 1; title.Text = "Inventory Expansion - Options"
+title.TextXAlignment = Enum.TextXAlignment.Left; title.TextScaled = true
+local optsScroll = Instance.new("ScrollingFrame", optionsPane)
+optsScroll.Size = UDim2.new(1,-12,1,-42); optsScroll.Position = UDim2.new(0,6,0,36)
+optsScroll.BackgroundTransparency = 1; optsScroll.ScrollBarThickness = 6
+local list = Instance.new("UIListLayout", optsScroll); list.Padding = UDim.new(0,8)
+local function addRow(text, isToggle, default)
+	local row = Instance.new("Frame", optsScroll)
+	row.Size = UDim2.new(1,0,0,44); row.BackgroundTransparency = 1
+	local lbl = Instance.new("TextLabel", row)
+	lbl.Size = UDim2.new(0.68,0,1,0); lbl.Position = UDim2.new(0,8,0,0)
+	lbl.BackgroundTransparency = 1; lbl.Text = text; lbl.TextScaled = true; lbl.TextXAlignment = Enum.TextXAlignment.Left
+	local ctrl = Instance.new("TextButton", row)
+	ctrl.Size = UDim2.new(0.28,-8,0.7,0); ctrl.Position = UDim2.new(0.72,4,0.15,0)
+	ctrl.TextScaled = true; ctrl.Font = Enum.Font.SourceSansSemibold; ctrl.BackgroundTransparency = 0.6
+	ctrl.Text = (isToggle and (default and "ON" or "OFF")) or "Run"
+	return row, ctrl
+end
+
+local r_shrink, c_shrink = addRow("1: Shrink hotbar (endless)", true, true)
+local r_scroll, c_scroll = addRow("2: Sideways scrolling hotbar", true, false)
+local r_regular,c_regular= addRow("3: Regular system", true, false)
+local r_save,c_save     = addRow("4: Save loadout (press to save)", false, false)
+local r_bp,c_bp         = addRow("5: Backpack logo opens backpack", true, true)
+local r_max8,c_max8     = addRow("6: Force 8-slot hotbar", true, false)
+local r_hide,c_hide     = addRow("7: Toggle hide hotbar", true, false)
+local r_core,c_core     = addRow("8: Toggle core inventory", true, false)
+local r_imgs,c_imgs     = addRow("9: Use tool images & name", true, true)
+local r_resp,c_resp     = addRow("10: Reload on respawn", true, true)
+local r_drop,c_drop     = addRow("11: Show Drop Tool button", true, true)
+local r_drag,c_drag     = addRow("12: Allow dragging slots", true, true)
+
+-- Hotbar container (lower center)
+local hotbarContainer = Instance.new("Frame", screenGui)
+hotbarContainer.AnchorPoint = Vector2.new(0.5,1)
+hotbarContainer.Position = UDim2.new(0.5,0,1,-16)
+hotbarContainer.Size = UDim2.new(0,600,0,HOTBAR_HEIGHT)
+hotbarContainer.BackgroundTransparency = 1
+local hotbarHolder = Instance.new("Frame", hotbarContainer)
+hotbarHolder.Size = UDim2.new(1,0,1,0); hotbarHolder.Position = UDim2.new(0,0,0,0); hotbarHolder.BackgroundTransparency = 1
+local hotbarLayout = Instance.new("UIListLayout", hotbarHolder); hotbarLayout.FillDirection=Enum.FillDirection.Horizontal; hotbarLayout.Padding=UDim.new(0,4)
+
+-- Backpack popup
+local bpPopup = Instance.new("Frame", screenGui)
+bpPopup.Size = UDim2.new(0,420,0,380); bpPopup.Position = UDim2.new(0,12,0,12+56+8)
+bpPopup.BackgroundColor3 = Color3.fromRGB(25,25,25); bpPopup.BorderSizePixel = 0; bpPopup.Visible = false
+Instance.new("UICorner", bpPopup)
+local bpHeader = Instance.new("Frame", bpPopup); bpHeader.Size = UDim2.new(1,0,0,40); bpHeader.BackgroundTransparency = 1
+local bpTitle = Instance.new("TextLabel", bpHeader); bpTitle.Size = UDim2.new(0.7,-8,1,0); bpTitle.Position = UDim2.new(0,8,0,0)
+bpTitle.BackgroundTransparency = 1; bpTitle.Text = "Backpack"; bpTitle.TextScaled = true; bpTitle.TextXAlignment = Enum.TextXAlignment.Left
+local searchBox = Instance.new("TextBox", bpHeader); searchBox.Size = UDim2.new(0.3,-12,0.7,0); searchBox.Position=UDim2.new(0.7,8,0.15,0)
+searchBox.PlaceholderText = "Search..."; searchBox.TextScaled = true; searchBox.BackgroundTransparency = 0.6
+local bpScroll = Instance.new("ScrollingFrame", bpPopup); bpScroll.Size = UDim2.new(1,-12,1,-52); bpScroll.Position=UDim2.new(0,6,0,44)
+bpScroll.BackgroundTransparency = 1; bpScroll.ScrollBarThickness = 6
+local bpList = Instance.new("UIListLayout", bpScroll); bpList.Padding = UDim.new(0,6)
+local bpPad = Instance.new("UIPadding", bpScroll); bpPad.PaddingLeft = UDim.new(0,6); bpPad.PaddingRight = UDim.new(0,6)
+
+-- Helpers: slot creation
+local function makeSlotFrame(tool)
+	local slot = Instance.new("Frame")
+	slot.Size = UDim2.new(0,SLOT_W,1,0)
+	slot.BackgroundColor3 = Color3.fromRGB(40,40,40)
+	slot.BorderSizePixel = 0
+	local uic = Instance.new("UICorner", slot); uic.CornerRadius = UDim.new(0,6)
+	local img = Instance.new("ImageLabel", slot)
+	img.Name = "Icon"; img.Size = UDim2.new(1,-8,1,-24); img.Position=UDim2.new(0,4,0,4)
+	img.BackgroundTransparency = 1; img.ScaleType = Enum.ScaleType.Fit; img.Image = ICON_PLACEHOLDER
+	local lbl = Instance.new("TextLabel", slot)
+	lbl.Name="Name"; lbl.Size=UDim2.new(1,-8,0,18); lbl.Position=UDim2.new(0,4,1,-22)
+	lbl.BackgroundTransparency = 1; lbl.TextScaled = true; lbl.TextColor3 = Color3.new(1,1,1)
+	if tool then lbl.Text = tool.Name end
+	return slot, img, lbl
+end
+
+-- Utility: get all tools (backpack + character)
+local function getAllTools()
+	local out = {}
+	if LocalPlayer.Backpack then
+		for _,v in ipairs(LocalPlayer.Backpack:GetChildren()) do if v:IsA("Tool") then table.insert(out,v) end end
+	end
+	if LocalPlayer.Character then
+		for _,v in ipairs(LocalPlayer.Character:GetChildren()) do if v:IsA("Tool") then table.insert(out,v) end end
+	end
+	-- ensure unique by instance
+	local seen = {}
+	local uniq = {}
+	for _,t in ipairs(out) do if not seen[t] then table.insert(uniq,t); seen[t]=true end end
+	return uniq
+end
+
+-- Refresh hotbar UI
+local function clearHotbar()
+	for _,c in ipairs(hotbarHolder:GetChildren()) do
+		if not c:IsA("UIListLayout") then c:Destroy() end
+	end
+	state.slots = {}
+end
+
+local function refreshHotbarUI()
+	clearHotbar()
+	local tools = getAllTools()
+	-- apply savedLoadout ordering first
+	if #state.savedLoadout>0 then
+		table.sort(tools, function(a,b)
+			local ai,bi = 1e9,1e9
+			for i,name in ipairs(state.savedLoadout) do
+				if name==a.Name then ai=i end
+				if name==b.Name then bi=i end
+			end
+			if ai==bi then return a.Name < b.Name end
+			return ai < bi
+		end)
+	end
+
+	if state.mode == "scroll" then
+		local scroll = Instance.new("ScrollingFrame", hotbarHolder)
+		scroll.Name = "HotbarScroll"; scroll.Size = UDim2.new(1,0,1,0); scroll.BackgroundTransparency = 1
+		scroll.CanvasSize = UDim2.new(0,0,0,0); scroll.ScrollBarThickness = 6; scroll.HorizontalScrollBarInset = Enum.ScrollBarInset.Always
+		local list = Instance.new("UIListLayout", scroll); list.FillDirection = Enum.FillDirection.Horizontal; list.Padding = UDim.new(0,6)
+		local pad = Instance.new("UIPadding", scroll); pad.PaddingLeft = UDim.new(0,6); pad.PaddingRight = UDim.new(0,6)
+		for i,tool in ipairs(tools) do
+			local slot, img, lbl = makeSlotFrame(tool)
+			slot.LayoutOrder = i
+			slot.Parent = scroll
+			-- tool image (best effort)
+			local tex = tool.TextureId or (tool:FindFirstChild("Handle") and tool.Handle:FindFirstChildWhichIsA("Decal") and tool.Handle:FindFirstChildWhichIsA("Decal").Texture) or ""
+			img.Image = (tex~="" and tex) or ICON_PLACEHOLDER
+			lbl.Text = tool.Name
+			state.slots[tool] = slot
+		end
+		list:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+			scroll.CanvasSize = UDim2.new(0, list.AbsoluteContentSize.X + 12, 0, 0)
+		end)
+	else
+		-- shrink or regular: create frames in holder
+		for i,tool in ipairs(tools) do
+			-- respect hotbarMax (if enforced)
+			if i <= state.hotbarMax or state.hotbarMax == math.huge then
+				local slot, img, lbl = makeSlotFrame(tool)
+				slot.LayoutOrder = i
+				slot.Parent = hotbarHolder
+				state.slots[tool] = slot
+				local tex = tool.TextureId or ""
+				img.Image = (tex~="" and tex) or ICON_PLACEHOLDER
+				lbl.Text = tool.Name
+			end
+		end
+		-- if shrink mode, size slots evenly when we know holder width
+		if state.mode == "shrink" then
+			-- wait a jitter to ensure AbsoluteSize available
+			RunService.Heartbeat:Wait()
+			local children = {}
+			for _,c in ipairs(hotbarHolder:GetChildren()) do if c:IsA("Frame") then table.insert(children,c) end end
+			local n = #children
+			if n > 0 then
+				local gap = hotbarLayout.Padding.Offset
+				local totalGap = math.max(0, (n-1)*gap)
+				local w = math.max(12, math.floor((hotbarHolder.AbsoluteSize.X - totalGap)/n))
+				for _,c in ipairs(children) do c.Size = UDim2.new(0,w,1,0) end
+			end
+		else
+			-- regular: fixed width
+			for _,c in ipairs(hotbarHolder:GetChildren()) do if c:IsA("Frame") then c.Size = UDim2.new(0,SLOT_W,1,0) end end
+		end
+	end
+
+	-- hook click to equip/unequip, basic drag if enabled
+	for tool,slot in pairs(state.slots) do
+		slot.InputBegan:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+				-- equip from backpack -> character or vice versa (client-side attempt)
+				if tool.Parent == LocalPlayer.Backpack then
+					pcall(function() tool.Parent = LocalPlayer.Character end)
+					local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildWhichIsA("Humanoid")
+					if hum then pcall(function() hum:EquipTool(tool) end) end
+				elseif tool.Parent == LocalPlayer.Character then
+					-- already equipped
+				else
+					-- move to backpack then equip
+					pcall(function() tool.Parent = LocalPlayer.Backpack end)
+				end
+				-- do not reorder on equip (per spec)
+			end
+		end)
+		-- basic drag to reorder (client-only visual reordering by LayoutOrder)
+		if c_drag and c_drag.Text == "ON" then
+			local dragging, startX
+			slot.InputBegan:Connect(function(inp)
+				if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+					dragging = true
+					startX = UserInputService:GetMouseLocation().X
+					slot.BackgroundTransparency = 0.3
+				end
+			end)
+			slot.InputEnded:Connect(function(inp)
+				if inp.UserInputType == Enum.UserInputType.MouseButton1 and dragging then
+					dragging = false
+					slot.BackgroundTransparency = 0
+					-- compute new index by center comparison
+					local centers = {}
+					for _,ch in ipairs(hotbarHolder:GetChildren()) do
+						if ch:IsA("Frame") then
+							table.insert(centers, {frame=ch, x = ch.AbsolutePosition.X + ch.AbsoluteSize.X/2})
+						end
+					end
+					table.sort(centers, function(a,b) return a.x < b.x end)
+					local mx = UserInputService:GetMouseLocation().X
+					local idx = 1
+					for i,c in ipairs(centers) do if mx > c.x then idx = i+1 end end
+					local seq = {}
+					for _,c in ipairs(centers) do table.insert(seq, c.frame) end
+					-- remove our slot
+					for i,v in ipairs(seq) do if v==slot then table.remove(seq,i); break end end
+					table.insert(seq, math.max(1, math.min(#seq+1, idx)), slot)
+					for i,v in ipairs(seq) do v.LayoutOrder = i end
+				end
+			end)
+		end
+	end
+end
+
+-- Backpack popup update
+local function updateBackpackPopup()
+	for _,v in ipairs(bpScroll:GetChildren()) do if v:IsA("Frame") then v:Destroy() end end
+	local q = (searchBox.Text or ""):lower()
+	local all = getAllTools()
+	local hotSet = {}
+	for t,_ in pairs(state.slots) do hotSet[t] = true end
+	local idx = 1
+	for _,tool in ipairs(all) do
+		if not hotSet[tool] then
+			if q == "" or tool.Name:lower():find(q,1,true) then
+				local slot = Instance.new("Frame"); slot.Size=UDim2.new(1,0,0,48); slot.BackgroundColor3=Color3.fromRGB(40,40,40); slot.BorderSizePixel=0
+				local uic=Instance.new("UICorner", slot)
+				local img = Instance.new("ImageLabel", slot); img.Size=UDim2.new(0,40,1,-8); img.Position=UDim2.new(0,4,0,4); img.BackgroundTransparency=1
+				img.Image = tool.TextureId ~= "" and tool.TextureId or ICON_PLACEHOLDER
+				local lbl = Instance.new("TextLabel", slot); lbl.Position=UDim2.new(0,52,0,0); lbl.Size=UDim2.new(0.6,0,1,0)
+				lbl.BackgroundTransparency=1; lbl.TextScaled=true; lbl.Text = tool.Name
+				slot.Parent = bpScroll; slot.LayoutOrder = idx
+				slot.InputBegan:Connect(function(inp)
+					if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+						-- move to character (try equip)
+						pcall(function() tool.Parent = LocalPlayer.Character end)
+						task.delay(0.05, refreshHotbarUI)
+					end
+				end)
+				idx = idx + 1
+			end
+		end
+	end
+	-- update CanvasSize
+	local total=0
+	for _,c in ipairs(bpScroll:GetChildren()) do if c:IsA("Frame") then total = total + c.AbsoluteSize.Y + bpList.Padding.Offset end end
+	bpScroll.CanvasSize = UDim2.new(0,0,0, math.max(0,total+12))
+end
+
+-- Drop button create
+local function createDropButton()
+	if state.dropButton and state.dropButton.Parent then state.dropButton:Destroy() end
+	local btn = Instance.new("TextButton", screenGui)
+	btn.Size = UDim2.new(0,100,0,34); btn.Position = UDim2.new(0,12,0,12+56+8+380+8)
+	btn.BackgroundTransparency = 0.6; btn.Text = "Drop tool"; btn.TextScaled = true; btn.Visible = false
+	state.dropButton = btn
+	btn.Activated:Connect(function()
+		local char = LocalPlayer.Character
+		if not char then return end
+		local tool = nil
+		for _,c in ipairs(char:GetChildren()) do if c:IsA("Tool") then tool = c; break end end
+		if tool then
+			-- client-side drop attempt
+			pcall(function() tool.Parent = workspace end)
+			pcall(function() char:FindFirstChildWhichIsA("Humanoid"):UnequipTools() end)
+			task.delay(0.05, refreshHotbarUI)
+		end
+	end)
+end
+
+-- Save loadout
+local function saveLoadout()
+	local arr = {}
+	local kids = {}
+	for _,c in ipairs(hotbarHolder:GetChildren()) do if c:IsA("Frame") then table.insert(kids,c) end end
+	table.sort(kids, function(a,b) return a.LayoutOrder < b.LayoutOrder end)
+	for _,slot in ipairs(kids) do
+		local name = slot.Name
+		-- our slot frames were unnamed; we set Name label text -> fallback: get label
+		local lbl = slot:FindFirstChild("Name")
+		if lbl and lbl.Text ~= "" then table.insert(arr, lbl.Text) end
+	end
+	state.savedLoadout = arr
+	warn("Saved loadout:", table.concat(arr, ","))
+end
+
+-- Wiring option controls and events
+local function wireOptions()
+	local function toggleBtn(btn)
+		btn.Text = (btn.Text == "ON") and "OFF" or "ON"
+	end
+	c_shrink.Activated:Connect(function()
+		state.mode = "shrink"; c_shrink.Text="ON"; c_scroll.Text="OFF"; c_regular.Text="OFF"; refreshHotbarUI()
+	end)
+	c_scroll.Activated:Connect(function()
+		state.mode = "scroll"; c_shrink.Text="OFF"; c_scroll.Text="ON"; c_regular.Text="OFF"; refreshHotbarUI()
+	end)
+	c_regular.Activated:Connect(function()
+		state.mode = "regular"; c_shrink.Text="OFF"; c_scroll.Text="OFF"; c_regular.Text="ON"; refreshHotbarUI()
+	end)
+	c_save.Activated:Connect(saveLoadout)
+	c_bp.Activated:Connect(function()
+		toggleBtn(c_bp)
+		bpPopup.Visible = (c_bp.Text == "ON")
+		if bpPopup.Visible then updateBackpackPopup() end
+	end)
+	c_max8.Activated:Connect(function()
+		toggleBtn(c_max8)
+		if c_max8.Text == "ON" then state.hotbarMax = 8 else state.hotbarMax = math.huge end
+		refreshHotbarUI()
+	end)
+	c_hide.Activated:Connect(function()
+		toggleBtn(c_hide)
+		state.hotbarHidden = (c_hide.Text == "ON")
+		hotbarContainer.Visible = not state.hotbarHidden
+	end)
+	c_core.Activated:Connect(function()
+		toggleBtn(c_core)
+		state.useCore = (c_core.Text == "ON")
+		if state.useCore then
+			pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true) end)
+			screenGui.Enabled = false
+		else
+			pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false) end)
+			screenGui.Enabled = true
+		end
+	end)
+	c_imgs.Activated:Connect(function() toggleBtn(c_imgs) refreshHotbarUI() end)
+	c_resp.Activated:Connect(function() toggleBtn(c_resp) end)
+	c_drop.Activated:Connect(function()
+		toggleBtn(c_drop)
+		if c_drop.Text == "ON" then createDropButton() end
+		if state.dropButton then state.dropButton.Visible = (c_drop.Text == "ON") end
+	end)
+	c_drag.Activated:Connect(function() toggleBtn(c_drag) refreshHotbarUI() end)
+end
+
+-- Open/close options and backpack buttons
+optionsBtn.Activated:Connect(function() optionsPane.Visible = not optionsPane.Visible end)
+backpackBtn.Activated:Connect(function()
+	bpPopup.Visible = not bpPopup.Visible
+	if bpPopup.Visible then updateBackpackPopup() end
+end)
+searchBox:GetPropertyChangedSignal("Text"):Connect(updateBackpackPopup)
+
+-- Listeners for backpack & character changes
+local function connectListeners()
+	-- Backpack changes
+	if LocalPlayer.Backpack then
+		LocalPlayer.Backpack.ChildAdded:Connect(function() refreshHotbarUI(); updateBackpackPopup() end)
+		LocalPlayer.Backpack.ChildRemoved:Connect(function() refreshHotbarUI(); updateBackpackPopup() end)
+	end
+	-- Character respawn and tool equip tracking
+	LocalPlayer.CharacterAdded:Connect(function(char)
+		-- small wait then refresh
+		task.wait(0.12)
+		if c_resp.Text ~= "OFF" then refreshHotbarUI(); updateBackpackPopup() end
+		-- watch equipped tools
+		char.ChildAdded:Connect(function(ch)
+			if ch:IsA("Tool") then
+				-- show drop if enabled
+				if c_drop.Text == "ON" and state.dropButton then state.dropButton.Visible = true end
+			end
+		end)
+		char.ChildRemoved:Connect(function(ch)
+			if ch:IsA("Tool") then
+				-- hide drop button if none equipped
+				local any=false
+				for _,v in ipairs(char:GetChildren()) do if v:IsA("Tool") then any=true; break end end
+				if state.dropButton then state.dropButton.Visible = any end
+				refreshHotbarUI(); updateBackpackPopup()
+			end
+		end)
+	end)
+end
+
+-- initial setup / immediate enable (the core of the fix)
+screenGui.Enabled = true
+pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false) end)
+
+-- build initial UI state & listeners
+wireOptions()
+refreshHotbarUI()
+updateBackpackPopup()
+createDropButton()
+state.dropButton.Visible = false
+connectListeners()
+
+-- responsiveness: recompute shrink widths on resize
+hotbarHolder:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+	if state.mode == "shrink" then refreshHotbarUI() end
+end)
+
+-- expose basic debug functions on player (optional)
+LocalPlayer:SetAttribute("InventoryExpansionReady", true)
+
+print("Inventory Expansion GUI initialized and enabled (immediate).")
+
