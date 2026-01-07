@@ -1,12 +1,9 @@
--- Full updated script (client) - Updated per user requests
--- Highlights:
---  * Auto set Workspace.FallenPartsDestroyHeight = NaN
---  * Telekinesis fix + playerlist loadstrings auto-fired at GUI launch
---  * "Goodbye." button: spawns BH clusters, attaches parts (capped) to BHs, BHs destroyed then 0.4s later parts are velocity-applied (1500) and collisions disabled
---  * "nuclear bomb." button: pressing it starts gathering immediately; the red round "kim ung yong" button on the overlay triggers the explosion; overlay is destroyed instantly upon detonation
---  * Nuke: gather attached parts to central BH, set Workspace.Gravity = 0 while gathered, on detonation destroy BH, wait 0.4s, then apply perfectly distributed sphere velocities (1500) and disable collisions. Gravity restored to original Workspace.Gravity 3s after detonation has fired
---  * Caps added to avoid mass-lag crashes during Goodbye (configurable)
---  * Skidding for target all & selected preserved
+-- Full updated script (client) - fixes applied
+-- Summary of fixes:
+--  * Nuke gathering actually centers on and follows local player's HRP while gathering
+--  * Goodbye no longer targets the local player (only other players in radius)
+--  * Pentagons now shrink over 10 seconds before colliding; BH destroyed then parts flung after 0.4s
+--  * Gravity restore, caps, and nuke GUI/detonation behavior preserved
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -119,8 +116,9 @@ local nukeHeldParts = {}        -- list of parts currently held for nuke
 local nukeCenterFolder = nil
 local nukeCenterPart = nil
 local nukeCenterAttachment = nil
+local nukeCenterFollowConn = nil
 local nukeOverlayGui = nil
-local nukeMaxParts = 400        -- cap to avoid lag; adjust downward if you still have crashes
+local nukeMaxParts = 400        -- cap to avoid lag; adjust downward if necessary
 
 -- Goodbye caps to prevent mass-lag
 local goodbyeMaxParts = 200     -- total pieces / clones attached across BHs; adjust as needed
@@ -281,9 +279,7 @@ local function ensurePersistentWatch(part)
     if persistentConns[part] then return end
     local conn
     conn = part.AncestryChanged:Connect(function()
-        -- if part exists and is not currently processed (maybe removed), reapply ForcePart
         if part and part.Parent then
-            -- reapply massless + ForcePart if needed
             pcall(function() part.Massless = true end)
             ForcePart(part)
         end
@@ -305,7 +301,7 @@ function ForcePart(v)
             or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
         ) then
 
-        -- IMPORTANT: Only pick up parts that are closer to local player than any other player
+        -- Only pick up parts that are closer to local player than any other player
         local okToPick = false
         local lpHRP = (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")) and localPlayer.Character.HumanoidRootPart
         if lpHRP then
@@ -316,7 +312,6 @@ function ForcePart(v)
                     local othChar = other.Character
                     if othChar and othChar:FindFirstChild("HumanoidRootPart") then
                         local otherDist = (v.Position - othChar.HumanoidRootPart.Position).Magnitude
-                        -- if any other player is strictly closer, skip this part
                         if otherDist < localDist then
                             okToPick = false
                             break
@@ -325,14 +320,12 @@ function ForcePart(v)
                 end
             end
         else
-            -- if local HRP not ready, avoid picking up
             okToPick = false
         end
 
         if not okToPick then return end
 
         if processedParts[v] then
-            -- already processed; ensure persistent tracking
             processedPartsPersistent[v] = true
             ensurePersistentWatch(v)
             return
@@ -387,7 +380,6 @@ function ForcePart(v)
 end
 
 local function clearProcessedParts()
-    -- Disconnect persistent connections
     for part, conn in pairs(persistentConns) do
         pcall(function() conn:Disconnect() end)
     end
@@ -433,7 +425,6 @@ local function anchorAndDelayedUnanchorParts()
                 or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
             ) then
 
-            -- distance check: only pick if closer to local player than any other player
             local lpHRP = (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")) and localPlayer.Character.HumanoidRootPart
             local okToConsider = false
             if lpHRP then
@@ -522,7 +513,6 @@ local function processWorkspaceParts()
                     and not isPartPlayerCharacter(v)
                     and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character)) then
 
-                    -- distance check for newly added parts
                     local lpHRP = (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")) and localPlayer.Character.HumanoidRootPart
                     local okToConsider = false
                     if lpHRP then
@@ -591,7 +581,7 @@ local function setBlackHoleActiveState(bh, active)
     end
 end
 
--- create extra BH helper
+-- create extra BH helper (unchanged)
 local function createExtraBlackHole(initialTarget, source)
     if initialTarget == localPlayer then initialTarget = nil end
     if initialTarget and isWhitelisted(initialTarget) and source ~= "CMD_ALLOW_WHITELISTED" then
@@ -1433,15 +1423,14 @@ window:Button("Reset Cycle", function()
     resetCycleNow()
 end)
 
--- GOODBYE: helper functions
--- uniform sphere distribution: golden spiral
+-- Helpers used by Goodbye/Nuke
 local function goldenSphereDirections(n)
     local out = {}
     if n <= 0 then return out end
     if n == 1 then return {Vector3.new(0,1,0)} end
     local phi = math.pi * (3 - math.sqrt(5)) -- golden angle
     for i = 0, n-1 do
-        local y = 1 - (i / (n - 1)) * 2 -- y goes from 1 to -1
+        local y = 1 - (i / (n - 1)) * 2
         local radius = math.sqrt(math.max(0, 1 - y*y))
         local theta = phi * i
         local x = math.cos(theta) * radius
@@ -1453,7 +1442,6 @@ local function goldenSphereDirections(n)
     return out
 end
 
--- collect all unanchored non-character parts (optionally limited)
 local function collectUnanchoredParts(limit)
     limit = limit or math.huge
     local res = {}
@@ -1470,7 +1458,6 @@ local function collectUnanchoredParts(limit)
     return res
 end
 
--- SAFE split (lightweight): clones are same size but we cap clones to avoid explosion
 local function splitPartIntoPiecesSafe(part, pieces)
     pieces = pieces or 1
     local out = {}
@@ -1479,10 +1466,10 @@ local function splitPartIntoPiecesSafe(part, pieces)
         local parent = part.Parent
         local size = part.Size
         for i = 1, pieces do
-            if #out + 1 > 3 then break end -- don't create too many clones per single part
+            if #out + 1 > 3 then break end
             local c = part:Clone()
             c.Name = part.Name .. "_split_" .. tostring(i)
-            c.Size = size -- keep same size to avoid many tiny pieces
+            c.Size = size
             c.CFrame = part.CFrame * CFrame.new(math.random(-2,2), math.random(-2,2), math.random(-2,2))
             c.Anchored = false
             c.Parent = parent
@@ -1494,7 +1481,7 @@ local function splitPartIntoPiecesSafe(part, pieces)
     return out
 end
 
--- GOODBYE per-player spawner
+-- GOODBYE per-player spawner with shrink over 10 seconds
 local function spawnGoodbyeForPlayer(targetPlayer)
     if not targetPlayer or not targetPlayer.Character or not targetPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
     local hrp = targetPlayer.Character.HumanoidRootPart
@@ -1506,6 +1493,7 @@ local function spawnGoodbyeForPlayer(targetPlayer)
     local BHs = {}
     local pentagonRadius = 30
     local pentagonCount = 5
+    local shrinkDuration = 10 -- seconds to shrink to zero
 
     -- Create pentagon BHs (orbiters)
     for i = 1, pentagonCount do
@@ -1527,7 +1515,8 @@ local function spawnGoodbyeForPlayer(targetPlayer)
             _running = true,
             _active = true,
             spinSpeed = 2, -- radians/sec, accelerates
-            source = "GOODBYE"
+            source = "GOODBYE",
+            initAngleOffset = angle
         }
         table.insert(BHs, bh)
     end
@@ -1547,16 +1536,13 @@ local function spawnGoodbyeForPlayer(targetPlayer)
     local bhDown = { Part = pDown, Attachment = attDown, AssignedParts = {}, TargetPlayer = targetPlayer, _running = true, _active = true, source = "GOODBYE" }
     table.insert(BHs, bhDown)
 
-    -- register BHs in master list (so rebalancer can see them if needed)
-    for _, bh in ipairs(BHs) do
-        table.insert(extraBlackHoles, bh)
-    end
+    -- register BHs
+    for _, bh in ipairs(BHs) do table.insert(extraBlackHoles, bh) end
 
-    -- attach _some_ unanchored parts to these BHs (capped)
+    -- attach limited unanchored parts to BHs (capped)
     spawn(function()
         if goodbyeMaxParts <= 0 then return end
         local available = collectUnanchoredParts(goodbyeMaxParts)
-        -- choose the parts nearest to targetPlayer HRP (to be deterministic and limited)
         table.sort(available, function(a,b)
             local da = (a.Position - centerPos).Magnitude
             local db = (b.Position - centerPos).Magnitude
@@ -1567,11 +1553,10 @@ local function spawnGoodbyeForPlayer(targetPlayer)
             if assignedCount >= goodbyeMaxParts then break end
             if not part or not part.Parent then continue end
             pcall(function()
-                -- split into up to 1-2 pieces (safe), avoid massive cloning
                 local pieces = splitPartIntoPiecesSafe(part, 1)
                 for _, pclone in ipairs(pieces) do
                     if pclone and pclone.Parent then
-                        -- choose nearest BH in BHs list
+                        -- choose nearest BH
                         local nearestBH = nil
                         local nd = math.huge
                         for _, bh in ipairs(BHs) do
@@ -1607,11 +1592,12 @@ local function spawnGoodbyeForPlayer(targetPlayer)
         end
     end)
 
-    -- BH motion threads: orbit + approach logic; on 'collision' destroy BH, then after 0.4s apply velocities to assigned parts
+    -- orbit + shrink coroutines
     for idx, bh in ipairs(BHs) do
         spawn(function()
             local t = 0
             local isPentagon = idx <= pentagonCount
+            local startTime = tick()
             while bh._running do
                 local dt = RunService.Heartbeat:Wait()
                 t = t + dt
@@ -1624,13 +1610,17 @@ local function spawnGoodbyeForPlayer(targetPlayer)
                 local targetPos = targetHRP.Position
 
                 if isPentagon then
-                    bh.spinSpeed = bh.spinSpeed + (dt * 0.8)
-                    local curPos = bh.Part.Position
-                    local distToHRP = (curPos - targetPos).Magnitude
-                    if distToHRP <= 1.6 then
-                        -- DESTROY BH immediately
+                    -- Shrink radius linearly over shrinkDuration seconds
+                    local elapsed = tick() - startTime
+                    local shrinkT = clamp(elapsed / shrinkDuration, 0, 1)
+                    local currentRadius = pentagonRadius * (1 - shrinkT) -- from pentagonRadius down to 0 over shrinkDuration
+                    -- accelerate spin slowly
+                    bh.spinSpeed = bh.spinSpeed + (dt * 0.6)
+                    -- If radius small enough (close to 0) we will move inward and trigger collision
+                    if currentRadius <= 1.5 then
+                        -- move to very near HRP and trigger collision behavior
                         bh._running = false
-                        -- remove BH visuals/part
+                        -- cleanup BH from master
                         pcall(function()
                             for i = #extraBlackHoles, 1, -1 do
                                 if extraBlackHoles[i] == bh then table.remove(extraBlackHoles, i); break end
@@ -1638,9 +1628,8 @@ local function spawnGoodbyeForPlayer(targetPlayer)
                         end)
                         local assignedParts = {}
                         for _, ppart in ipairs(bh.AssignedParts) do table.insert(assignedParts, ppart) end
-                        -- destroy BH part
                         pcall(function() if bh.Part and bh.Part.Parent then bh.Part:Destroy() end end)
-                        -- 0.4s after BH destruction: disable collisions and fling parts with velocity=1500
+                        -- after 0.4s, disable collisions and fling with velocity 1500 (uniform directions)
                         spawn(function()
                             wait(0.4)
                             local dirs = goldenSphereDirections(#assignedParts)
@@ -1661,10 +1650,10 @@ local function spawnGoodbyeForPlayer(targetPlayer)
                         end)
                         break
                     else
-                        -- normal orbit movement
-                        local angleOff = (2 * math.pi * (idx-1) / pentagonCount) + (t * bh.spinSpeed)
-                        local x = math.cos(angleOff) * pentagonRadius
-                        local z = math.sin(angleOff) * pentagonRadius
+                        -- orbiting at currentRadius
+                        local angleOff = bh.initAngleOffset + (t * bh.spinSpeed)
+                        local x = math.cos(angleOff) * currentRadius
+                        local z = math.sin(angleOff) * currentRadius
                         local desiredPos = targetPos + Vector3.new(x, 0, z)
                         pcall(function()
                             bh.Part.CFrame = CFrame.new(desiredPos)
@@ -1672,12 +1661,12 @@ local function spawnGoodbyeForPlayer(targetPlayer)
                         end)
                     end
                 else
-                    -- above/below close-in then act same (destroy BH then 0.4s later fling)
+                    -- above/below slowly close in on the player (unchanged)
                     local curPos = bh.Part.Position
                     local dir = (targetPos - curPos)
                     local dist = dir.Magnitude
                     if dist > 1 then
-                        local step = 6 * dt
+                        local step = 6 * dt -- slow close-in speed
                         local newPos = curPos + dir.Unit * math.min(step, dist)
                         pcall(function()
                             bh.Part.CFrame = CFrame.new(newPos)
@@ -1716,7 +1705,7 @@ local function spawnGoodbyeForPlayer(targetPlayer)
                 end
             end
 
-            -- cleanup
+            -- cleanup BH
             pcall(function()
                 if bh.Part and bh.Part.Parent then bh.Part:Destroy() end
                 for i = #extraBlackHoles, 1, -1 do
@@ -1727,30 +1716,25 @@ local function spawnGoodbyeForPlayer(targetPlayer)
     end
 end
 
+-- triggerGoodbye spawns BH clusters only for OTHER players in radius (NOT localplayer)
 local function triggerGoodbye()
     local blastRadius = 3500
     local playersToTarget = {}
-    -- target non-local players inside radius
     for _, pl in ipairs(Players:GetPlayers()) do
-        if pl and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+        if pl and pl ~= localPlayer and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
             local lpHRP = (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")) and localPlayer.Character.HumanoidRootPart
-            local basePos = lpHRP and lpHRP.Position or (localPlayer.Character and localPlayer.Character:GetModelCFrame().p or Vector3.new(0,0,0))
+            local basePos = lpHRP and lpHRP.Position or Vector3.new(0,0,0)
             local d = (pl.Character.HumanoidRootPart.Position - basePos).Magnitude
             if d <= blastRadius then table.insert(playersToTarget, pl) end
         end
     end
-    -- always include localplayer cluster (user wanted BHs for every player)
-    if localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
-        table.insert(playersToTarget, localPlayer)
-    end
 
-    -- spawn clusters (capped by goodbyeMaxParts via attachment logic)
     for _, pl in ipairs(playersToTarget) do
         spawnGoodbyeForPlayer(pl)
     end
 end
 
--- NUCLEAR BOMB: Gathering + Detonate split
+-- NUCLEAR BOMB: Gathering + Detonate
 local function createCentralNukeHolder()
     local folder = Workspace:FindFirstChild("ÆS_Nuke_Folder") or Instance.new("Folder", Workspace)
     folder.Name = "ÆS_Nuke_Folder"
@@ -1775,7 +1759,18 @@ local function startNukeGather()
     nukeCenterPart.CFrame = CFrame.new(centerPos)
     nukeCenterAttachment = Instance.new("Attachment", nukeCenterPart)
 
-    -- collect up to nukeMaxParts parts (capped to avoid massive lag)
+    -- follow local player's HRP while gathering
+    if nukeCenterFollowConn then
+        pcall(function() nukeCenterFollowConn:Disconnect() end)
+        nukeCenterFollowConn = nil
+    end
+    nukeCenterFollowConn = RunService.Heartbeat:Connect(function()
+        if nukeCenterPart and nukeCenterPart.Parent and localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            pcall(function() nukeCenterPart.CFrame = localPlayer.Character.HumanoidRootPart.CFrame end)
+        end
+    end)
+
+    -- collect up to nukeMaxParts parts (capped)
     local parts = collectUnanchoredParts(nukeMaxParts)
     for _, p in ipairs(parts) do
         if p and p.Parent then
@@ -1800,70 +1795,67 @@ local function startNukeGather()
         end
     end
 
-    -- set gravity to 0 immediately while gathering
+    -- set gravity to 0 while gathering (user wanted gravity 0 during gathering)
     pcall(function() Workspace.Gravity = 0 end)
 end
 
--- Detonate nuke: destroy BH (center), wait 0.4s, then apply velocities and disable collisions; restore gravity after 3s
+-- Detonate nuke: destroy central holder first, 0.4s later apply velocities, restore gravity after 3s
 local function detonateNukeAndLaunch()
     if not nukeGathering then return end
     nukeGathering = false
 
-    -- copy held list and clear state
+    -- copy held parts
     local held = {}
     for _, p in ipairs(nukeHeldParts) do table.insert(held, p) end
     nukeHeldParts = {}
 
-    -- destroy central BH attachments/part first
+    -- stop following
+    if nukeCenterFollowConn then
+        pcall(function() nukeCenterFollowConn:Disconnect() end)
+        nukeCenterFollowConn = nil
+    end
+
+    -- destroy central BH part/folder first
     pcall(function()
         if nukeCenterPart and nukeCenterPart.Parent then
-            -- destroy the part (the attachments will be destroyed with it)
             local folder = nukeCenterPart.Parent
             nukeCenterPart:Destroy()
-            -- we will destroy the folder too just to be clean
-            if folder and folder.Parent then
-                folder:Destroy()
-            end
+            if folder and folder.Parent then folder:Destroy() end
         end
         nukeCenterPart = nil
         nukeCenterAttachment = nil
-        nukeCenterFolder = nil
     end)
 
-    -- after 0.4 seconds, apply velocities (1500) and disable collisions
+    -- after 0.4s apply velocities and disable collisions
     spawn(function()
         wait(0.4)
         local n = #held
-        if n == 0 then
-            -- restore gravity 3s after detonation
-            spawn(function() wait(3); pcall(function() Workspace.Gravity = ORIGINAL_GRAVITY end) end)
-            if nukeOverlayGui and nukeOverlayGui.Parent then nukeOverlayGui:Destroy() end
-            return
-        end
-        local dirs = goldenSphereDirections(n)
-        for i, part in ipairs(held) do
-            if part and part.Parent then
-                pcall(function()
-                    local ap = part:FindFirstChildOfClass("AlignPosition")
-                    if ap then ap:Destroy() end
-                    local att = part:FindFirstChildOfClass("Attachment")
-                    if att then att:Destroy() end
-                    part.CanCollide = false
-                    pcall(function() part.Massless = false end)
-                    local dir = dirs[((i-1) % #dirs) + 1] or Vector3.new(0,1,0)
-                    part.Velocity = dir * 1500
-                end)
+        if n > 0 then
+            local dirs = goldenSphereDirections(n)
+            for i, part in ipairs(held) do
+                if part and part.Parent then
+                    pcall(function()
+                        local ap = part:FindFirstChildOfClass("AlignPosition")
+                        if ap then ap:Destroy() end
+                        local att = part:FindFirstChildOfClass("Attachment")
+                        if att then att:Destroy() end
+                        part.CanCollide = false
+                        pcall(function() part.Massless = false end)
+                        local dir = dirs[((i-1) % #dirs) + 1] or Vector3.new(0,1,0)
+                        part.Velocity = dir * 1500
+                    end)
+                end
             end
         end
 
-        -- gravity restore after 3 seconds from detonation
+        -- restore gravity 3s after detonation
         spawn(function()
             wait(3)
             pcall(function() Workspace.Gravity = ORIGINAL_GRAVITY end)
         end)
     end)
 
-    -- destroy overlay GUI immediately (the user requested the GUI to destroy itself instantly after detonation)
+    -- destroy overlay GUI immediately
     if nukeOverlayGui and nukeOverlayGui.Parent then
         pcall(function() nukeOverlayGui:Destroy() end)
         nukeOverlayGui = nil
@@ -1907,8 +1899,6 @@ local function spawnNukeOverlay()
     redBtn.ZIndex = 5
     redBtn.TextScaled = false
     redBtn.Parent = frame
-    -- make it look round-ish without relying on RobloxRoundButton style
-    redBtn.ClipsDescendants = true
     local uiCorner = Instance.new("UICorner", redBtn); uiCorner.CornerRadius = UDim.new(1,0)
 
     local label = Instance.new("TextLabel", frame)
@@ -1920,9 +1910,7 @@ local function spawnNukeOverlay()
     label.TextScaled = true
     label.TextColor3 = Color3.new(0,0,0)
 
-    -- Pressing redBtn detonates instantly
     redBtn.MouseButton1Click:Connect(function()
-        -- small click feedback
         spawn(function()
             for i=1,2 do
                 redBtn.Size = redBtn.Size + UDim2.new(0, 6, 0, 6)
@@ -1931,7 +1919,6 @@ local function spawnNukeOverlay()
                 wait(0.04)
             end
         end)
-        -- Detonate (destroy BHs & apply velocities after 0.4s) and destroy overlay immediately
         detonateNukeAndLaunch()
     end)
 end
