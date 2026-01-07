@@ -1,9 +1,11 @@
--- Full updated script (client) - fixes applied
--- Summary of fixes:
---  * Nuke gathering actually centers on and follows local player's HRP while gathering
---  * Goodbye no longer targets the local player (only other players in radius)
---  * Pentagons now shrink over 10 seconds before colliding; BH destroyed then parts flung after 0.4s
---  * Gravity restore, caps, and nuke GUI/detonation behavior preserved
+-- Full updated script (client) - nuke gravity + 15s restore + detonation velocity textbox
+-- Summary:
+-- * Gathering -> gravity set to 0 while gathering
+-- * On detonation: gravity is applied immediately (Workspace.Gravity = ORIGINAL_GRAVITY)
+-- * BH destroyed, wait 0.4s, then apply explosion velocity (user-adjustable via textbox) to gathered parts, collisions disabled
+-- * After 15 seconds, restore the pre-detonation velocities for those parts (if they still exist)
+-- * Textbox on the "kim ung yong" overlay for adjusting explosion velocity (default 1500)
+-- * Caps and anti-lag measures remain
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -119,6 +121,12 @@ local nukeCenterAttachment = nil
 local nukeCenterFollowConn = nil
 local nukeOverlayGui = nil
 local nukeMaxParts = 400        -- cap to avoid lag; adjust downward if necessary
+
+-- We'll track pre-detonation velocities for restoration later
+local nukeFiredPartsOriginalVelocity = {} -- part -> Vector3
+
+-- explosion velocity (user adjustable via textbox)
+local explosionVelocity = 1500
 
 -- Goodbye caps to prevent mass-lag
 local goodbyeMaxParts = 200     -- total pieces / clones attached across BHs; adjust as needed
@@ -581,7 +589,7 @@ local function setBlackHoleActiveState(bh, active)
     end
 end
 
--- create extra BH helper (unchanged)
+-- create extra BH helper
 local function createExtraBlackHole(initialTarget, source)
     if initialTarget == localPlayer then initialTarget = nil end
     if initialTarget and isWhitelisted(initialTarget) and source ~= "CMD_ALLOW_WHITELISTED" then
@@ -1753,6 +1761,7 @@ local function startNukeGather()
     if not localPlayer.Character or not localPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
     nukeGathering = true
     nukeHeldParts = {}
+    nukeFiredPartsOriginalVelocity = {}
 
     local centerPos = localPlayer.Character.HumanoidRootPart.Position
     nukeCenterFolder, nukeCenterPart = createCentralNukeHolder()
@@ -1799,7 +1808,7 @@ local function startNukeGather()
     pcall(function() Workspace.Gravity = 0 end)
 end
 
--- Detonate nuke: destroy central holder first, 0.4s later apply velocities, restore gravity after 3s
+-- Detonate nuke: destroy central holder first, set gravity back immediately, 0.4s later apply velocities and schedule 15s restore
 local function detonateNukeAndLaunch()
     if not nukeGathering then return end
     nukeGathering = false
@@ -1814,6 +1823,9 @@ local function detonateNukeAndLaunch()
         pcall(function() nukeCenterFollowConn:Disconnect() end)
         nukeCenterFollowConn = nil
     end
+
+    -- Immediately re-enable gravity (user requested gravity to apply once detonation is triggered)
+    pcall(function() Workspace.Gravity = ORIGINAL_GRAVITY end)
 
     -- destroy central BH part/folder first
     pcall(function()
@@ -1835,6 +1847,12 @@ local function detonateNukeAndLaunch()
             for i, part in ipairs(held) do
                 if part and part.Parent then
                     pcall(function()
+                        -- store original velocity for later restoration
+                        local origVel = Vector3.new(0,0,0)
+                        local ok, v = pcall(function() return part.Velocity end)
+                        if ok and v then origVel = v end
+                        nukeFiredPartsOriginalVelocity[part] = origVel
+
                         local ap = part:FindFirstChildOfClass("AlignPosition")
                         if ap then ap:Destroy() end
                         local att = part:FindFirstChildOfClass("Attachment")
@@ -1842,16 +1860,25 @@ local function detonateNukeAndLaunch()
                         part.CanCollide = false
                         pcall(function() part.Massless = false end)
                         local dir = dirs[((i-1) % #dirs) + 1] or Vector3.new(0,1,0)
-                        part.Velocity = dir * 1500
+                        part.Velocity = dir * explosionVelocity
                     end)
                 end
             end
         end
 
-        -- restore gravity 3s after detonation
+        -- schedule velocity restore 15 seconds after detonation
         spawn(function()
-            wait(3)
-            pcall(function() Workspace.Gravity = ORIGINAL_GRAVITY end)
+            wait(15)
+            for part, orig in pairs(nukeFiredPartsOriginalVelocity) do
+                if part and part.Parent then
+                    pcall(function()
+                        -- restore original velocity
+                        part.Velocity = orig
+                    end)
+                end
+            end
+            -- clear restore table
+            nukeFiredPartsOriginalVelocity = {}
         end)
     end)
 
@@ -1863,6 +1890,7 @@ local function detonateNukeAndLaunch()
 end
 
 -- Build nuke overlay (right side) — pressing the red round button detonates
+-- Added textbox to adjust explosion velocity (default 1500)
 local function spawnNukeOverlay()
     if nukeOverlayGui and nukeOverlayGui.Parent then return end
     local gui = Instance.new("ScreenGui")
@@ -1875,7 +1903,7 @@ local function spawnNukeOverlay()
     frame.Name = "NukeFrame"
     frame.AnchorPoint = Vector2.new(1, 0.5)
     frame.Position = UDim2.new(1, -12, 0.5, 0)
-    frame.Size = UDim2.new(0, 240, 0, 160)
+    frame.Size = UDim2.new(0, 260, 0, 180)
     frame.BackgroundColor3 = Color3.new(1, 1, 0) -- yellow
     frame.BorderSizePixel = 0
 
@@ -1885,12 +1913,12 @@ local function spawnNukeOverlay()
     topText.BackgroundTransparency = 1
     topText.Font = Enum.Font.SourceSansBold
     topText.Text = "Ordered from Temu shipping."
-    topText.TextColor3 = Color3.new(1,1,1)
+    topText.TextColor3 = Color3.new(0,0,0)
     topText.TextScaled = true
 
     local redBtn = Instance.new("TextButton", frame)
     redBtn.Size = UDim2.new(0, 80, 0, 80)
-    redBtn.Position = UDim2.new(0.5, -40, 0.5, -20)
+    redBtn.Position = UDim2.new(0.5, -40, 0.5, -10)
     redBtn.AnchorPoint = Vector2.new(0.5, 0.5)
     redBtn.Text = ""
     redBtn.AutoButtonColor = true
@@ -1903,13 +1931,48 @@ local function spawnNukeOverlay()
 
     local label = Instance.new("TextLabel", frame)
     label.Size = UDim2.new(1, -16, 0, 24)
-    label.Position = UDim2.new(0, 8, 1, -32)
+    label.Position = UDim2.new(0, 8, 1, -36)
     label.BackgroundTransparency = 1
     label.Font = Enum.Font.SourceSansBold
     label.Text = "kim ung yong nuke launcher 3000"
     label.TextScaled = true
     label.TextColor3 = Color3.new(0,0,0)
 
+    -- Velocity adjustment UI
+    local velLabel = Instance.new("TextLabel", frame)
+    velLabel.Size = UDim2.new(0, 120, 0, 20)
+    velLabel.Position = UDim2.new(0, 8, 0, 40)
+    velLabel.BackgroundTransparency = 1
+    velLabel.Font = Enum.Font.SourceSans
+    velLabel.Text = "Explosion Velocity:"
+    velLabel.TextSize = 14
+    velLabel.TextColor3 = Color3.new(0,0,0)
+    velLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+    local velBox = Instance.new("TextBox", frame)
+    velBox.Size = UDim2.new(0, 120, 0, 24)
+    velBox.Position = UDim2.new(0, 8, 0, 60)
+    velBox.BackgroundColor3 = Color3.new(1,1,1)
+    velBox.TextColor3 = Color3.new(0,0,0)
+    velBox.Text = tostring(explosionVelocity)
+    velBox.ClearTextOnFocus = false
+    velBox.Font = Enum.Font.SourceSans
+    velBox.TextSize = 16
+
+    -- validate input on focus lost
+    velBox.FocusLost:Connect(function(enterPressed)
+        local str = velBox.Text or ""
+        local num = tonumber(str)
+        if num and num > 0 then
+            explosionVelocity = num
+            velBox.Text = tostring(explosionVelocity)
+        else
+            -- invalid input -> reset to current value
+            velBox.Text = tostring(explosionVelocity)
+        end
+    end)
+
+    -- Pressing redBtn detonates instantly (uses explosionVelocity)
     redBtn.MouseButton1Click:Connect(function()
         spawn(function()
             for i=1,2 do
@@ -1919,12 +1982,10 @@ local function spawnNukeOverlay()
                 wait(0.04)
             end
         end)
+        -- Detonate (destroy BHs & apply velocities after 0.4s) and destroy overlay immediately
         detonateNukeAndLaunch()
     end)
 end
-
--- Removed the old "telekinesis/fix target" and "Load Player List Script" buttons.
--- Instead those loadstrings will run automatically at GUI launch
 
 -- "Goodbye." button
 window:Button("Goodbye.", function()
