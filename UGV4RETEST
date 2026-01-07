@@ -1,11 +1,11 @@
--- Full updated script (client) - nuke gravity + 15s restore + detonation velocity textbox
--- Summary:
--- * Gathering -> gravity set to 0 while gathering
--- * On detonation: gravity is applied immediately (Workspace.Gravity = ORIGINAL_GRAVITY)
--- * BH destroyed, wait 0.4s, then apply explosion velocity (user-adjustable via textbox) to gathered parts, collisions disabled
--- * After 15 seconds, restore the pre-detonation velocities for those parts (if they still exist)
--- * Textbox on the "kim ung yong" overlay for adjusting explosion velocity (default 1500)
--- * Caps and anti-lag measures remain
+-- Full updated script (client) - safety confirmation + gravity on confirm + center red button
+-- Notes:
+--  * Gravity is NOT set to 0 during gathering anymore.
+--  * When you confirm the kim ung yong detonation: Workspace.Gravity = 0 is set immediately, then restored after 3 seconds.
+--  * BH destroyed, wait 0.4s, apply explosion velocities (user adjustable), collisions disabled.
+--  * 15 seconds after detonation original part velocities are restored (if the part still exists).
+--  * Safety modal appears before detonation (Yes/No). Red button placed centered in the frame.
+--  * Caps and anti-lag measures retained.
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -1637,7 +1637,7 @@ local function spawnGoodbyeForPlayer(targetPlayer)
                         local assignedParts = {}
                         for _, ppart in ipairs(bh.AssignedParts) do table.insert(assignedParts, ppart) end
                         pcall(function() if bh.Part and bh.Part.Parent then bh.Part:Destroy() end end)
-                        -- after 0.4s, disable collisions and fling with velocity 1500 (uniform directions)
+                        -- after 0.4s, disable collisions and fling with velocity (uniform directions)
                         spawn(function()
                             wait(0.4)
                             local dirs = goldenSphereDirections(#assignedParts)
@@ -1804,11 +1804,11 @@ local function startNukeGather()
         end
     end
 
-    -- set gravity to 0 while gathering (user wanted gravity 0 during gathering)
-    pcall(function() Workspace.Gravity = 0 end)
+    -- NOTE: gravity is NOT set to 0 here anymore; it will be applied when red button is confirmed.
 end
 
--- Detonate nuke: destroy central holder first, set gravity back immediately, 0.4s later apply velocities and schedule 15s restore
+-- Detonate nuke: destroy central holder first, 0.4s later apply velocities and schedule 15s restore of velocities
+-- This function does NOT change gravity; gravity is handled by the confirm handler (set to 0 on confirm then restored after 3s)
 local function detonateNukeAndLaunch()
     if not nukeGathering then return end
     nukeGathering = false
@@ -1823,9 +1823,6 @@ local function detonateNukeAndLaunch()
         pcall(function() nukeCenterFollowConn:Disconnect() end)
         nukeCenterFollowConn = nil
     end
-
-    -- Immediately re-enable gravity (user requested gravity to apply once detonation is triggered)
-    pcall(function() Workspace.Gravity = ORIGINAL_GRAVITY end)
 
     -- destroy central BH part/folder first
     pcall(function()
@@ -1881,15 +1878,9 @@ local function detonateNukeAndLaunch()
             nukeFiredPartsOriginalVelocity = {}
         end)
     end)
-
-    -- destroy overlay GUI immediately
-    if nukeOverlayGui and nukeOverlayGui.Parent then
-        pcall(function() nukeOverlayGui:Destroy() end)
-        nukeOverlayGui = nil
-    end
 end
 
--- Build nuke overlay (right side) — pressing the red round button detonates
+-- Build nuke overlay (right side) — pressing the red round button opens a safety modal; pressing Yes triggers detonation
 -- Added textbox to adjust explosion velocity (default 1500)
 local function spawnNukeOverlay()
     if nukeOverlayGui and nukeOverlayGui.Parent then return end
@@ -1916,10 +1907,11 @@ local function spawnNukeOverlay()
     topText.TextColor3 = Color3.new(0,0,0)
     topText.TextScaled = true
 
+    -- Centered red button (anchorpoint center)
     local redBtn = Instance.new("TextButton", frame)
     redBtn.Size = UDim2.new(0, 80, 0, 80)
-    redBtn.Position = UDim2.new(0.5, -40, 0.5, -10)
     redBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+    redBtn.Position = UDim2.new(0.5, 0, 0.5, 0) -- EXACT CENTER
     redBtn.Text = ""
     redBtn.AutoButtonColor = true
     redBtn.BackgroundColor3 = Color3.new(1,0,0)
@@ -1972,18 +1964,86 @@ local function spawnNukeOverlay()
         end
     end)
 
-    -- Pressing redBtn detonates instantly (uses explosionVelocity)
-    redBtn.MouseButton1Click:Connect(function()
-        spawn(function()
-            for i=1,2 do
-                redBtn.Size = redBtn.Size + UDim2.new(0, 6, 0, 6)
-                wait(0.04)
-                redBtn.Size = redBtn.Size - UDim2.new(0, 6, 0, 6)
-                wait(0.04)
-            end
+    -- Safety modal creator
+    local function createSafetyModal(parentGui, onConfirm)
+        -- modal overlay
+        local modal = Instance.new("Frame", parentGui)
+        modal.Size = UDim2.new(1,0,1,0)
+        modal.Position = UDim2.new(0,0,0,0)
+        modal.BackgroundTransparency = 0.5
+        modal.BackgroundColor3 = Color3.new(0,0,0)
+        modal.ZIndex = 10
+
+        local box = Instance.new("Frame", modal)
+        box.Size = UDim2.new(0, 360, 0, 160)
+        box.Position = UDim2.new(0.5, 0, 0.5, 0)
+        box.AnchorPoint = Vector2.new(0.5, 0.5)
+        box.BackgroundColor3 = Color3.new(1, 0.9, 0.8)
+        box.BorderSizePixel = 0
+        box.ZIndex = 11
+        local boxCorner = Instance.new("UICorner", box); boxCorner.CornerRadius = UDim.new(0, 8)
+
+        local warn = Instance.new("TextLabel", box)
+        warn.Size = UDim2.new(1, -24, 0, 64)
+        warn.Position = UDim2.new(0, 12, 0, 12)
+        warn.BackgroundTransparency = 1
+        warn.Font = Enum.Font.SourceSansBold
+        warn.TextColor3 = Color3.new(0.1,0.1,0.1)
+        warn.TextWrapped = true
+        warn.TextScaled = false
+        warn.TextSize = 16
+        warn.Text = "WARNING: This will DETONATE the nuke. Parts will be flung and gravity will be momentarily altered.\nAre you absolutely sure you want to proceed?"
+
+        local yesBtn = Instance.new("TextButton", box)
+        yesBtn.Size = UDim2.new(0.44, 0, 0, 36)
+        yesBtn.Position = UDim2.new(0.52, -6, 1, -46)
+        yesBtn.AnchorPoint = Vector2.new(0, 0)
+        yesBtn.Text = "Yes - DETONATE"
+        yesBtn.Font = Enum.Font.SourceSansBold
+        yesBtn.TextColor3 = Color3.new(1,1,1)
+        yesBtn.BackgroundColor3 = Color3.new(0.8, 0.1, 0.1)
+        yesBtn.BorderSizePixel = 0
+        yesBtn.ZIndex = 12
+        local yesCorner = Instance.new("UICorner", yesBtn); yesCorner.CornerRadius = UDim.new(0,6)
+
+        local noBtn = Instance.new("TextButton", box)
+        noBtn.Size = UDim2.new(0.44, 0, 0, 36)
+        noBtn.Position = UDim2.new(0, 6, 1, -46)
+        noBtn.Text = "No - Cancel"
+        noBtn.Font = Enum.Font.SourceSansBold
+        noBtn.TextColor3 = Color3.new(1,1,1)
+        noBtn.BackgroundColor3 = Color3.new(0.2, 0.2, 0.2)
+        noBtn.BorderSizePixel = 0
+        noBtn.ZIndex = 12
+        local noCorner = Instance.new("UICorner", noBtn); noCorner.CornerRadius = UDim.new(0,6)
+
+        -- cancel handler
+        noBtn.MouseButton1Click:Connect(function()
+            pcall(function() modal:Destroy() end)
         end)
-        -- Detonate (destroy BHs & apply velocities after 0.4s) and destroy overlay immediately
-        detonateNukeAndLaunch()
+
+        -- confirm handler
+        yesBtn.MouseButton1Click:Connect(function()
+            pcall(function() modal:Destroy() end)
+            pcall(function() onConfirm() end)
+        end)
+    end
+
+    -- Pressing redBtn opens the safety modal. The modal's confirm will set gravity to 0, call detonate, schedule gravity restore after 3s, and destroy overlay immediately.
+    redBtn.MouseButton1Click:Connect(function()
+        createSafetyModal(gui, function()
+            -- Apply gravity = 0 at the moment of confirmation (user requested)
+            pcall(function() Workspace.Gravity = 0 end)
+            -- Trigger detonation logic (does not change gravity itself)
+            pcall(function() detonateNukeAndLaunch() end)
+            -- Restore gravity after 3 seconds
+            spawn(function()
+                wait(3)
+                pcall(function() Workspace.Gravity = ORIGINAL_GRAVITY end)
+            end)
+            -- Destroy overlay GUI immediately as requested
+            pcall(function() if nukeOverlayGui and nukeOverlayGui.Parent then nukeOverlayGui:Destroy(); nukeOverlayGui = nil end end)
+        end)
     end)
 end
 
@@ -1994,7 +2054,7 @@ window:Button("Goodbye.", function()
     end)
 end)
 
--- "nuclear bomb." button: starts gathering immediately and spawns overlay; the overlay's red button detonates.
+-- "nuclear bomb." button: starts gathering immediately and spawns overlay; the overlay's red button triggers a safety modal which detonates.
 window:Button("nuclear bomb.", function()
     spawn(function()
         pcall(function()
