@@ -1,7 +1,6 @@
--- Full updated script (Blackhole GUI)
--- Adds persistent math.huge-style fling pulses to parts while stabilizing locally (anti-fling).
--- Includes: FallenPartsDestroyHeight=NaN enforcement, ping estimator, fixed skidding, respawn-safe cleanup,
--- per-part ancestry cleanup, and the new doPersistentFling called from ForcePart.
+-- Full updated script: blackhole GUI with per-part anti-fling (math.huge), ping compensation,
+-- FallenPartsDestroyHeight=NaN, skid fixes, respawn safety, and instant snap behavior.
+-- Paste into client.
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -35,6 +34,9 @@ local extraBlackHoles = {}
 -- per-part AncestryChanged connections to auto-clean when parts are removed/destroyed
 local partConns = {}
 
+-- per-part anti-fling thread handles (best-effort; threads exit when processedParts entry removed)
+local antiFlingThreads = {}
+
 -- PAA state
 local PAAEnabled = false
 local PAA_isUsingSelected = false
@@ -62,21 +64,21 @@ local cycleDead = {}
 local cycleConns = {}
 local cycleRestartPending = false
 
--- USER-REQUESTED / EXTREME VALUES
+-- USER-REQUESTED VALUES
 local fallenpartsdestroyheight = 0/0 -- NaN requested (keeps fallen parts from being auto-destroyed)
 
 local BASE_FLING_AXIS = 1e6
 local BASE_PULL_FORCE = 1e8
 local BASE_PULL_RESP  = 1e6
 
-local FLING_MULTIPLIER = 9e15     -- example scale used for torque
-local PULL_MULTIPLIER  = math.huge  -- user requested
+local FLING_MULTIPLIER = 9e15     -- 9e15
+local PULL_MULTIPLIER  = math.huge  -- user heavy test
 
 local FLING_TORQUE = Vector3.new(BASE_FLING_AXIS * FLING_MULTIPLIER,
                                  BASE_FLING_AXIS * FLING_MULTIPLIER,
                                  BASE_FLING_AXIS * FLING_MULTIPLIER)
-local PULL_MAX_FORCE = BASE_PULL_FORCE * (1e6) -- avoid literal inf in assigning default; will re-evaluate later
-local PULL_RESPONSIVENESS = BASE_PULL_RESP * (1e6)
+local PULL_MAX_FORCE = BASE_PULL_FORCE * PULL_MULTIPLIER
+local PULL_RESPONSIVENESS = BASE_PULL_RESP * PULL_MULTIPLIER
 
 local MASSLESS_TORQUE_SCALE = 1.0
 local MASSLESS_PULL_SCALE  = 1.0
@@ -89,8 +91,11 @@ local SKID_SMOOTHNESS = 40.0
 local playerLastVel = {}
 local playerLastVelTime = {}
 
--- ONE-FRAME FLING multiplier (user asked math.huge)
+-- ONE-FRAME FLING multiplier (kept for impulses)
 local ONE_FRAME_FLING_MULT = math.huge
+
+-- PART persistent fling multiplier (user requested math.huge)
+local PART_FLING_MULT = math.huge
 
 -- Setup folder & primary attachment
 local function setupPlayer()
@@ -234,34 +239,13 @@ do
     end)
 end
 
--- Helper: sanitize a component for applied vector (prevent Inf/NaN)
-local function sanitizeComponent(comp, fallback, largeFinite)
-    largeFinite = largeFinite or 1e50
-    if isFiniteNumber(comp) then
-        if comp > 1e308 then return 1e308 end
-        if comp < -1e308 then return -1e308 end
-        return comp
-    end
-    -- fallback to sign
-    local s = signOfNumber(fallback)
-    return largeFinite * s
-end
-
--- NEW: doPersistentFling
--- Sends repeated huge-velocity pulses and stabilizes the part locally between pulses to avoid visual collapse.
--- Parameters:
--- part: BasePart
--- flingVec: Vector3 add-on velocity (optional)
--- multiplier: number (can be math.huge)
--- pulses: number of repeated huge pulses to send (default 3)
--- pulseInterval: seconds between pulses (default 0.12)
--- totalDuration: how long to run the local anti-fling stabilizer (default estimatedPing*3 + 0.1)
-local function doPersistentFling(part, flingVec, multiplier, pulses, pulseInterval, totalDuration)
+-- ONE-FRAME FLING helper (robust with math.huge)
+local function doOneFrameFling(part, flingVec, multiplier)
     if not part or not part.Parent then return end
     local ok, _ = pcall(function() return part:IsDescendantOf(game) end)
     if not ok then return end
 
-    -- attempt to set network owner (best-effort)
+    -- Try to take network ownership so physics changes are applied from local client
     pcall(function()
         if typeof(part.SetNetworkOwner) == "function" then
             pcall(function() part:SetNetworkOwner(localPlayer) end)
@@ -270,95 +254,155 @@ local function doPersistentFling(part, flingVec, multiplier, pulses, pulseInterv
         end
     end)
 
-    pulses = pulses or 3
-    pulseInterval = pulseInterval or 0.12
-    totalDuration = totalDuration or math.max(0.06, estimatedPing * 3.0) + 0.1
-
     local orig = getPartVelocity(part)
-    flingVec = flingVec or Vector3.new(0,0,0)
     local mult = multiplier or ONE_FRAME_FLING_MULT
 
-    -- We'll use a large finite fallback for actual numeric sets when multiplier is Inf,
-    -- but we still *intend* to send math.huge-style impulses by using very large numbers.
+    -- If multiplier is infinite, replace it with a very large finite fallback value
     local LARGE_FINITE = 1e50
     if mult == math.huge or mult == -math.huge then
-        -- leave mult as math.huge for logic, but the numeric multiplication below will be sanitized
+        mult = LARGE_FINITE
     end
 
-    -- Create a local loop that restores the part's local velocity every RenderStepped to keep client stable.
-    local stopFlag = false
-    local stabilizerConn
-    stabilizerConn = RunService.RenderStepped:Connect(function()
-        if stopFlag then return end
-        if not part or not part.Parent then
-            stopFlag = true
-            if stabilizerConn then pcall(function() stabilizerConn:Disconnect() end) end
-            return
-        end
-        -- restore the local velocity so the part doesn't fly away locally
-        -- small vertical jitter to avoid sleeping
-        pcall(function()
-            setPartVelocity(part, orig + Vector3.new(0, 0.02, 0))
-        end)
-    end)
+    -- Compose applied vector; use flingVec (may be zero) + orig * mult
+    flingVec = flingVec or Vector3.new(0,0,0)
+    local applied = Vector3.new(
+        (flingVec.X or 0) + (orig.X or 0) * mult,
+        (flingVec.Y or 0) + (orig.Y or 0) * mult,
+        (flingVec.Z or 0) + (orig.Z or 0) * mult
+    )
 
-    -- Helper to send a single huge pulse (sanitized)
-    local function sendPulse()
-        if not part or not part.Parent then return end
-        local curOrig = getPartVelocity(part)
-        -- compute applied vector attempt: flingVec + curOrig * mult
-        local appliedX, appliedY, appliedZ
-        if mult == math.huge or mult == -math.huge then
-            -- force a very large finite applied vector based on sign of components
-            appliedX = sanitizeComponent(flingVec.X + curOrig.X * 1, curOrig.X, LARGE_FINITE) * (1e12) -- scale big
-            appliedY = sanitizeComponent(flingVec.Y + curOrig.Y * 1, curOrig.Y, LARGE_FINITE) * (1e12)
-            appliedZ = sanitizeComponent(flingVec.Z + curOrig.Z * 1, curOrig.Z, LARGE_FINITE) * (1e12)
-        else
-            appliedX = sanitizeComponent((flingVec.X or 0) + (curOrig.X or 0) * mult, curOrig.X, LARGE_FINITE)
-            appliedY = sanitizeComponent((flingVec.Y or 0) + (curOrig.Y or 0) * mult, curOrig.Y, LARGE_FINITE)
-            appliedZ = sanitizeComponent((flingVec.Z or 0) + (curOrig.Z or 0) * mult, curOrig.Z, LARGE_FINITE)
+    -- Sanitize components (prevent Inf / NaN)
+    local function sanitizeComponent(comp, fallbackComp)
+        if isFiniteNumber(comp) then
+            -- clamp to reasonably large magnitude to avoid runtime issues
+            if comp > 1e308 then return 1e308 end
+            if comp < -1e308 then return -1e308 end
+            return comp
         end
-        local applied = Vector3.new(appliedX, appliedY, appliedZ)
+        -- fallback to sign of flingVec or orig
+        local s = signOfNumber(fallbackComp)
+        return LARGE_FINITE * s
+    end
 
-        pcall(function() setPartVelocity(part, applied) end)
-        -- Wait a very short time to ensure the velocity update is sent, then restore local velocity for stabilization
+    applied = Vector3.new(
+        sanitizeComponent(applied.X, (flingVec.X ~= 0 and flingVec.X) or orig.X),
+        sanitizeComponent(applied.Y, (flingVec.Y ~= 0 and flingVec.Y) or orig.Y),
+        sanitizeComponent(applied.Z, (flingVec.Z ~= 0 and flingVec.Z) or orig.Z)
+    )
+
+    -- Apply the extreme velocity, then perform a series of restores tuned to ping
+    pcall(function() setPartVelocity(part, applied) end)
+
+    -- Immediate frame restore
+    RunService.RenderStepped:Wait()
+    pcall(function() setPartVelocity(part, orig) end)
+
+    -- Extra restore on Stepped (reduces race with physics)
+    RunService.Stepped:Wait()
+    pcall(function() setPartVelocity(part, orig) end)
+
+    -- Anti-ping repeated restores:
+    -- Duration scales with estimatedPing; multiply by factor to be conservative
+    local duration = math.max(0.06, estimatedPing * 3.0) -- seconds (minimum 60ms)
+    local endTime = tick() + duration
+
+    -- Perform frequent restores during the window (RenderStepped is best for tight restores)
+    while tick() < endTime do
         RunService.RenderStepped:Wait()
-        pcall(function() setPartVelocity(part, curOrig) end)
-        -- extra stepped restore
-        RunService.Stepped:Wait()
-        pcall(function() setPartVelocity(part, curOrig) end)
+        pcall(function() setPartVelocity(part, orig) end)
     end
 
-    -- Send pulses spaced by pulseInterval
-    spawn(function()
-        for i = 1, pulses do
-            if not part or not part.Parent then break end
-            sendPulse()
-            wait(pulseInterval)
-        end
-    end)
+    -- Final retry restores spaced out to catch delayed server corrections
+    for i = 1, 4 do
+        wait(0.02 * i)
+        pcall(function() setPartVelocity(part, orig) end)
+    end
 
-    -- Additionally run a small totalDuration window where we aggressively restore local velocity (stabilizer already doing this).
-    spawn(function()
-        local endTime = tick() + totalDuration
-        while tick() < endTime do
-            if not part or not part.Parent then break end
-            -- render-step restore is happening; add a tiny wait so we don't spin too hard
-            wait(0.03)
-        end
-        stopFlag = true
-        if stabilizerConn then pcall(function() stabilizerConn:Disconnect() end) end
-    end)
+    -- tiny vertical pulse to keep physics active (reduces sleeping/jitter)
+    pcall(function() setPartVelocity(part, orig + Vector3.new(0, 0.05, 0)) end)
+end
 
-    -- Extra retries after the main window to catch delayed corrections
+-- NEW: persistent per-part hidden fling + anti-fling loop
+-- Applies huge multiplier to existing velocity (or a provided flingVec) while continuously doing
+-- anti-fling restores so the part doesn't "collapse" or get launched away from local-control.
+local function startPartHiddenFling(part, flingVec, multiplier)
+    if not part or not part.Parent then return end
+    -- Avoid starting multiple loops for same part
+    if antiFlingThreads[part] then return end
+
+    antiFlingThreads[part] = true -- marker; the actual coroutine uses processedParts entry to exit
+
     spawn(function()
-        wait(totalDuration + 0.04)
-        for i = 1, 4 do
-            if not part or not part.Parent then break end
-            local curOrig = getPartVelocity(part)
-            pcall(function() setPartVelocity(part, curOrig) end)
-            wait(0.02 * i)
+        local LARGE_FINITE = 1e50
+        while processedParts[part] and part and part.Parent and part:IsDescendantOf(game) do
+            -- tight heartbeat-driven loop
+            RunService.Heartbeat:Wait()
+
+            local orig = getPartVelocity(part)
+            local mult = multiplier or PART_FLING_MULT
+            if mult == math.huge or mult == -math.huge then mult = LARGE_FINITE end
+
+            -- Compose applied vector: flingVec + orig * mult
+            flingVec = flingVec or Vector3.new(0,0,0)
+            local applied = Vector3.new(
+                (flingVec.X or 0) + (orig.X or 0) * mult,
+                (flingVec.Y or 0) + (orig.Y or 0) * mult,
+                (flingVec.Z or 0) + (orig.Z or 0) * mult
+            )
+
+            local function sanitizeComponent(comp, fallbackComp)
+                if isFiniteNumber(comp) then
+                    if comp > 1e308 then return 1e308 end
+                    if comp < -1e308 then return -1e308 end
+                    return comp
+                end
+                local s = signOfNumber(fallbackComp)
+                return LARGE_FINITE * s
+            end
+
+            applied = Vector3.new(
+                sanitizeComponent(applied.X, (flingVec.X ~= 0 and flingVec.X) or orig.X),
+                sanitizeComponent(applied.Y, (flingVec.Y ~= 0 and flingVec.Y) or orig.Y),
+                sanitizeComponent(applied.Z, (flingVec.Z ~= 0 and flingVec.Z) or orig.Z)
+            )
+
+            -- Best-effort set network owner so local changes have effect
+            pcall(function()
+                if typeof(part.SetNetworkOwner) == "function" then
+                    part:SetNetworkOwner(localPlayer)
+                end
+            end)
+
+            -- Apply extreme velocity, then run the anti-fling restores like hidden fling
+            pcall(function() setPartVelocity(part, applied) end)
+            -- immediate restore next frame
+            RunService.RenderStepped:Wait()
+            pcall(function() setPartVelocity(part, orig) end)
+            -- stepped restore
+            RunService.Stepped:Wait()
+            pcall(function() setPartVelocity(part, orig) end)
+
+            -- keep doing restores for a short duration tuned to ping
+            local duration = math.max(0.05, estimatedPing * 2.5)
+            local endTime = tick() + duration
+            while tick() < endTime and processedParts[part] and part and part.Parent do
+                RunService.RenderStepped:Wait()
+                pcall(function() setPartVelocity(part, orig) end)
+            end
+
+            -- small staggered restores after that
+            for i = 1, 3 do
+                if not (processedParts[part] and part and part.Parent) then break end
+                wait(0.02 * i)
+                pcall(function() setPartVelocity(part, orig) end)
+            end
+
+            -- tiny vertical pulse to keep physics awake
+            pcall(function() setPartVelocity(part, orig + Vector3.new(0, 0.03, 0)) end)
         end
+
+        -- Cleanup marker
+        antiFlingThreads[part] = nil
     end)
 end
 
@@ -454,7 +498,7 @@ local function predictTargetPosition(pl, pos, vel, now)
     return predicted, leadFactor, accel
 end
 
--- ForcePart (also massless handling) with per-part AncestryChanged cleanup
+-- ForcePart (also massless handling) with per-part AncestryChanged cleanup and persistent anti-fling
 local function ForcePart(v)
     if not v or not v:IsA("BasePart") then return end
     if isPartPlayerCharacter(v) then return end
@@ -483,6 +527,7 @@ local function ForcePart(v)
                         pcall(function() partConns[v]:Disconnect() end)
                         partConns[v] = nil
                     end
+                    -- anti-fling thread will exit on its own because processedParts[v] cleared
                 end
             end)
             partConns[v] = conn
@@ -517,7 +562,6 @@ local function ForcePart(v)
             resp  = resp * MASSLESS_RESP_SCALE
         end
 
-        -- Try to keep values finite for apperance; server clamp may apply
         AlignPosition.MaxForce = maxF
         AlignPosition.MaxVelocity = math.huge
         AlignPosition.Responsiveness = resp
@@ -531,11 +575,14 @@ local function ForcePart(v)
             AlignPosition.Attachment1 = Attachment1
         end
 
-        -- NEW: send math.huge-style pulses to this part to impart server-side impulse while stabilizing locally
+        -- Start persistent hidden fling loop for this part (applies PART_FLING_MULT while anti-fling restores run)
+        startPartHiddenFling(v, Vector3.new(0,0,0), PART_FLING_MULT)
+
+        -- Small one-frame fling impulse to give initial push (keeps existing behavior)
         spawn(function()
-            local flingVec = Vector3.new(0,0,0) -- use zero-add by default (the huge impulse is from multiplier)
-            -- pulses: higher pulses gives stronger server-side effect; keep small default to be safe
-            doPersistentFling(v, flingVec, ONE_FRAME_FLING_MULT, 4, 0.10, math.max(0.12, estimatedPing * 3 + 0.08))
+            pcall(function()
+                doOneFrameFling(v, Vector3.new(0,0,0), ONE_FRAME_FLING_MULT)
+            end)
         end)
     end
 end
@@ -563,6 +610,8 @@ local function clearProcessedParts()
             pcall(function() partConns[part]:Disconnect() end)
             partConns[part] = nil
         end
+        -- ensure processedParts cleared so persistent loops end
+        processedParts[part] = nil
     end
     processedParts = {}
     initiallyAnchoredParts = {}
@@ -749,13 +798,14 @@ local function createExtraBlackHole(initialTarget, source)
                 if isPlayerDisabled(bh.TargetPlayer) then
                     setBlackHoleActiveState(bh, false)
                 else
-                    -- instant teleport-on-target-change
+                    -- if target changed since last loop, teleport instantly to player HRP to avoid long startup lag
                     if bh.LastTarget ~= bh.TargetPlayer then
                         bh.LastTarget = bh.TargetPlayer
                         pcall(function()
                             local c = bh.TargetPlayer.Character
                             if c and c:FindFirstChild("HumanoidRootPart") and bh.Attachment then
                                 bh.Attachment.WorldCFrame = c.HumanoidRootPart.CFrame
+                                -- small smoothing seed
                                 bh.smoothedCF = bh.Attachment.WorldCFrame
                             elseif c and c:FindFirstChild("Head") and bh.Attachment then
                                 bh.Attachment.WorldCFrame = c.Head.CFrame
@@ -773,6 +823,7 @@ local function createExtraBlackHole(initialTarget, source)
                         local vel = hrp.Velocity or Vector3.new(0,0,0)
                         local now = tick()
 
+                        -- improved prediction: use predictTargetPosition and then add ping-based leadTime
                         local predBase, leadFactor, accel = predictTargetPosition(bh.TargetPlayer, pos, vel, now)
 
                         local speed = vel.Magnitude
@@ -781,11 +832,13 @@ local function createExtraBlackHole(initialTarget, source)
                         local leadTime = clamp(baseLead + pingLead, 0.05, 1.2)
                         local predictedPos = pos + vel * leadTime + 0.5 * accel * (leadTime * leadTime)
 
+                        -- If big vertical motion (jump/fall), use head position to reduce vertical ping error
                         local head = char:FindFirstChild("Head")
                         if head and math.abs(vel.Y) > 3 then
                             predictedPos = Vector3.new(predictedPos.X, head.Position.Y, predictedPos.Z)
                         end
 
+                        -- Prefer humanoid.MoveDirection when available (gives intended walking direction)
                         local humanoid = char:FindFirstChildOfClass("Humanoid")
                         local moveDir = Vector3.new(0,0,0)
                         if humanoid and typeof(humanoid.MoveDirection) == "Vector3" and humanoid.MoveDirection.Magnitude > 0.01 then
@@ -801,17 +854,21 @@ local function createExtraBlackHole(initialTarget, source)
                         end
                         local dir = (horiz.Magnitude > 0.001) and horiz.Unit or Vector3.new(0,0,1)
 
-                        local skidAmplitude = math.max(0.5, speed * 0.5)
+                        -- FIX: reduce amplitude so total skid length ~= speed (not 2*speed)
+                        local skidAmplitude = math.max(0.5, speed * 0.5) -- half of speed => total length ≈ speed
                         if estimatedPing > 0.15 then
                             skidAmplitude = skidAmplitude * (1 + (estimatedPing - 0.15))
                         end
 
+                        -- Frequency tuning
                         local baseFreq = 6.5
                         local freq = baseFreq + (speed * 2.2) - (estimatedPing * 1.5)
                         if freq < 3 then freq = 3 end
 
                         local phase = t * (2 * math.pi * freq)
                         local s = math.sin(phase)
+
+                        -- shaped bias to spend more time near forward predicted pos improving hit chance
                         local signS = (s >= 0) and 1 or -1
                         local bias = signS * (1 - math.pow((1 - math.abs(s)), 0.85))
 
@@ -822,9 +879,11 @@ local function createExtraBlackHole(initialTarget, source)
 
                         local desiredPos = predictedPos + offset + verticalOffset
 
+                        -- look ahead toward movement direction for orientation
                         local lookAhead = predictedPos + dir * math.max(1, speed * 0.6) + Vector3.new(0, 0.1, 0)
                         local targetCF = CFrame.new(desiredPos, lookAhead)
 
+                        -- aggressive deterministic smoothing
                         local effectiveSmooth = SKID_SMOOTHNESS * (1 + speed * 0.85)
                         if effectiveSmooth < 3.0 then effectiveSmooth = 3.0 end
                         local skidAlpha = 1 - math.exp(-effectiveSmooth * dt)
@@ -834,6 +893,7 @@ local function createExtraBlackHole(initialTarget, source)
                         local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
                         local curCF = success and cur or bh.smoothedCF or bh.Part.CFrame
 
+                        -- Aggressive lerp toward the predicted + offset location
                         bh.smoothedCF = curCF:Lerp(targetCF, skidAlpha)
 
                         if att then
@@ -842,6 +902,7 @@ local function createExtraBlackHole(initialTarget, source)
                     end
                 end
             else
+                -- idle behavior near Attachment1
                 local hasValidTargets = false
                 for _, pl in ipairs(Players:GetPlayers()) do
                     if pl ~= localPlayer and pl.Parent and not isWhitelisted(pl) and isPlayerAlive(pl) then
@@ -900,6 +961,8 @@ local function destroyExtraBlackHole(bh)
             else
                 pcall(function() p.Massless = false end)
             end
+            -- removing processedParts will also stop anti-fling
+            processedParts[p] = nil
         end
     end
 end
@@ -1297,9 +1360,8 @@ function startRebalancer()
                     if ap then
                         pcall(function()
                             local isMass = (pcall(function() return p.Massless end) and p.Massless)
-                            -- ap.MaxForce may be enormous; clamp to very large finite for client safety
-                            ap.MaxForce = 1e30 * (isMass and MASSLESS_PULL_SCALE or 1)
-                            ap.Responsiveness = 1e30 * (isMass and MASSLESS_RESP_SCALE or 1)
+                            ap.MaxForce = PULL_MAX_FORCE * (isMass and MASSLESS_PULL_SCALE or 1)
+                            ap.Responsiveness = PULL_RESPONSIVENESS * (isMass and MASSLESS_RESP_SCALE or 1)
                         end)
                         table.insert(parts, p)
                     else
@@ -1308,8 +1370,8 @@ function startRebalancer()
                         if ap2 then
                             pcall(function()
                                 local isMass = (pcall(function() return p.Massless end) and p.Massless)
-                                ap2.MaxForce = 1e30 * (isMass and MASSLESS_PULL_SCALE or 1)
-                                ap2.Responsiveness = 1e30 * (isMass and MASSLESS_RESP_SCALE or 1)
+                                ap2.MaxForce = PULL_MAX_FORCE * (isMass and MASSLESS_PULL_SCALE or 1)
+                                ap2.Responsiveness = PULL_RESPONSIVENESS * (isMass and MASSLESS_RESP_SCALE or 1)
                             end)
                             table.insert(parts, p)
                         end
@@ -1452,7 +1514,7 @@ local function onCharacterAdded(character)
 end
 Players.LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
 
--- Primary loop (Attachment1 movement & skid) unchanged from previous fixed skid version; kept deterministic
+-- Primary loop (Attachment1 follows target; instant snap when target changes + fixed skid)
 local lastAttachment1Target = nil
 local function startPrimaryLoop()
     if primaryLoopRunning then return end
@@ -1640,12 +1702,53 @@ local function setTargetSelected(value)
     end
 end
 
--- GUI (TurtleLib) - kept minimal controls
+-- GUI (TurtleLib)
 local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/miroeramaa/TurtleLib/main/TurtleUiLib.lua"))()
-local window = library:Window("Blackhole GUI — persistent fling test")
+local window = library:Window("Fix it you panis negor🗣🔥")
 
 window:Toggle("Unanchored Target All", false, function(Value) setTargetAll(Value) end)
 window:Toggle("Target Selected Players", false, function(Value) setTargetSelected(Value) end)
+
+window:Toggle("Life Cycle Mode", false, function(Value)
+    LifeCycleMode = Value
+    if LifeCycleMode then
+        tryStartCycleIfNeeded()
+    else
+        endCycleMode()
+    end
+end)
+
+window:Button("Reset Cycle", function()
+    resetCycleNow()
+end)
+
+window:Button("Load Player List Script", function()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/Jlchris1/Udklol/refs/heads/main/Playerlistv6"))()
+end)
+window:Button("telekinesis/fix target", function()
+    loadstring(game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true))()
+end)
+
+local loopCheckActive = false
+window:Toggle("Continuous Loop Check", false, function(Value)
+    loopCheckActive = Value
+    if loopCheckActive then
+        spawn(function()
+            while loopCheckActive do
+                if targetAllActive or targetSelectedActive then
+                    for _, v in ipairs(Workspace:GetDescendants()) do
+                        if v:IsA("BasePart") and not v.Anchored and not processedParts[v] and not isPartPlayerCharacter(v) and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character)) then
+                            if initiallyMasslessParts[v] == nil then pcall(function() initiallyMasslessParts[v] = v.Massless end) end
+                            pcall(function() v.Massless = true end)
+                            ForcePart(v)
+                        end
+                    end
+                end
+                wait(0.5)
+            end
+        end)
+    end
+end)
 
 window:Toggle("PAA/unPAA (player amount BHs)", false, function(Value)
     PAAEnabled = Value
@@ -1666,13 +1769,27 @@ window:Button("Delete Extra Blackholes (DBH)", function() deleteCommandBlackHole
 
 spawn(function()
     while true do
+        if PAAEnabled then
+            if PAA_isUsingSelected then
+                if targetSelectedActive then refreshPAA() end
+            else
+                if targetAllActive then refreshPAA() end
+            end
+        end
+        wait(2)
+    end
+end)
+
+spawn(function()
+    while true do
         if #extraBlackHoles > 0 and not rebalancerRunning then startRebalancer()
         elseif #extraBlackHoles == 0 and rebalancerRunning then stopRebalancer() end
+        if cycleRestartPending then scheduleCycleRestart() end
         wait(0.5)
     end
 end)
 
--- HUD count
+-- HUD
 do
     local screenGui = Instance.new("ScreenGui")
     screenGui.Name = "ÆS_BHCountGui"
@@ -1693,26 +1810,30 @@ do
     txt.TextColor3 = Color3.new(1,1,1)
     txt.Parent = screenGui
 
-    spawn(function()
-        while true do
-            local count = 0
-            pcall(function()
-                for _, obj in ipairs(Workspace:GetDescendants()) do
-                    if obj:IsA("Folder") then
-                        local lname = obj.Name:lower()
-                        if string.find(lname, "blackhole") or string.find(lname, "bh") or string.find(lname, "aes_blackhole") or string.find(lname, "æs_blackhole") then
-                            for _, child in ipairs(obj:GetDescendants()) do
-                                if child:IsA("BasePart") then
-                                    local cname = child.Name:lower()
-                                    if string.find(cname, "extrabh_center") or string.find(cname, "bh_center") or string.find(cname, "bh_center_part") or string.find(cname, "extra") then
-                                        count = count + 1
-                                    end
-                                end
+    local function countBlackHolePartsInFolders()
+        local count = 0
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("Folder") then
+                local lname = obj.Name:lower()
+                if string.find(lname, "blackhole") or string.find(lname, "bh") or string.find(lname, "aes_blackhole") or string.find(lname, "æs_blackhole") then
+                    for _, child in ipairs(obj:GetDescendants()) do
+                        if child:IsA("BasePart") then
+                            local cname = child.Name:lower()
+                            if string.find(cname, "extrabh_center") or string.find(cname, "bh_center") or string.find(cname, "bh_center_part") or string.find(cname, "extra") then
+                                count = count + 1
                             end
                         end
                     end
                 end
-            end)
+            end
+        end
+        return count
+    end
+
+    spawn(function()
+        while true do
+            local count = 0
+            pcall(function() count = countBlackHolePartsInFolders() end)
             txt.Text = "BlackHoles: "..tostring(count)
             wait(0.5)
         end
