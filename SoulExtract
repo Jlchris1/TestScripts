@@ -1,0 +1,272 @@
+-- Devour Soul (LocalScript)
+-- StarterPlayerScripts (LocalScript)
+-- Ascend 25 studs and ensure the ascent completes at the exact time the draining kills the NPC.
+-- 0.5% max health drained every 0.01s (client-side). No Torque, no fling, no tool destruction.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local workspace = game:GetService("Workspace")
+
+local localPlayer = Players.LocalPlayer
+if not localPlayer then return end
+
+-- CONFIG
+local TOOL_NAME = "Devour Soul"
+local TOOL_HANDLE_NAME = "Handle"
+local TOTAL_LIFT = 25                    -- studs to ascend
+local DRAIN_INTERVAL = 0.01              -- seconds between drains
+local DRAIN_PCT = 0.005                  -- 0.5% per tick
+local ALIGN_MAX_FORCE = 9e9
+local ALIGN_RESPONSIVENESS = 1200
+local ALIGN_ORI_RESPONSIVENESS = 1200
+local CLEANUP_ON_DEATH = true
+local ANCHOR_SIZE = Vector3.new(1,1,1)
+
+-- Helpers
+local function findHumanoidFromPart(part)
+    if not part then return nil, nil end
+    local node = part
+    for i = 1, 8 do
+        if not node then break end
+        local hum = node:FindFirstChildOfClass("Humanoid")
+        if hum then return hum, node end
+        node = node.Parent
+    end
+    return nil, nil
+end
+
+local function isPlayerCharacter(model)
+    return model and Players:GetPlayerFromCharacter(model) ~= nil
+end
+
+local function createTool()
+    local bp = localPlayer:FindFirstChildOfClass("Backpack")
+    if not bp then return nil end
+
+    local existing = bp:FindFirstChild(TOOL_NAME) or (localPlayer.Character and localPlayer.Character:FindFirstChild(TOOL_NAME))
+    if existing and existing:IsA("Tool") then return existing end
+
+    local tool = Instance.new("Tool")
+    tool.Name = TOOL_NAME
+    tool.RequiresHandle = true
+    tool.CanBeDropped = false
+    tool.Parent = bp
+
+    local handle = Instance.new("Part")
+    handle.Name = TOOL_HANDLE_NAME
+    handle.Size = Vector3.new(1,1,1)
+    handle.Transparency = 1
+    handle.CanCollide = false
+    handle.Massless = true
+    handle.Parent = tool
+
+    return tool
+end
+
+-- Main effect
+local function performDevourOn(humanoid, model)
+    if not humanoid or not model then return end
+    if isPlayerCharacter(model) then return end
+
+    local hrp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("LowerTorso") or model:FindFirstChild("Torso")
+    if not hrp or not hrp:IsA("BasePart") then return end
+
+    -- Avoid double-grab
+    if model:FindFirstChild("DevourSoul_Grabbed") then return end
+    local tag = Instance.new("BoolValue")
+    tag.Name = "DevourSoul_Grabbed"
+    tag.Value = true
+    tag.Parent = model
+
+    -- Anchor (anchored invisible part)
+    local anchor = Instance.new("Part")
+    anchor.Name = "DevourSoul_Anchor"
+    anchor.Size = ANCHOR_SIZE
+    anchor.Transparency = 1
+    anchor.Anchored = true
+    anchor.CanCollide = false
+    anchor.Massless = true
+    anchor.Parent = workspace
+
+    -- start anchor at HRP position & orientation
+    anchor.CFrame = hrp.CFrame
+
+    -- Attachments
+    local attAnchor = Instance.new("Attachment")
+    attAnchor.Name = "Devour_Attach_Anchor"
+    attAnchor.Parent = anchor
+
+    local attHRP = Instance.new("Attachment")
+    attHRP.Name = "Devour_Attach_HRP"
+    attHRP.Parent = hrp
+    attHRP.WorldCFrame = hrp.CFrame
+
+    -- AlignPosition: rigidly pull HRP to anchor
+    local alignPos = Instance.new("AlignPosition")
+    alignPos.Name = "Devour_AlignPos"
+    alignPos.Attachment0 = attHRP
+    alignPos.Attachment1 = attAnchor
+    alignPos.RigidityEnabled = true
+    alignPos.MaxForce = ALIGN_MAX_FORCE
+    alignPos.Responsiveness = ALIGN_RESPONSIVENESS
+    alignPos.MaxVelocity = math.huge
+    alignPos.Parent = hrp
+
+    -- AlignOrientation: lock orientation (prevents spin)
+    local alignOri = Instance.new("AlignOrientation")
+    alignOri.Name = "Devour_AlignOri"
+    alignOri.Attachment0 = attHRP
+    alignOri.Attachment1 = attAnchor
+    alignOri.MaxTorque = 9e9
+    alignOri.Responsiveness = ALIGN_ORI_RESPONSIVENESS
+    alignOri.Parent = hrp
+
+    -- Compute dynamic lift time so ascent finishes as the NPC reaches 0 HP.
+    local maxHealth = (humanoid and humanoid.MaxHealth and humanoid.MaxHealth > 0) and humanoid.MaxHealth or 1
+    local currentHealth = (humanoid and humanoid.Health) and humanoid.Health or maxHealth
+
+    -- Damage per second = (maxHealth * DRAIN_PCT) / DRAIN_INTERVAL
+    local dmgPerSec = (maxHealth * DRAIN_PCT) / math.max(DRAIN_INTERVAL, 1e-6)
+    local timeToDie = nil
+    if dmgPerSec > 0 then
+        timeToDie = currentHealth / dmgPerSec
+    end
+    -- Fallback: if computed is nil/zero/too small, give very small time so it still finishes
+    if not timeToDie or timeToDie <= 0.001 then
+        timeToDie = 0.1
+    end
+
+    local LIFT_TIME = timeToDie
+    local startY = anchor.Position.Y
+    local targetY = startY + TOTAL_LIFT
+    local elapsed = 0
+
+    local alive = true
+    local deathConn
+    deathConn = humanoid.Died:Connect(function() alive = false end)
+
+    -- Drain accumulator
+    local drainAccum = 0
+
+    local function cleanup()
+        pcall(function() if tag and tag.Parent then tag:Destroy() end end)
+        pcall(function() if alignPos and alignPos.Parent then alignPos:Destroy() end end)
+        pcall(function() if alignOri and alignOri.Parent then alignOri:Destroy() end end)
+        pcall(function() if attHRP and attHRP.Parent then attHRP:Destroy() end end)
+        pcall(function() if attAnchor and attAnchor.Parent then attAnchor:Destroy() end end)
+        pcall(function() if anchor and anchor.Parent then anchor:Destroy() end end)
+        if deathConn then deathConn:Disconnect() end
+    end
+
+    local conn
+    conn = RunService.Heartbeat:Connect(function(dt)
+        if not alive then
+            conn:Disconnect()
+            cleanup()
+            return
+        end
+
+        -- advance time
+        elapsed = elapsed + dt
+        local t = math.clamp(elapsed / math.max(LIFT_TIME, 1e-6), 0, 1)
+
+        -- eased progress (smooth)
+        local eased = t < 0.5 and 8 * t^4 or 1 - (-2 * t + 2)^4 / 2
+        local newY = startY + (targetY - startY) * eased
+
+        -- Move anchor: follow HRP X/Z (exact) and set Y to newY.
+        -- Keep anchor rotation same as HRP to avoid orientation mismatch.
+        local hrpRot = hrp.CFrame - hrp.CFrame.Position -- rotation-only CFrame
+        anchor.CFrame = CFrame.new(hrp.Position.X, newY, hrp.Position.Z) * hrpRot
+
+        -- Aggressively zero velocities each frame to avoid fling/spin.
+        pcall(function()
+            if hrp and hrp:IsA("BasePart") then
+                hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+            end
+        end)
+
+        -- Drain health according to the configured tick
+        drainAccum = drainAccum + dt
+        while drainAccum >= DRAIN_INTERVAL do
+            drainAccum = drainAccum - DRAIN_INTERVAL
+            local dmg = maxHealth * DRAIN_PCT
+            -- client-side attempt (may be overridden by server)
+            pcall(function()
+                if humanoid and humanoid.Health > 0 then
+                    humanoid.Health = math.clamp(humanoid.Health - dmg, 0, humanoid.MaxHealth)
+                end
+            end)
+            -- if health reached zero, mark alive false
+            if humanoid.Health <= 0 then
+                alive = false
+                break
+            end
+        end
+
+        -- finish when progress done OR humanoid died
+        if t >= 1 or (humanoid.Health <= 0 and CLEANUP_ON_DEATH) then
+            conn:Disconnect()
+            -- small delay so final frame settles
+            task.spawn(function()
+                wait(0.02)
+                cleanup()
+            end)
+            return
+        end
+    end)
+end
+
+-- Wire tool click (no ClickDetector). Uses Tool.Equipped mouse Button1Down.
+local function wireTool(tool)
+    if not tool or not tool:IsA("Tool") then return end
+
+    local equippedConn
+    tool.Equipped:Connect(function(mouse)
+        if not mouse then mouse = localPlayer:GetMouse() end
+
+        if equippedConn then
+            equippedConn:Disconnect()
+            equippedConn = nil
+        end
+
+        equippedConn = mouse.Button1Down:Connect(function()
+            local target = mouse.Target
+            if not target then return end
+            local hum, model = findHumanoidFromPart(target)
+            if not hum or not model then return end
+            if isPlayerCharacter(model) then return end
+            pcall(function() performDevourOn(hum, model) end)
+        end)
+    end)
+
+    tool.Unequipped:Connect(function()
+        if equippedConn then
+            equippedConn:Disconnect()
+            equippedConn = nil
+        end
+    end)
+end
+
+-- Setup tool & auto-equip
+local tool = createTool()
+if tool then
+    wireTool(tool)
+
+    local function tryEquip()
+        local char = localPlayer.Character
+        if char then
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            if humanoid and tool.Parent == localPlayer.Backpack then
+                pcall(function() humanoid:EquipTool(tool) end)
+            end
+        end
+    end
+
+    tryEquip()
+    localPlayer.CharacterAdded:Connect(function()
+        task.wait(0.12)
+        tryEquip()
+    end)
+end
