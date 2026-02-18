@@ -1,0 +1,945 @@
+-- Devour Soul + Black Hole tools (LocalScript)
+-- Place in StarterPlayerScripts (client). Provides:
+--  * Devour Soul tool (handleless) - improved: will pick a fallback part if HRP/Torso missing;
+--    can hit through walls by using mouse.Hit fallback when clicking accessories/walls.
+--  * Always-on persistent black hole that follows the local player (20 studs up, 10 behind).
+--  * Black Hole tool: click to place a temporary BH at click (snaps to player/NPC root if nearby),
+--    instantly kills NPCs it intersects and pulls their parts in (HP toggling loop), returns after 1s.
+--  * Equip Black Hole tool shows a left-side "Singularity" button — pulling all NPCs in 200 studs
+--    to the BH over 3s, then kills them and applies HP toggles for 5s.
+-- Notes: this is client-side visual/physics logic. Tuning values are near the user's requests.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local StarterGui = game:GetService("StarterGui")
+
+local localPlayer = Players.LocalPlayer
+if not localPlayer then return end
+
+-- ======================
+-- Utilities
+-- ======================
+local function clamp(v,a,b) if v < a then return a elseif v > b then return b end return v end
+
+local function isPlayerCharacter(model)
+    return model and Players:GetPlayerFromCharacter(model) ~= nil
+end
+
+local function isNPC(character)
+    if not character or not character:IsA("Model") then return false end
+    local hum = character:FindFirstChildOfClass("Humanoid")
+    if hum and not Players:GetPlayerFromCharacter(character) then return true end
+    return false
+end
+
+local function isPartPlayerCharacter(part)
+    if not part then return false end
+    for _, pl in ipairs(Players:GetPlayers()) do
+        local char = pl.Character
+        if char and part:IsDescendantOf(char) then return true end
+    end
+    return false
+end
+
+local function stripBodyForces(part)
+    if not part then return end
+    for _, c in ipairs(part:GetChildren()) do
+        if c:IsA("BodyPosition") or c:IsA("BodyGyro") or c:IsA("BodyVelocity")
+        or c:IsA("BodyAngularVelocity") or c:IsA("BodyForce") or c:IsA("RocketPropulsion") then
+            pcall(function() c:Destroy() end)
+        end
+    end
+end
+
+-- Helper: find a humanoid/model from a click target OR from a position (to hit through walls)
+-- If part is nil or an accessory/wall, we search for nearest NPC whose HRP is within snapRadius of the position.
+local function findHumanoidFromTargetOrPosition(targetPart, hitPos, snapRadius)
+    snapRadius = snapRadius or 6
+    if targetPart then
+        -- try walk-up search for humanoid
+        local node = targetPart
+        for i = 1, 10 do
+            if not node then break end
+            local hum = node:FindFirstChildOfClass("Humanoid")
+            if hum then return hum, node end
+            node = node.Parent
+        end
+    end
+
+    -- fallback: search for humanoid whose HRP is within snapRadius of hitPos (allows hitting through walls)
+    if hitPos then
+        local foundHum, foundModel, foundDist = nil, nil, math.huge
+        for _, m in ipairs(Workspace:GetChildren()) do
+            if m:IsA("Model") then
+                local hum = m:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health ~= nil and not Players:GetPlayerFromCharacter(m) then
+                    local hrp = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("UpperTorso") or m:FindFirstChild("Torso")
+                    if hrp and hrp:IsA("BasePart") then
+                        local d = (hrp.Position - hitPos).Magnitude
+                        if d < snapRadius and d < foundDist then
+                            foundHum, foundModel, foundDist = hum, m, d
+                        end
+                    end
+                end
+            end
+        end
+        if foundHum then return foundHum, foundModel end
+    end
+
+    return nil, nil
+end
+
+-- Helper: find a player whose HRP is within snapRadius of hitPos (for snapping BH to player)
+local function findPlayerNearPosition(hitPos, snapRadius)
+    snapRadius = snapRadius or 8
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= localPlayer and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+            local hrp = pl.Character.HumanoidRootPart
+            if (hrp.Position - hitPos).Magnitude <= snapRadius then
+                return pl, hrp
+            end
+        end
+    end
+    return nil, nil
+end
+
+-- Helper: find NPC model near position
+local function findNPCNearPosition(hitPos, snapRadius)
+    snapRadius = snapRadius or 8
+    for _, m in ipairs(Workspace:GetChildren()) do
+        if m:IsA("Model") and isNPC(m) then
+            local hrp = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("UpperTorso") or m:FindFirstChild("Torso")
+            if hrp and (hrp.Position - hitPos).Magnitude <= snapRadius then
+                return m, hrp
+            end
+        end
+    end
+    return nil, nil
+end
+
+-- ======================
+-- Devour Soul tool (improved)
+-- ======================
+local DEVOUR_NAME = "Devour Soul"
+
+-- Create devour tool if missing; returns tool instance
+local function createDevourTool()
+    local bp = localPlayer:FindFirstChildOfClass("Backpack")
+    if not bp then return nil end
+    local existing = bp:FindFirstChild(DEVOUR_NAME) or (localPlayer.Character and localPlayer.Character:FindFirstChild(DEVOUR_NAME))
+    if existing and existing:IsA("Tool") then return existing end
+
+    local tool = Instance.new("Tool")
+    tool.Name = DEVOUR_NAME
+    tool.RequiresHandle = false
+    tool.CanBeDropped = false
+    tool.Parent = bp
+    return tool
+end
+
+-- Find a fallback BasePart inside model to attach to (if HRP/torso missing)
+local function findFallbackPartInModel(model)
+    if not model then return nil end
+    for _, v in ipairs(model:GetDescendants()) do
+        if v:IsA("BasePart") and v.Name ~= "Handle" then
+            return v
+        end
+    end
+    return nil
+end
+
+-- Explode visuals (reuse from earlier)
+local function explodeCharacterParts(model)
+    if not model then return end
+    local centerPart = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso")
+    local centerPos = centerPart and centerPart.Position or (model:GetModelCFrame().p or Vector3.new())
+    for _, v in ipairs(model:GetDescendants()) do
+        if v:IsA("BasePart") then
+            pcall(function()
+                local dir = (v.Position - centerPos)
+                if dir.Magnitude < 0.001 then
+                    dir = Vector3.new(math.random()-0.5, 0.5 + math.random()*0.5, math.random()-0.5)
+                end
+                dir = dir.Unit
+                local vel = dir * 70 + Vector3.new(0, 70 * 0.25, 0)
+                v.AssemblyLinearVelocity = vel
+                v.AssemblyAngularVelocity = Vector3.new(
+                    (math.random()-0.5) * 60,
+                    (math.random()-0.5) * 60,
+                    (math.random()-0.5) * 60
+                )
+            end)
+        end
+    end
+end
+
+-- Core devour routine (modified to allow fallback part and hit-through logic)
+-- If tool param provided, will create temporary handle on tool (like earlier).
+local ALIGN_MAX_FORCE = 9e9
+local ALIGN_RESP = 1200
+local ALIGN_ORI_RESP = 1200
+local ANCHOR_SIZE = Vector3.new(1,1,1)
+
+local latestHandle = nil
+local latestTargetModel = nil
+local latestDeathConn = nil
+
+local function createTempHandleForTool(tool)
+    if not tool or not tool:IsA("Tool") then return nil end
+    if latestHandle and latestHandle.Parent then pcall(function() latestHandle:Destroy() end) end
+    latestHandle = nil
+    local handle = Instance.new("Part")
+    handle.Name = "Handle"
+    handle.Size = Vector3.new(1,1,1)
+    handle.Transparency = 0.5
+    handle.CanCollide = false
+    handle.Massless = true
+    handle.Parent = tool
+    latestHandle = handle
+    return handle
+end
+
+local function removeTempHandle()
+    if latestHandle then pcall(function() latestHandle:Destroy() end); latestHandle = nil end
+    if latestDeathConn then pcall(function() latestDeathConn:Disconnect() end); latestDeathConn = nil end
+    latestTargetModel = nil
+end
+
+local function performDevourOn(humanoid, model, tool)
+    if not humanoid or not model then return end
+    if isPlayerCharacter(model) then return end
+
+    if model:FindFirstChild("DevourSoul_Grabbed") then return end
+    local tag = Instance.new("BoolValue")
+    tag.Name = "DevourSoul_Grabbed"
+    tag.Parent = model
+
+    -- create temp handle if needed
+    if tool and tool.Parent then
+        createTempHandleForTool(tool)
+        latestTargetModel = model
+    end
+
+    -- pick HRP or fallback
+    local hrp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("LowerTorso") or model:FindFirstChild("Torso") or findFallbackPartInModel(model)
+    if not hrp or not hrp:IsA("BasePart") then
+        pcall(function() tag:Destroy() end)
+        return
+    end
+
+    -- create anchor that we'll move upward (preserve earlier devour lift behavior)
+    local anchor = Instance.new("Part")
+    anchor.Name = "DevourSoul_Anchor"
+    anchor.Size = ANCHOR_SIZE
+    anchor.Transparency = 1
+    anchor.Anchored = true
+    anchor.CanCollide = false
+    anchor.Massless = true
+    anchor.Parent = Workspace
+    anchor.CFrame = hrp.CFrame
+
+    local attAnchor = Instance.new("Attachment", anchor)
+    attAnchor.Name = "Devour_Attach_Anchor"
+
+    local attHRP = Instance.new("Attachment", hrp)
+    attHRP.Name = "Devour_Attach_HRP"
+    attHRP.WorldCFrame = hrp.CFrame
+
+    local alignPos = Instance.new("AlignPosition", hrp)
+    alignPos.Name = "Devour_AlignPos"
+    alignPos.Attachment0 = attHRP
+    alignPos.Attachment1 = attAnchor
+    alignPos.RigidityEnabled = true
+    alignPos.MaxForce = ALIGN_MAX_FORCE
+    alignPos.Responsiveness = ALIGN_RESP
+    alignPos.MaxVelocity = math.huge
+
+    local alignOri = Instance.new("AlignOrientation", hrp)
+    alignOri.Name = "Devour_AlignOri"
+    alignOri.Attachment0 = attHRP
+    alignOri.Attachment1 = attAnchor
+    alignOri.MaxTorque = 9e9
+    alignOri.Responsiveness = ALIGN_ORI_RESP
+
+    -- compute timed lift to LIFT_STUDS over life / or some default
+    local LIFT_STUDS = 25
+    local DRAIN_INTERVAL = 0.01
+    local DRAIN_PCT = 0.005
+
+    local maxH = (humanoid and humanoid.MaxHealth and humanoid.MaxHealth > 0) and humanoid.MaxHealth or 1
+    local currH = (humanoid and humanoid.Health) and humanoid.Health or maxH
+    local dmgPerSec = (maxH * DRAIN_PCT) / math.max(DRAIN_INTERVAL, 1e-6)
+    local timeToDie = (dmgPerSec > 0) and (currH / dmgPerSec) or 0.1
+    if timeToDie <= 0.001 then timeToDie = 0.1 end
+    local liftTime = timeToDie
+
+    local startY = anchor.Position.Y
+    local targetY = startY + LIFT_STUDS
+    local elapsed = 0
+    local finished = false
+
+    local function doCleanupAndExplode()
+        if finished then return end
+        finished = true
+        pcall(function()
+            if alignPos and alignPos.Parent then alignPos:Destroy() end
+            if alignOri and alignOri.Parent then alignOri:Destroy() end
+            if attHRP and attHRP.Parent then attHRP:Destroy() end
+            if attAnchor and attAnchor.Parent then attAnchor:Destroy() end
+            if anchor and anchor.Parent then anchor:Destroy() end
+        end)
+
+        pcall(function() explodeCharacterParts(model) end)
+
+        if latestTargetModel == model then removeTempHandle() end
+        pcall(function() if tag and tag.Parent then tag:Destroy() end end)
+    end
+
+    local deathConnLocal
+    deathConnLocal = humanoid.Died:Connect(function()
+        doCleanupAndExplode()
+        if deathConnLocal then deathConnLocal:Disconnect() end
+    end)
+
+    if latestDeathConn then pcall(function() latestDeathConn:Disconnect() end); latestDeathConn = nil end
+    latestDeathConn = deathConnLocal
+
+    local drainAccum = 0
+    local conn
+    conn = RunService.Heartbeat:Connect(function(dt)
+        if finished then conn:Disconnect() return end
+        elapsed = elapsed + dt
+        local t = clamp(elapsed / math.max(liftTime, 1e-6), 0, 1)
+        local eased = t < 0.5 and 8 * t^4 or 1 - (-2 * t + 2)^4 / 2
+        local newY = startY + (targetY - startY) * eased
+
+        pcall(function()
+            if hrp and hrp.Parent then
+                local hrpRot = hrp.CFrame - hrp.CFrame.Position
+                anchor.CFrame = CFrame.new(hrp.Position.X, newY, hrp.Position.Z) * hrpRot
+            end
+        end)
+
+        -- zero velocities to avoid fling/spin during lift
+        pcall(function()
+            if hrp and hrp:IsA("BasePart") then
+                hrp.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                hrp.AssemblyAngularVelocity = Vector3.new(0,0,0)
+            end
+        end)
+
+        drainAccum = drainAccum + dt
+        while drainAccum >= DRAIN_INTERVAL do
+            drainAccum = drainAccum - DRAIN_INTERVAL
+            local dmg = maxH * DRAIN_PCT
+            pcall(function()
+                if humanoid and humanoid.Health > 0 then
+                    humanoid.Health = clamp(humanoid.Health - dmg, 0, humanoid.MaxHealth)
+                end
+            end)
+            if humanoid.Health <= 0 then break end
+        end
+
+        if t >= 1 then
+            doCleanupAndExplode()
+            conn:Disconnect()
+            return
+        end
+    end)
+end
+
+-- Wire Devour tool
+local function wireDevourTool(tool)
+    if not tool or not tool:IsA("Tool") then return end
+    local equippedConn
+    tool.Equipped:Connect(function(mouse)
+        if not mouse then mouse = localPlayer:GetMouse() end
+        if equippedConn then equippedConn:Disconnect(); equippedConn = nil end
+        equippedConn = mouse.Button1Down:Connect(function()
+            local target = mouse.Target
+            local hit = mouse.Hit and mouse.Hit.p
+            local hum, model = findHumanoidFromTargetOrPosition(target, hit, 8)
+            if not hum or not model then return end
+            if isPlayerCharacter(model) then return end
+            -- ensure tool handle behavior: remove previous handle if clicking different NPC
+            if latestHandle and latestTargetModel and latestTargetModel ~= model then
+                removeTempHandle()
+            end
+            local toolRef = tool
+            pcall(function() performDevourOn(hum, model, toolRef) end)
+        end)
+    end)
+    tool.Unequipped:Connect(function()
+        if equippedConn then equippedConn:Disconnect(); equippedConn = nil end
+    end)
+end
+
+-- ======================
+-- Persistent Black Hole that follows player (always-on)
+-- ======================
+local BH_FOLDER_NAME = "DevourBH_Folder"
+local BH_CENTER_NAME = "DevourBH_Center"
+local BH_ATTACHMENT_NAME = "DevourBH_Att"
+local BH_PULL_FORCE = 6e7
+local BH_PULL_RESP = 200
+local BH_TORQUE = Vector3.new(0, 1e6, 0)
+
+local BHFolder = Workspace:FindFirstChild(BH_FOLDER_NAME)
+if not BHFolder then
+    BHFolder = Instance.new("Folder")
+    BHFolder.Name = BH_FOLDER_NAME
+    BHFolder.Parent = Workspace
+end
+
+local centerPart = BHFolder:FindFirstChild(BH_CENTER_NAME)
+if not centerPart then
+    centerPart = Instance.new("Part")
+    centerPart.Name = BH_CENTER_NAME
+    centerPart.Anchored = true
+    centerPart.CanCollide = false
+    centerPart.Transparency = 1
+    centerPart.Size = Vector3.new(1,1,1)
+    centerPart.Parent = BHFolder
+end
+
+local BH_Attachment = centerPart:FindFirstChild(BH_ATTACHMENT_NAME)
+if not BH_Attachment then
+    BH_Attachment = Instance.new("Attachment")
+    BH_Attachment.Name = BH_ATTACHMENT_NAME
+    BH_Attachment.Parent = centerPart
+end
+
+-- track processed parts and initial massless/anchored state
+local processedParts = {}
+local initiallyMasslessParts = {}
+local initiallyAnchoredParts = {}
+
+local function ForcePartToBH(v)
+    if not v or not v:IsA("BasePart") then return end
+    if v.Anchored then return end
+    if v.Name == "Handle" then return end
+    if processedParts[v] then return end
+    if isPartPlayerCharacter(v) then return end
+    if localPlayer.Character and v:IsDescendantOf(localPlayer.Character) then return end
+    if v.Parent and v.Parent:FindFirstChildOfClass("Humanoid") then return end
+
+    processedParts[v] = true
+    initiallyAnchoredParts[v] = initiallyAnchoredParts[v] == nil and v.Anchored or initiallyAnchoredParts[v]
+    initiallyMasslessParts[v] = initiallyMasslessParts[v] == nil and v.Massless or initiallyMasslessParts[v]
+
+    pcall(function() v.Massless = true end)
+    stripBodyForces(v)
+    v.CanCollide = false
+
+    local att = Instance.new("Attachment")
+    att.Name = "DevourBH_Att_Part"
+    att.Parent = v
+    pcall(function() att.WorldCFrame = v.CFrame end)
+
+    local ap = Instance.new("AlignPosition")
+    ap.Name = "DevourBH_Align"
+    ap.Attachment0 = att
+    ap.Attachment1 = BH_Attachment
+    ap.MaxForce = BH_PULL_FORCE
+    ap.MaxVelocity = math.huge
+    ap.Responsiveness = BH_PULL_RESP
+    ap.Parent = v
+
+    local ok, Torque = pcall(function() return Instance.new("Torque") end)
+    if ok and Torque then
+        Torque.Attachment0 = att
+        Torque.Parent = v
+        Torque.Torque = BH_TORQUE
+    else
+        pcall(function() v.AssemblyAngularVelocity = Vector3.new(0, 60, 0) end)
+    end
+end
+
+-- initial scan
+local function initialScanAndForce()
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart") then
+            if not v.Anchored
+                and v.Name ~= "Handle"
+                and not isPartPlayerCharacter(v)
+                and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
+                and not (v.Parent and v.Parent:FindFirstChildOfClass("Humanoid")) then
+                if initiallyAnchoredParts[v] == nil then initiallyAnchoredParts[v] = v.Anchored end
+                if initiallyMasslessParts[v] == nil then pcall(function() initiallyMasslessParts[v] = v.Massless end) end
+                pcall(function() v.Massless = true end)
+                ForcePartToBH(v)
+            end
+        end
+    end
+end
+
+Workspace.DescendantAdded:Connect(function(v)
+    if v and v:IsA("BasePart") then
+        if not v.Anchored
+            and v.Name ~= "Handle"
+            and not isPartPlayerCharacter(v)
+            and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
+            and not (v.Parent and v.Parent:FindFirstChildOfClass("Humanoid")) then
+            if initiallyAnchoredParts[v] == nil then initiallyAnchoredParts[v] = v.Anchored end
+            if initiallyMasslessParts[v] == nil then pcall(function() initiallyMasslessParts[v] = v.Massless end) end
+            pcall(function() v.Massless = true end)
+            ForcePartToBH(v)
+        end
+    end
+end)
+
+-- BH center follows local player
+spawn(function()
+    while true do
+        local char = localPlayer.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            local hrp = char.HumanoidRootPart
+            local upOffset = Vector3.new(0, 20, 0)
+            local behind = -10
+            local desiredPos = hrp.Position + upOffset + hrp.CFrame.LookVector * behind
+            pcall(function() centerPart.Position = desiredPos end)
+            pcall(function() BH_Attachment.WorldPosition = centerPart.Position end)
+        else
+            pcall(function() centerPart.Position = Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.p or Vector3.new(0,50,0) end)
+            pcall(function() BH_Attachment.WorldPosition = centerPart.Position end)
+        end
+        RunService.Heartbeat:Wait()
+    end
+end)
+
+-- ======================
+-- Black Hole Tool (placement + singulartiy)
+-- ======================
+
+local BLACKHOLE_TOOL_NAME = "Black Hole"
+local SNAP_RADIUS = 8      -- snap to player/NPC within this radius
+local TEMP_BH_LIFETIME = 1 -- seconds before returning
+local CLICK_KILL_HP_TOGGLE_PERIOD = 0.3
+local CLICK_KILL_TOGGLE_DURATION = 5
+local SINGULARITY_RADIUS = 200
+local SINGULARITY_TRAVEL_TIME = 3
+local SINGULARITY_HIT_TOGGLE_PERIOD = 0.5
+local SINGULARITY_HIT_TOGGLE_DURATION = 5
+
+-- create black hole tool in backpack (and auto-equip)
+local function createBlackHoleTool()
+    local bp = localPlayer:FindFirstChildOfClass("Backpack")
+    if not bp then return nil end
+    local existing = bp:FindFirstChild(BLACKHOLE_TOOL_NAME) or (localPlayer.Character and localPlayer.Character:FindFirstChild(BLACKHOLE_TOOL_NAME))
+    if existing and existing:IsA("Tool") then return existing end
+
+    local tool = Instance.new("Tool")
+    tool.Name = BLACKHOLE_TOOL_NAME
+    tool.RequiresHandle = false
+    tool.CanBeDropped = false
+    tool.Parent = bp
+    return tool
+end
+
+-- create temporary BH object (at pos) with attachment
+local function createTemporaryBH(pos)
+    local folder = Workspace:FindFirstChild(BH_FOLDER_NAME) or Instance.new("Folder", Workspace)
+    folder.Name = BH_FOLDER_NAME
+    local part = Instance.new("Part", folder)
+    part.Name = "TempBH_Center"
+    part.Size = Vector3.new(1,1,1)
+    part.Transparency = 1
+    part.Anchored = true
+    part.CanCollide = false
+    part.Position = pos
+    local att = Instance.new("Attachment", part)
+    att.Name = "TempBH_Att"
+    return {Part = part, Attachment = att, AssignedParts = {}}
+end
+
+-- Helper: attach NPC parts to a BH (attachment object) - used for click-kill and post-death pulling
+local function attachModelPartsToBH(model, bh)
+    if not model or not bh or not bh.Attachment then return end
+    for _, v in ipairs(model:GetDescendants()) do
+        if v:IsA("BasePart") and not isPartPlayerCharacter(v) then
+            pcall(function()
+                -- remove previous forces
+                stripBodyForces(v)
+                v.CanCollide = false
+                pcall(function() v.Massless = true end)
+                -- create an attachment on the part if not exists
+                local att = v:FindFirstChild("DevourBH_Att_Part") or v:FindFirstChild("TempBH_Att_Part")
+                if not att then
+                    att = Instance.new("Attachment")
+                    att.Name = "TempBH_Att_Part"
+                    att.Parent = v
+                end
+                local ap = v:FindFirstChild("TempBH_Align") or v:FindFirstChild("DevourBH_Align")
+                if not ap then
+                    ap = Instance.new("AlignPosition")
+                    ap.Name = "TempBH_Align"
+                    ap.Attachment0 = att
+                    ap.MaxVelocity = math.huge
+                    ap.Parent = v
+                end
+                ap.Attachment1 = bh.Attachment
+                ap.MaxForce = 6e7
+                ap.Responsiveness = 400
+                -- torque for spin
+                if not v:FindFirstChildOfClass("Torque") then
+                    local ok, Torque = pcall(function() return Instance.new("Torque") end)
+                    if ok and Torque then
+                        local tmpAtt = Instance.new("Attachment", v)
+                        tmpAtt.Name = "TempBH_Torque_Att"
+                        Torque.Attachment0 = tmpAtt
+                        Torque.Parent = v
+                        Torque.Torque = BH_TORQUE
+                    end
+                end
+                table.insert(bh.AssignedParts, v)
+            end)
+        end
+    end
+end
+
+-- HP toggle loops (toggle between 0 and tiny positive to satisfy user's request)
+local function startHPToggleLoop(humanoid, smallHP, interval, duration)
+    if not humanoid then return end
+    spawn(function()
+        local elapsed = 0
+        local state = true -- currently at 0? we'll start with 0 then smallHP
+        while elapsed < duration do
+            pcall(function()
+                if humanoid and humanoid.Parent then
+                    if state then
+                        humanoid.Health = 0
+                    else
+                        humanoid.Health = smallHP
+                    end
+                end
+            end)
+            state = not state
+            wait(interval)
+            elapsed = elapsed + interval
+        end
+    end)
+end
+
+-- Instant kill & pull for BH click: kill NPCs intersecting temp BH and attach their parts to temp BH
+local function clickBHInstantKillAt(tempBH)
+    if not tempBH or not tempBH.Part then return end
+    local pos = tempBH.Part.Position
+    -- detect NPCs with HRP within a small radius (we'll use 8 studs)
+    local radius = 8
+    for _, m in ipairs(Workspace:GetChildren()) do
+        if m:IsA("Model") and isNPC(m) then
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            local hrp = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("UpperTorso") or m:FindFirstChild("Torso")
+            if hum and hrp then
+                if (hrp.Position - pos).Magnitude <= radius then
+                    -- instantly kill
+                    pcall(function() hum.Health = 0 end)
+                    -- attach their parts to temp BH
+                    attachModelPartsToBH(m, tempBH)
+                    -- HP toggling: 0 <-> 0.0001 every 0.3s for 5s
+                    startHPToggleLoop(hum, 0.0001, CLICK_KILL_HP_TOGGLE_PERIOD, CLICK_KILL_TOGGLE_DURATION)
+                end
+            end
+        end
+    end
+end
+
+-- After temp BH lifetime, return it to original center (centerPart position)
+local function returnTempBHToCenter(tempBH, returnDelay)
+    spawn(function()
+        wait(returnDelay or TEMP_BH_LIFETIME)
+        if not tempBH or not tempBH.Part then return end
+        local targetPos = centerPart.Position
+        -- animate return over 0.25s for smoothness
+        local t = 0
+        local dur = 0.25
+        local startPos = tempBH.Part.Position
+        while t < dur do
+            local alpha = t/dur
+            tempBH.Part.Position = startPos:Lerp(targetPos, alpha)
+            if tempBH.Attachment then tempBH.Attachment.WorldPosition = tempBH.Part.Position end
+            RunService.Heartbeat:Wait()
+            t = t + RunService.Heartbeat:Wait()
+        end
+        tempBH.Part.Position = targetPos
+        if tempBH.Attachment then tempBH.Attachment.WorldPosition = targetPos end
+
+        -- reassign assigned parts back to persistent BH
+        for _, p in ipairs(tempBH.AssignedParts) do
+            if p and p.Parent then
+                local ap = p:FindFirstChildWhichIsA("AlignPosition")
+                if ap then
+                    ap.Attachment1 = BH_Attachment
+                    p.CanCollide = false
+                end
+            end
+        end
+
+        -- cleanup temp BH part after small delay
+        wait(0.35)
+        if tempBH and tempBH.Part and tempBH.Part.Parent then tempBH.Part:Destroy() end
+    end)
+end
+
+-- Pull a single NPC model to a BH position over 'duration' seconds, then kill and attach parts to BH
+local function pullNPCToBHOverTime(model, bhPos, duration, afterKillAttachToBH)
+    if not model or not model:IsA("Model") then return end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local hrp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("LowerTorso") or model:FindFirstChild("Torso") or findFallbackPartInModel(model)
+    if not hum or not hrp then return end
+    if isPlayerCharacter(model) then return end
+
+    -- create anchor at hrp start and an attachment
+    local anchor = Instance.new("Part")
+    anchor.Name = "Singularity_Anchor"
+    anchor.Size = Vector3.new(1,1,1)
+    anchor.Transparency = 1
+    anchor.Anchored = true
+    anchor.CanCollide = false
+    anchor.Massless = true
+    anchor.Parent = Workspace
+    anchor.Position = hrp.Position
+
+    local attAnchor = Instance.new("Attachment", anchor)
+    attAnchor.Name = "Sing_Attach_Anchor"
+
+    local attHRP = Instance.new("Attachment", hrp)
+    attHRP.Name = "Sing_Attach_HRP"
+    attHRP.WorldCFrame = hrp.CFrame
+
+    local alignPos = Instance.new("AlignPosition", hrp)
+    alignPos.Name = "Sing_AlignPos"
+    alignPos.Attachment0 = attHRP
+    alignPos.Attachment1 = attAnchor
+    alignPos.MaxForce = ALIGN_MAX_FORCE
+    alignPos.MaxVelocity = math.huge
+    alignPos.Responsiveness = 800
+
+    local alignOri = Instance.new("AlignOrientation", hrp)
+    alignOri.Name = "Sing_AlignOri"
+    alignOri.Attachment0 = attHRP
+    alignOri.Attachment1 = attAnchor
+    alignOri.MaxTorque = 9e9
+    alignOri.Responsiveness = 800
+
+    -- animate anchor from start to bhPos over duration
+    local elapsed = 0
+    while elapsed < duration do
+        local dt = RunService.Heartbeat:Wait()
+        elapsed = elapsed + dt
+        local alpha = clamp(elapsed / duration, 0, 1)
+        local newPos = hrp.Position:Lerp(bhPos, alpha)
+        pcall(function()
+            anchor.Position = newPos
+            attAnchor.WorldCFrame = anchor.CFrame
+        end)
+        -- zero HRP velocities for stable movement
+        pcall(function()
+            if hrp and hrp:IsA("BasePart") then
+                hrp.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                hrp.AssemblyAngularVelocity = Vector3.new(0,0,0)
+            end
+        end)
+    end
+
+    -- upon arrival: kill and optionally attach parts to BH
+    pcall(function() if hum and hum.Parent then hum.Health = 0 end end)
+    -- HP toggle while touching BH for 5s (0 <-> 0.0001 every 0.5s)
+    startHPToggleLoop(hum, 0.0001, SINGULARITY_HIT_TOGGLE_PERIOD, SINGULARITY_HIT_TOGGLE_DURATION)
+
+    if afterKillAttachToBH and afterKillAttachToBH.Attachment then
+        attachModelPartsToBH(model, afterKillAttachToBH)
+    end
+
+    -- cleanup align/attachments/anchor after a short delay
+    wait(0.15)
+    pcall(function()
+        if alignPos and alignPos.Parent then alignPos:Destroy() end
+        if alignOri and alignOri.Parent then alignOri:Destroy() end
+        if attHRP and attHRP.Parent then attHRP:Destroy() end
+        if attAnchor and attAnchor.Parent then attAnchor:Destroy() end
+        if anchor and anchor.Parent then anchor:Destroy() end
+    end)
+end
+
+-- Build GUI button (left side) when Black Hole tool equipped
+local singularityButton = nil
+local function createSingularityButton(show, callback)
+    if show then
+        if singularityButton and singularityButton.Parent then return end
+        local screenGui = Instance.new("ScreenGui")
+        screenGui.Name = "BH_Singularity_GUI"
+        screenGui.ResetOnSpawn = false
+        screenGui.Parent = localPlayer:FindFirstChildOfClass("PlayerGui") or game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+
+        local btn = Instance.new("TextButton", screenGui)
+        btn.Name = "SingularityBtn"
+        btn.Size = UDim2.new(0,140,0,40)
+        btn.Position = UDim2.new(0, 8, 0, 100) -- left side
+        btn.Text = "Singularity"
+        btn.Font = Enum.Font.SourceSansBold
+        btn.TextSize = 20
+        btn.BackgroundColor3 = Color3.fromRGB(40,40,40)
+        btn.TextColor3 = Color3.new(1,1,1)
+        btn.BorderSizePixel = 0
+        btn.AutoButtonColor = true
+
+        btn.MouseButton1Click:Connect(function()
+            pcall(function() callback() end)
+        end)
+        singularityButton = screenGui
+    else
+        if singularityButton and singularityButton.Parent then
+            singularityButton:Destroy()
+        end
+        singularityButton = nil
+    end
+end
+
+-- Wire Black Hole tool input
+local function wireBlackHoleTool(tool)
+    if not tool or not tool:IsA("Tool") then return end
+    local equippedConn
+    tool.Equipped:Connect(function(mouse)
+        if not mouse then mouse = localPlayer:GetMouse() end
+        createSingularityButton(true, function()
+            -- Singularity activation: pull every NPC in 200 studs radius to persistent BH, 3s travel
+            local bhPos = centerPart.Position
+            -- find NPCs
+            for _, m in ipairs(Workspace:GetChildren()) do
+                if m:IsA("Model") and isNPC(m) then
+                    local hrp = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("UpperTorso") or m:FindFirstChild("Torso")
+                    if hrp then
+                        local d = (hrp.Position - bhPos).Magnitude
+                        if d <= SINGULARITY_RADIUS then
+                            -- pull over 3s and attach to persistent BH after kill
+                            spawn(function()
+                                pullNPCToBHOverTime(m, bhPos, SINGULARITY_TRAVEL_TIME, {Attachment = BH_Attachment})
+                            end)
+                        end
+                    end
+                end
+            end
+        end)
+
+        if equippedConn then equippedConn:Disconnect(); equippedConn = nil end
+
+        equippedConn = mouse.Button1Down:Connect(function()
+            local hitPos = mouse.Hit and mouse.Hit.p
+            if not hitPos then return end
+
+            -- Snap to nearest player or NPC root if suspiciously near
+            local snapPL, plHRP = findPlayerNearPosition(hitPos, SNAP_RADIUS)
+            local snapNPCModel, snapNPCHR = findNPCNearPosition(hitPos, SNAP_RADIUS)
+
+            local placePos = hitPos
+            if snapPL and plHRP then
+                placePos = plHRP.Position
+            elseif snapNPCModel and snapNPCHR then
+                placePos = snapNPCHR.Position
+            end
+
+            -- create temp BH and run instant kill for NPCs intersecting it
+            local tempBH = createTemporaryBH(placePos)
+            -- assign parts in vicinity to temp BH as well (we'll search within 60 studs for parts to attach for visual)
+            spawn(function()
+                -- instant kill NPCs that are within small radius around click (and attach parts)
+                clickBHInstantKillAt(tempBH)
+            end)
+
+            -- also reassign recently processed parts (from persistent system) in a sphere around temp BH to use temp BH while active
+            spawn(function()
+                local radius = 80
+                for part, _ in pairs(processedParts) do
+                    if part and part.Parent and (part.Position - placePos).Magnitude <= radius then
+                        -- if this part has an AlignPosition we set its Attachment1 to tempBH.Attachment
+                        local ap = part:FindFirstChildWhichIsA("AlignPosition")
+                        if ap and tempBH and tempBH.Attachment then
+                            pcall(function() ap.Attachment1 = tempBH.Attachment end)
+                            table.insert(tempBH.AssignedParts, part)
+                        end
+                    end
+                end
+            end)
+
+            -- schedule return to center after 1s
+            returnTempBHToCenter(tempBH, TEMP_BH_LIFETIME)
+        end)
+    end)
+
+    tool.Unequipped:Connect(function()
+        createSingularityButton(false)
+    end)
+end
+
+-- ======================
+-- Final setup: create tools, wire them, and auto-equip
+-- ======================
+
+-- Create Devour tool and wire
+local devTool = createDevourTool()
+if devTool then
+    wireDevourTool(devTool)
+    -- auto equip if possible
+    spawn(function()
+        wait(0.08)
+        local char = localPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum and devTool.Parent == localPlayer:FindFirstChildOfClass("Backpack") then
+                pcall(function() hum:EquipTool(devTool) end)
+            end
+        end
+    end)
+end
+
+-- Create Black Hole tool and wire
+local bhTool = createBlackHoleTool()
+if bhTool then
+    wireBlackHoleTool(bhTool)
+    -- auto equip BH tool to give player immediate access (but do not force if dev tool was auto-equipped)
+    spawn(function()
+        wait(0.12)
+        local char = localPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum and bhTool.Parent == localPlayer:FindFirstChildOfClass("Backpack") then
+                pcall(function() hum:EquipTool(bhTool) end)
+            end
+        end
+    end)
+end
+
+-- Ensure persistent BH is running and initial scan executed
+initialScanAndForce()
+
+-- Small API for cleanup if needed
+local ToolsAPI = {}
+ToolsAPI.DevourTool = devTool
+ToolsAPI.BlackHoleTool = bhTool
+ToolsAPI.PersistentBH = {Center = centerPart, Attachment = BH_Attachment}
+ToolsAPI.Destroy = function()
+    -- cleanup processed parts
+    for p, _ in pairs(processedParts) do
+        if p and p.Parent then
+            p.CanCollide = true
+            pcall(function()
+                if initiallyMasslessParts[p] ~= nil then p.Massless = initiallyMasslessParts[p] end
+                if initiallyAnchoredParts[p] == false then p.Anchored = false end
+            end)
+            local ap = p:FindFirstChild("DevourBH_Align") or p:FindFirstChild("TempBH_Align") or p:FindFirstChild("Sing_AlignPos")
+            if ap then pcall(function() ap:Destroy() end) end
+            local att = p:FindFirstChild("DevourBH_Att_Part") or p:FindFirstChild("TempBH_Att_Part")
+            if att then pcall(function() att:Destroy() end) end
+        end
+    end
+    processedParts = {}
+    initiallyMasslessParts = {}
+    initiallyAnchoredParts = {}
+    -- destroy BH folder
+    if BHFolder and BHFolder.Parent then BHFolder:Destroy() end
+end
+
+-- Script ready.
+print("Devour Soul + Black Hole client tools loaded for", localPlayer.Name)
