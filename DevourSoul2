@@ -1,0 +1,377 @@
+-- Devour Soul — LocalScript (StarterPlayerScripts)
+-- - Tool is handleless by default
+-- - Clicking an NPC creates a temporary Handle on the tool
+-- - The handle is removed when that latest-clicked NPC dies (tool won't drop)
+-- - NPC ascends 25 studs while being drained (0.5% every 0.01s), reaching the top as they die
+-- - When they die, each part receives an outward velocity ~70 for an "explosive" effect (client-side)
+-- - No fling/spin while ascending
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local localPlayer = Players.LocalPlayer
+if not localPlayer then return end
+
+-- CONFIG
+local TOOL_NAME = "Devour Soul"
+local LIFT_STUDS = 25
+local DRAIN_INTERVAL = 0.01
+local DRAIN_PCT = 0.005              -- 0.5% per tick
+local ALIGN_MAX_FORCE = 9e9
+local ALIGN_RESP = 1200
+local ALIGN_ORI_RESP = 1200
+local ANCHOR_SIZE = Vector3.new(1,1,1)
+local EXPLOSION_VELOCITY = 70        -- magnitude to set on each part when NPC dies
+local CLEANUP_ON_DEATH = true
+
+-- State (for the temporary handle associated with the latest clicked NPC)
+local latestHandle = nil
+local latestTargetModel = nil
+local latestDeathConn = nil
+
+-- Helper: walk up to find Humanoid & model
+local function findHumanoidFromPart(part)
+    if not part then return nil, nil end
+    local node = part
+    for i = 1, 8 do
+        if not node then break end
+        local hum = node:FindFirstChildOfClass("Humanoid")
+        if hum then return hum, node end
+        node = node.Parent
+    end
+    return nil, nil
+end
+
+local function isPlayerCharacter(model)
+    return model and Players:GetPlayerFromCharacter(model) ~= nil
+end
+
+-- create tool (handleless by default)
+local function createTool()
+    local bp = localPlayer:FindFirstChildOfClass("Backpack")
+    if not bp then return nil end
+
+    local existing = bp:FindFirstChild(TOOL_NAME) or (localPlayer.Character and localPlayer.Character:FindFirstChild(TOOL_NAME))
+    if existing and existing:IsA("Tool") then return existing end
+
+    local tool = Instance.new("Tool")
+    tool.Name = TOOL_NAME
+    -- handleless by default so player doesn't carry a physical part until click
+    tool.RequiresHandle = false
+    tool.CanBeDropped = false
+    tool.Parent = bp
+
+    return tool
+end
+
+-- Create a temporary handle on the tool (replaces previous one)
+local function createTempHandleForTool(tool)
+    if not tool or not tool:IsA("Tool") then return nil end
+
+    -- remove existing handle if we created one earlier
+    if latestHandle and latestHandle.Parent then
+        pcall(function() latestHandle:Destroy() end)
+    end
+    latestHandle = nil
+
+    -- create handle part under tool
+    local handle = Instance.new("Part")
+    handle.Name = "Handle"           -- engine recognizes this as the tool handle
+    handle.Size = Vector3.new(1,1,1)
+    handle.Transparency = 0.5        -- semi-invisible; change if you want visuals
+    handle.CanCollide = false
+    handle.Massless = true
+    handle.Parent = tool
+
+    -- if tool is currently equipped, the engine will parent the handle into the character automatically
+    -- (no welds needed). If not equipped, it will sit under the tool until equipped.
+    latestHandle = handle
+    return handle
+end
+
+-- Remove the temporary handle (without dropping the tool)
+local function removeTempHandle()
+    if latestHandle then
+        pcall(function() latestHandle:Destroy() end)
+        latestHandle = nil
+    end
+    -- clear target/death conn as well
+    if latestDeathConn then
+        pcall(function() latestDeathConn:Disconnect() end)
+        latestDeathConn = nil
+    end
+    latestTargetModel = nil
+end
+
+-- Explosion: set AssemblyLinearVelocity (and some angular) on each BasePart
+local function explodeCharacterParts(model)
+    if not model then return end
+    -- center for outward direction (use HumanoidRootPart position if present)
+    local centerPart = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso")
+    local centerPos = centerPart and centerPart.Position or (model:GetModelCFrame().p or Vector3.new())
+
+    for _, v in ipairs(model:GetDescendants()) do
+        if v:IsA("BasePart") then
+            pcall(function()
+                -- compute outward direction + slight upward bias
+                local dir = (v.Position - centerPos)
+                if dir.Magnitude < 0.001 then
+                    dir = Vector3.new(math.random()-0.5, 0.5 + math.random()*0.5, math.random()-0.5)
+                end
+                dir = dir.Unit
+                local vel = dir * EXPLOSION_VELOCITY + Vector3.new(0, EXPLOSION_VELOCITY * 0.25, 0)
+                v.AssemblyLinearVelocity = vel
+
+                -- add some angular velocity for visual effect
+                local ang = Vector3.new(
+                    (math.random()-0.5) * 60,
+                    (math.random()-0.5) * 60,
+                    (math.random()-0.5) * 60
+                )
+                v.AssemblyAngularVelocity = ang
+            end)
+        end
+    end
+end
+
+-- Core devour routine (lift + drain, then explosion on death)
+local function performDevourOn(humanoid, model, tool)
+    if not humanoid or not model then return end
+    if isPlayerCharacter(model) then return end
+
+    -- Prevent double-grab
+    if model:FindFirstChild("DevourSoul_Grabbed") then return end
+    local tag = Instance.new("BoolValue")
+    tag.Name = "DevourSoul_Grabbed"
+    tag.Parent = model
+
+    -- If no temporary handle on tool yet, create one now (per request)
+    if tool and tool.Parent then
+        -- create a handle (this replaces any previous handle created)
+        createTempHandleForTool(tool)
+        -- track which model is associated with this handle
+        latestTargetModel = model
+    end
+
+    -- Anchor/attachments/align to lift
+    local hrp = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("LowerTorso") or model:FindFirstChild("Torso")
+    if not hrp or not hrp:IsA("BasePart") then
+        -- no usable part to attach to
+        pcall(function() tag:Destroy() end)
+        return
+    end
+
+    local anchor = Instance.new("Part")
+    anchor.Name = "DevourSoul_Anchor"
+    anchor.Size = ANCHOR_SIZE
+    anchor.Transparency = 1
+    anchor.Anchored = true
+    anchor.CanCollide = false
+    anchor.Massless = true
+    anchor.Parent = Workspace
+    anchor.CFrame = hrp.CFrame
+
+    local attAnchor = Instance.new("Attachment")
+    attAnchor.Name = "Devour_Attach_Anchor"
+    attAnchor.Parent = anchor
+
+    local attHRP = Instance.new("Attachment")
+    attHRP.Name = "Devour_Attach_HRP"
+    attHRP.Parent = hrp
+    attHRP.WorldCFrame = hrp.CFrame
+
+    local alignPos = Instance.new("AlignPosition")
+    alignPos.Name = "Devour_AlignPos"
+    alignPos.Attachment0 = attHRP
+    alignPos.Attachment1 = attAnchor
+    alignPos.RigidityEnabled = true
+    alignPos.MaxForce = ALIGN_MAX_FORCE
+    alignPos.Responsiveness = ALIGN_RESP
+    alignPos.MaxVelocity = math.huge
+    alignPos.Parent = hrp
+
+    local alignOri = Instance.new("AlignOrientation")
+    alignOri.Name = "Devour_AlignOri"
+    alignOri.Attachment0 = attHRP
+    alignOri.Attachment1 = attAnchor
+    alignOri.MaxTorque = 9e9
+    alignOri.Responsiveness = ALIGN_ORI_RESP
+    alignOri.Parent = hrp
+
+    -- compute timed lift so they reach LIFT_STUDS when they die (based on current health & drain)
+    local maxH = (humanoid and humanoid.MaxHealth and humanoid.MaxHealth > 0) and humanoid.MaxHealth or 1
+    local currH = (humanoid and humanoid.Health) and humanoid.Health or maxH
+    local dmgPerSec = (maxH * DRAIN_PCT) / math.max(DRAIN_INTERVAL, 1e-6)
+    local timeToDie = (dmgPerSec > 0) and (currH / dmgPerSec) or 0.1
+    if timeToDie <= 0.001 then timeToDie = 0.1 end
+    local liftTime = timeToDie
+
+    local startY = anchor.Position.Y
+    local targetY = startY + LIFT_STUDS
+    local elapsed = 0
+    local finished = false
+
+    -- Death handling — we want to explode the body and remove the handle when the latest clicked NPC (this target) dies.
+    -- We must avoid race conditions if other clicks replace the latest handle; track which model is latestTargetModel.
+    local function doCleanupAndExplode()
+        if finished then return end
+        finished = true
+
+        -- remove Align/attachment/anchor first so parts are free
+        pcall(function()
+            if alignPos and alignPos.Parent then alignPos:Destroy() end
+            if alignOri and alignOri.Parent then alignOri:Destroy() end
+            if attHRP and attHRP.Parent then attHRP:Destroy() end
+            if attAnchor and attAnchor.Parent then attAnchor:Destroy() end
+            if anchor and anchor.Parent then anchor:Destroy() end
+        end)
+
+        -- explosion visuals (client-side)
+        pcall(function()
+            explodeCharacterParts(model)
+        end)
+
+        -- Remove the temp handle if this model is the latestTargetModel
+        if latestTargetModel == model then
+            removeTempHandle()
+        end
+
+        -- remove tag
+        pcall(function() if tag and tag.Parent then tag:Destroy() end end)
+    end
+
+    -- Connect death directly so explosion runs as soon as the NPC dies
+    local deathConnLocal
+    deathConnLocal = humanoid.Died:Connect(function()
+        doCleanupAndExplode()
+        if deathConnLocal then deathConnLocal:Disconnect() end
+    end)
+
+    -- If this model becomes the "latest clicked", we should ensure old death connection for previously-latest is disconnected
+    -- Manage latestDeathConn so that removeTempHandle also disconnects it
+    if latestDeathConn then
+        pcall(function() latestDeathConn:Disconnect() end)
+        latestDeathConn = nil
+    end
+    latestDeathConn = deathConnLocal
+
+    -- main loop: lift & drain (zero velocities to prevent fling/spin while lifting)
+    local drainAccum = 0
+    local conn
+    conn = RunService.Heartbeat:Connect(function(dt)
+        if finished then
+            conn:Disconnect()
+            return
+        end
+
+        -- lift interpolation
+        elapsed = elapsed + dt
+        local t = math.clamp(elapsed / math.max(liftTime, 1e-6), 0, 1)
+        local eased = t < 0.5 and 8 * t^4 or 1 - (-2 * t + 2)^4 / 2
+        local newY = startY + (targetY - startY) * eased
+
+        -- anchor follows HRP X/Z exactly while moving up
+        pcall(function()
+            if hrp and hrp.Parent then
+                local hrpRot = hrp.CFrame - hrp.CFrame.Position
+                anchor.CFrame = CFrame.new(hrp.Position.X, newY, hrp.Position.Z) * hrpRot
+            end
+        end)
+
+        -- aggressively zero velocities on HRP to avoid fling/spin during lift
+        pcall(function()
+            if hrp and hrp:IsA("BasePart") then
+                hrp.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                hrp.AssemblyAngularVelocity = Vector3.new(0,0,0)
+            end
+        end)
+
+        -- drain health
+        drainAccum = drainAccum + dt
+        while drainAccum >= DRAIN_INTERVAL do
+            drainAccum = drainAccum - DRAIN_INTERVAL
+            local dmg = maxH * DRAIN_PCT
+            pcall(function()
+                if humanoid and humanoid.Health > 0 then
+                    humanoid.Health = math.clamp(humanoid.Health - dmg, 0, humanoid.MaxHealth)
+                end
+            end)
+            if humanoid.Health <= 0 then
+                -- death will trigger humanoid.Died -> doCleanupAndExplode
+                break
+            end
+        end
+
+        -- finish normally when lift completes (if somehow they survive)
+        if t >= 1 then
+            -- finish: cleanup attachments but do not explode unless dead
+            doCleanupAndExplode()
+            conn:Disconnect()
+            return
+        end
+    end)
+end
+
+-- Wire tool click -> target detection (no ClickDetector)
+local function wireTool(tool)
+    if not tool or not tool:IsA("Tool") then return end
+
+    local equippedConn
+    tool.Equipped:Connect(function(mouse)
+        if not mouse then mouse = localPlayer:GetMouse() end
+
+        if equippedConn then
+            equippedConn:Disconnect()
+            equippedConn = nil
+        end
+
+        equippedConn = mouse.Button1Down:Connect(function()
+            local target = mouse.Target
+            if not target then return end
+            local hum, model = findHumanoidFromPart(target)
+            if not hum or not model then return end
+            if isPlayerCharacter(model) then return end
+
+            -- If the user clicked a different NPC: remove previous handle so only latest has handle
+            if latestHandle and latestTargetModel and latestTargetModel ~= model then
+                removeTempHandle()
+            end
+
+            -- create temporary handle and set latestTargetModel inside performDevourOn
+            local toolRef = tool
+            pcall(function()
+                performDevourOn(hum, model, toolRef)
+            end)
+        end)
+    end)
+
+    tool.Unequipped:Connect(function()
+        if equippedConn then
+            equippedConn:Disconnect()
+            equippedConn = nil
+        end
+    end)
+end
+
+-- Setup tool and auto-equip
+local tool = createTool()
+if tool then
+    wireTool(tool)
+
+    local function tryEquip()
+        local char = localPlayer.Character
+        if char then
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            if humanoid and tool.Parent == localPlayer.Backpack then
+                pcall(function() humanoid:EquipTool(tool) end)
+            end
+        end
+    end
+
+    tryEquip()
+    localPlayer.CharacterAdded:Connect(function()
+        task.wait(0.12)
+        tryEquip()
+    end)
+end
