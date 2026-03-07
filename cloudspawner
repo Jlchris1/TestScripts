@@ -1,0 +1,128 @@
+-- Server script: Cloud spawner
+-- Place this in ServerScriptService
+
+local Workspace = game:GetService("Workspace")
+local Debris = game:GetService("Debris")
+
+-- ===== CONFIG =====
+local MIN_SPAWN_DELAY = 15         -- seconds (minimum time between spawns)
+local MAX_SPAWN_DELAY = 30         -- seconds (maximum time between spawns)
+
+local MIN_CLOUD_LIFETIME = 60      -- seconds (1 minute)
+local MAX_CLOUD_LIFETIME = 1200    -- seconds (20 minutes)
+
+-- Default cloud part size (the ParticleEmitter uses Shape = Box + Volume)
+local CLOUD_PART_SIZE = Vector3.new(80, 6, 40)
+
+-- Default spawn area center and extents (if you don't use a CloudSpawnArea part)
+local DEFAULT_SPAWN_CENTER = Vector3.new(0, 120, 0)      -- X, Y, Z
+local DEFAULT_SPAWN_EXTENTS = Vector3.new(400, 0, 400)   -- X, Y, Z extents for randomness
+
+-- Name of optional area part in Workspace you can create to control where clouds spawn.
+-- Create a PART named "CloudSpawnArea" (anchored) and the script will use its Position/Size.
+local SPAWN_AREA_NAME = "CloudSpawnArea"
+-- ==================
+
+-- Create / get container for spawned clouds
+local cloudsFolder = Workspace:FindFirstChild("Clouds")
+if not cloudsFolder then
+    cloudsFolder = Instance.new("Folder")
+    cloudsFolder.Name = "Clouds"
+    cloudsFolder.Parent = Workspace
+end
+
+-- Helper to get spawn center & extents
+local function getSpawnArea()
+    local area = Workspace:FindFirstChild(SPAWN_AREA_NAME)
+    if area and area:IsA("BasePart") then
+        return area.Position, area.Size
+    else
+        return DEFAULT_SPAWN_CENTER, DEFAULT_SPAWN_EXTENTS
+    end
+end
+
+-- returns a random position inside the area (keeps Y = center.Y)
+local function randomSpawnPosition()
+    local center, extents = getSpawnArea()
+    local x = center.X + (math.random() - 0.5) * extents.X
+    local z = center.Z + (math.random() - 0.5) * extents.Z
+    local y = center.Y
+    return Vector3.new(x, y, z)
+end
+
+-- Create a cloud (part + particle emitter). Returns the Part.
+local function createCloud()
+    local spawnPos = randomSpawnPosition()
+    local lifetime = math.random(MIN_CLOUD_LIFETIME, MAX_CLOUD_LIFETIME)
+
+    -- Invisible anchor part, particles are emitted relative to this
+    local part = Instance.new("Part")
+    part.Size = CLOUD_PART_SIZE
+    part.Anchored = true
+    part.CanCollide = false
+    part.Transparency = 1
+    part.Position = spawnPos
+    part.Name = "Cloud"
+    part.Parent = cloudsFolder
+
+    -- ParticleEmitter
+    local em = Instance.new("ParticleEmitter")
+    em.Name = "CloudEmitter"
+
+    -- texture you requested
+    em.Texture = "rbxasset://textures/particles/smoke_main.dds"
+
+    -- appearance & behavior
+    em.Rate = 200
+    em.Speed = NumberRange.new(0)                   -- speed 0 (particles stay with the part)
+    em.Lifetime = NumberRange.new(6, 12)           -- particles themselves live ~6-12s
+    em.Size = NumberSequence.new({                 -- nice fluffy sizes (tweak as desired)
+        NumberSequenceKeypoint.new(0, 8),
+        NumberSequenceKeypoint.new(1, 14),
+    })
+    em.Transparency = NumberSequence.new(0)        -- fully opaque (you can tweak)
+    em.RotSpeed = NumberRange.new(0)
+    em.EmissionDirection = Enum.NormalId.Top
+    em.SpreadAngle = Vector2.new(0, 0)
+    em.Rotation = NumberRange.new(0)
+    em.RotSpeed = NumberRange.new(0)
+    em.VelocitySpread = 0
+
+    -- emitter shape to fill a box volume (so cloud looks thick)
+    em.Shape = Enum.ParticleEmitterShape.Box
+    em.ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume
+    em.ShapeInOut = Enum.ParticleEmitterShapeInOut.Outward
+
+    em.Parent = part
+    em.Enabled = true
+
+    -- schedule disabling/destroying
+    -- we disable emitter after `lifetime` seconds, then wait a bit for existing particles to die,
+    -- then destroy the whole part. The particle lifetime above is 6-12s, so wait a small buffer.
+    task.delay(lifetime, function()
+        if em and em.Parent then
+            em.Enabled = false
+        end
+        local buffer = 20
+        task.delay(buffer, function()
+            if part and part.Parent then
+                part:Destroy()
+            end
+        end)
+    end)
+
+    return part
+end
+
+-- Spawner loop (safe pcall so one error won't stop the loop)
+spawn(function()
+    while true do
+        local delayTime = math.random(MIN_SPAWN_DELAY, MAX_SPAWN_DELAY)
+        task.wait(delayTime)
+        local ok, err = pcall(createCloud)
+        if not ok then
+            warn("Cloud spawner error:", err)
+            -- continue loop even after an error
+        end
+    end
+end)
