@@ -1,0 +1,200 @@
+-- TornadoGUIClient.lua (LocalScript)
+-- Place this LocalScript in StarterPlayerScripts (or StarterGui). It listens for server telling it to open GUI,
+-- builds the GUI locally, parses TextBoxes robustly, and fires RemoteEvents to the server.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+
+-- Wait for TornadoEvents in ReplicatedStorage
+local tornadoFolder = ReplicatedStorage:WaitForChild("TornadoEvents")
+local OpenGUI = tornadoFolder:WaitForChild("OpenGUI")
+local SummonTornado = tornadoFolder:WaitForChild("SummonTornado")
+local UpdateTornadoParams = tornadoFolder:WaitForChild("UpdateTornadoParams")
+
+-- Copy of clamp/config we need client-side for parsing defaults and UI constraints (kept small)
+local CONFIG = {
+	FUNNEL_MIN_DIAMETER = 40,
+	FUNNEL_MAX_DIAMETER = 5000,
+	WINDFIELD_BUFFER = 20,
+	MAIN_FUNNEL_LIMIT = 2048,
+	TORNADO_LIFESPAN_MIN = 1,
+	TORNADO_LIFESPAN_MAX = 720,
+}
+
+local function clamp(v,a,b) if v < a then return a elseif v > b then return b else return v end end
+
+-- robust parsing for numbers on client (commas/spaces allowed)
+local function parseNumber(txt, fallback)
+	if txt == nil then return fallback end
+	local s = tostring(txt)
+	-- remove commas and whitespace
+	s = s:gsub(",", ""):gsub("%s+", "")
+	-- match initial numeric substring (handles "300.5abc" -> "300.5")
+	local m = s:match("^([+-]?%d+%.?%d*)") or s:match("^([+-]?%d*%.%d+)") or s
+	local n = tonumber(m) or tonumber(s)
+	if not n then return fallback end
+	return n
+end
+
+-- Debounce helper for live updates
+local function debounceFunction(delay)
+	local busy = false
+	return function(fn)
+		if busy then return end
+		busy = true
+		task.delay(delay or 0.12, function()
+			pcall(fn)
+			busy = false
+		end)
+	end
+end
+
+-- Build GUI when OpenGUI is fired by server
+OpenGUI.OnClientEvent:Connect(function(defaults)
+	-- ensure defaults exist
+	defaults = defaults or {funnelDiameter = 300, windfieldRadius = 360, windspeedMPH = 200, moveSpeed = 3, lifespan = 420}
+
+	-- Avoid duplicates
+	if player:FindFirstChildOfClass("PlayerGui"):FindFirstChild("TornadoSummonGUI") then
+		player:FindFirstChildOfClass("PlayerGui").TornadoSummonGUI:Destroy()
+	end
+
+	-- create ScreenGui
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "TornadoSummonGUI"
+	screenGui.ResetOnSpawn = false
+	screenGui.Parent = player:WaitForChild("PlayerGui")
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Panel"
+	frame.Size = UDim2.new(0, 300, 0, 320)
+	frame.Position = UDim2.new(0.5, -150, 0.12, 0)
+	frame.BackgroundColor3 = Color3.fromRGB(28,28,30)
+	frame.BorderSizePixel = 0
+	frame.Parent = screenGui
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, 0, 0, 36)
+	title.Position = UDim2.new(0,0,0,0)
+	title.BackgroundTransparency = 1
+	title.Text = "Tornado Summon"
+	title.Font = Enum.Font.SourceSansBold
+	title.TextSize = 20
+	title.TextColor3 = Color3.new(1,1,1)
+	title.Parent = frame
+
+	local baseY = 44
+	local function makeLabelAndBox(name, hint, default, y, boxName)
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(0, 120, 0, 24)
+		lbl.Position = UDim2.new(0, 8, 0, baseY + y)
+		lbl.BackgroundTransparency = 1
+		lbl.Text = name .. ":"
+		lbl.Font = Enum.Font.SourceSans
+		lbl.TextSize = 16
+		lbl.TextColor3 = Color3.new(1,1,1)
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.Parent = frame
+
+		local box = Instance.new("TextBox")
+		box.Name = boxName or "Box"
+		box.Size = UDim2.new(0, 160, 0, 24)
+		box.Position = UDim2.new(0, 140, 0, baseY + y)
+		box.ClearTextOnFocus = false
+		box.Text = tostring(default or "")
+		box.PlaceholderText = hint or ""
+		box.Font = Enum.Font.SourceSans
+		box.TextSize = 16
+		box.TextColor3 = Color3.fromRGB(0,0,0)
+		box.BackgroundColor3 = Color3.fromRGB(240,240,240)
+		box.Parent = frame
+		return lbl, box
+	end
+
+	local _, funnelBox = makeLabelAndBox("Funnel Diameter (studs)", "e.g. 300", defaults.funnelDiameter or 300, 0, "FunnelBox")
+	local _, windfieldBox = makeLabelAndBox("Windfield Radius (studs)", "e.g. 350", defaults.windfieldRadius or math.max(defaults.funnelDiameter + CONFIG.WINDFIELD_BUFFER, defaults.funnelDiameter * 1.2), 36, "WindfieldBox")
+	local _, windspeedBox = makeLabelAndBox("Windspeed (MPH)", "e.g. 200", defaults.windspeedMPH or 200, 72, "WindspeedBox")
+	local _, moveBox = makeLabelAndBox("Movement Speed (studs/s)", "e.g. 3", defaults.moveSpeed or 3, 108, "MoveBox")
+	local _, lifeBox = makeLabelAndBox("Lifespan (s)", "e.g. 60", defaults.lifespan or 420, 144, "LifeBox")
+
+	local summonBtn = Instance.new("TextButton")
+	summonBtn.Size = UDim2.new(0, 110, 0, 34)
+	summonBtn.Position = UDim2.new(0.5, -55, 1, -46)
+	summonBtn.Text = "Summon"
+	summonBtn.Font = Enum.Font.SourceSansBold
+	summonBtn.TextSize = 18
+	summonBtn.BackgroundColor3 = Color3.fromRGB(52, 120, 255)
+	summonBtn.TextColor3 = Color3.new(1,1,1)
+	summonBtn.Parent = frame
+
+	-- parse/read fields locally before sending to server
+	local function readFields()
+		local fd = clamp(parseNumber(funnelBox.Text, defaults.funnelDiameter or 300), CONFIG.FUNNEL_MIN_DIAMETER, CONFIG.FUNNEL_MAX_DIAMETER)
+		local wrDefault = math.max(fd + CONFIG.WINDFIELD_BUFFER, fd * 1.2)
+		local wr = clamp(parseNumber(windfieldBox.Text, wrDefault), fd + CONFIG.WINDFIELD_BUFFER, fd * 12)
+		local ws = clamp(parseNumber(windspeedBox.Text, defaults.windspeedMPH or 200), 1, 20000)
+		local ms = clamp(parseNumber(moveBox.Text, defaults.moveSpeed or 3), 0, 100)
+		local ls = clamp(parseNumber(lifeBox.Text, defaults.lifespan or 420), CONFIG.TORNADO_LIFESPAN_MIN, CONFIG.TORNADO_LIFESPAN_MAX)
+		return fd, wr, ws, ms, ls
+	end
+
+	-- Live update debounce wrapper
+	local debouncedUpdate = debounceFunction(0.12)
+
+	local function pushLiveUpdate()
+		debouncedUpdate(function()
+			local fd, wr, ws, ms, ls = readFields()
+			-- Fire a safe live update to server (server will clamp & validate)
+			pcall(function()
+				UpdateTornadoParams:FireServer({
+					funnelDiameter = fd,
+					windfieldRadius = wr,
+					windspeedMPH = ws,
+					moveSpeed = ms,
+					lifespan = ls
+				})
+			end)
+		end)
+	end
+
+	-- Connect property changed and focus lost for each box (so every change is picked up)
+	local function connectBox(box)
+		box:GetPropertyChangedSignal("Text"):Connect(pushLiveUpdate)
+		box.FocusLost:Connect(function()
+			pushLiveUpdate()
+		end)
+	end
+
+	connectBox(funnelBox)
+	connectBox(windfieldBox)
+	connectBox(windspeedBox)
+	connectBox(moveBox)
+	connectBox(lifeBox)
+
+	-- Summon button: read final values then FireServer SummonTornado
+	summonBtn.MouseButton1Click:Connect(function()
+		local fd, wr, ws, ms, ls = readFields()
+		print(("[TornadoGUI] Summon clicked by %s -> funnelDiameter=%s, windfieldRadius=%s, windspeedMPH=%s, moveSpeed=%s, lifespan=%s")
+			:format(player.Name, tostring(fd), tostring(wr), tostring(ws), tostring(ms), tostring(ls)))
+		-- Fire the server with a single table (server will clamp & validate)
+		pcall(function()
+			SummonTornado:FireServer({
+				funnelDiameter = fd,
+				windfieldRadius = wr,
+				windspeedMPH = ws,
+				moveSpeed = ms,
+				lifespan = ls
+			})
+		end)
+		-- Remove GUI after sending
+		screenGui:Destroy()
+	end)
+
+	-- If player closes GUI manually or dies, cleanup
+	screenGui.Destroying:Connect(function()
+		-- nothing special needed; event connections are local and will get GC'd
+	end)
+end)
