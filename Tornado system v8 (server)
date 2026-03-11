@@ -1,0 +1,1301 @@
+-- StormGeneratorsWithCommands.lua (ServerScriptService)
+-- Modified: funnels touch ground (size = (fd, 600, fd)), particles bigger and EM_RATE=500,
+-- tornadoes lock against future resizes shortly after summon (so older tornadoes are not resized),
+-- multiple simultaneous tornadoes allowed, tornadoes persist after summoner death.
+
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+math.randomseed(tick() + os.time())
+
+-- ================ CONFIG =================
+local CONFIG = {
+	COMMAND_ACCESS = "OwnerOnly",
+	OWNER_USERID = 4603716962,
+	OWNER_FRIEND_IDS = { 4000834716 }, -- added requested userid
+
+	WALLCLOUD_Y = 520,
+	FUNNEL_TOP_Y = 420,
+
+	-- internal tiling limits (NOT clamping user inputs)
+	FUNNEL_MIN_DIAMETER = 40,
+	FUNNEL_MAX_DIAMETER = 5000,
+
+	-- increased particle rate per your request
+	EM_RATE = 500,
+	PARTICLE_TEXTURE = "rbxasset://textures/particles/smoke_main.dds",
+	PARTICLE_LIFETIME = {3, 10},
+
+	MAX_PARTICLE_SIZE = 10000,
+	MAX_PARTICLE_BASE = 5000,
+
+	WINDFIELD_BUFFER = 20,
+
+	BODYVELOCITY_MAXFORCE = 1e6,
+	UPDATE_RATE = 0.04,
+
+	TORNADO_LIFESPAN_MIN = 1,
+	TORNADO_LIFESPAN_MAX = 720,
+
+	WHITELIST_FOLDER_NAME = "Whitelisted",
+	CLOUDS_FOLDER_NAME = "Clouds",
+
+	FUNNEL_MAX_VERTICAL_SPAN = 900,
+	GUI_NAME = "TornadoSummonGUI",
+
+	-- lift/mass tuning
+	LIFT_VERTICAL_MULT = 0.8,
+	MASS_SCALE = 0.025,
+	MAX_VERTICAL_VEL = 6000,
+	MAX_TOSS_VEL = 8000,
+
+	-- fling altitude threshold
+	TOSS_Y = 300,
+
+	-- when funnelDiameter bigger than this, create multiple wallcloud parts
+	CLOUD_PART_SIZE_LIMIT = 500,
+
+	-- tiling only
+	MAIN_FUNNEL_LIMIT = 2048,
+	MPH_PULL_MULT = 0.18,
+	TOSS_VEL_MULT = 6,
+	UNANCHOR_MPH_THRESHOLD = 100,
+	CATASTROPHIC_MPH = 500,
+	RIP_MPH = 280,
+}
+-- =========================================
+
+-- Ensure Whitelisted folder exists
+local whitelistFolder = Workspace:FindFirstChild(CONFIG.WHITELIST_FOLDER_NAME)
+if not whitelistFolder then
+	whitelistFolder = Instance.new("Folder")
+	whitelistFolder.Name = CONFIG.WHITELIST_FOLDER_NAME
+	whitelistFolder.Parent = Workspace
+end
+
+-- Registry of active tornado records (allows many)
+local activeTornadoes = {} -- array of records
+
+-- helpers
+local function GUID() return HttpService:GenerateGUID(false) end
+local function rnd(a,b) return a + math.random() * (b - a) end
+local function clamp(v,a,b) if v < a then return a elseif v > b then return b else return v end end
+local function lerp(a,b,t) return a + (b-a)*t end
+
+local function isWhitelisted(inst)
+	if not inst then return false end
+	if whitelistFolder and inst:IsDescendantOf(whitelistFolder) then return true end
+	if inst.Name == "Baseplate" then return true end
+	return false
+end
+
+local function modelMass(m)
+	local sum = 0
+	for _, d in ipairs(m:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local ok, mass = pcall(function() return d:GetMass() end)
+			if ok and mass then sum = sum + mass end
+		end
+	end
+	return sum
+end
+
+local function destroyAllWeldsAndAttachments(model)
+	for _, inst in ipairs(model:GetDescendants()) do
+		if inst:IsA("WeldConstraint") or inst:IsA("Weld") or inst:IsA("Motor6D") or inst:IsA("HingeConstraint") or inst:IsA("BallSocketConstraint") or inst:IsA("RodConstraint") or inst:IsA("Attachment") or inst:IsA("AlignPosition") or inst:IsA("AlignOrientation") or inst:IsA("VectorForce") or inst:IsA("Constraint") then
+			pcall(function() inst:Destroy() end)
+		else
+			local t = inst.ClassName:lower()
+			if string.find(t, "weld") or string.find(t, "constraint") then pcall(function() inst:Destroy() end) end
+		end
+	end
+end
+
+-- Particle emitter helper: NO VelocityInheritance; rate forced to CONFIG.EM_RATE (increased)
+local function attachEmitter(part, baseScale)
+	local em = Instance.new("ParticleEmitter")
+	em.Name = "CloudEmitter"
+	em.Texture = CONFIG.PARTICLE_TEXTURE
+	em.Speed = NumberRange.new(0)
+	em.Rate = CONFIG.EM_RATE
+	em.Lifetime = NumberRange.new(CONFIG.PARTICLE_LIFETIME[1], CONFIG.PARTICLE_LIFETIME[2])
+	baseScale = baseScale or 1
+	local largest = math.max(part.Size.X, part.Size.Y, part.Size.Z)
+	-- larger base particle sizing so small funnels look fuller (kept within MAX_PARTICLE_BASE)
+	local s0 = clamp(math.max(1.0, largest / 15) * baseScale, 0.8, CONFIG.MAX_PARTICLE_BASE)
+	local s1 = clamp(s0 * 1.9, s0, CONFIG.MAX_PARTICLE_SIZE)
+	em.Size = NumberSequence.new{ NumberSequenceKeypoint.new(0, s0), NumberSequenceKeypoint.new(1, s1) }
+	em.Transparency = NumberSequence.new(0)
+	em.RotSpeed = NumberRange.new(40,320)
+	em.EmissionDirection = Enum.NormalId.Top
+	em.SpreadAngle = Vector2.new(0,0)
+	em.VelocitySpread = 0
+	em.Parent = part
+	em.Enabled = true
+	return em
+end
+
+local function spawnWallCloudGroup(centerX, centerZ, wcRadius, numCloudParts)
+	numCloudParts = math.max(1, math.floor(numCloudParts or 1))
+	local folder = Instance.new("Folder")
+	folder.Name = "WallCloudGroup_" .. GUID()
+	folder.Parent = Workspace
+	local cloudParts = {}
+
+	for i = 1, numCloudParts do
+		local p = Instance.new("Part")
+		p.Name = "WallCloudPart_"..i.."_"..GUID()
+		p.Size = Vector3.new(wcRadius*2, 20, wcRadius*2)
+		p.Anchored = true
+		p.CanCollide = false
+		p.Transparency = 1
+		local offset = Vector3.new(0,0,0)
+		if numCloudParts > 1 then
+			local angle = (i/numCloudParts) * math.pi * 2 + rnd(-0.2,0.2)
+			local ringRadius = math.max(0, wcRadius * 0.18) * (i-1)
+			offset = Vector3.new(math.cos(angle)*ringRadius, 0, math.sin(angle)*ringRadius)
+		end
+		p.Position = Vector3.new(centerX, CONFIG.WALLCLOUD_Y, centerZ) + offset
+		p.Parent = folder
+		local em = attachEmitter(p, 6.0 + (i-1)*1.2)
+		em.Rate = CONFIG.EM_RATE
+		em.Shape = Enum.ParticleEmitterShape.Sphere
+		em.ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume
+		em.EmissionDirection = Enum.NormalId.Top
+		em.Color = ColorSequence.new(Color3.fromRGB(185,185,190))
+		cloudParts[#cloudParts+1] = {part = p, emitter = em}
+	end
+
+	return {folder = folder, parts = cloudParts, radius = wcRadius}
+end
+
+local function ensureBV(hrp)
+	if not hrp then return nil end
+	local existing = hrp:FindFirstChild("TornadoBV")
+	if existing and existing:IsA("BodyVelocity") then return existing end
+	local bv = Instance.new("BodyVelocity")
+	bv.Name = "TornadoBV"
+	bv.MaxForce = Vector3.new(CONFIG.BODYVELOCITY_MAXFORCE, CONFIG.BODYVELOCITY_MAXFORCE, CONFIG.BODYVELOCITY_MAXFORCE)
+	bv.Velocity = Vector3.new(0,0,0)
+	bv.Parent = hrp
+	return bv
+end
+
+-- toss helpers and "one-shot" tracking
+local tossedHRPs = {}    -- [hrp] = true when already flung
+local tossedParts = {}   -- [part] = true
+local tossedModels = {}  -- [model] = true
+
+local function markClearedToss(inst)
+	if inst == nil then return end
+	pcall(function()
+		if typeof(inst) == "Instance" then
+			if inst:IsA("BasePart") then tossedParts[inst] = nil end
+			if inst:IsA("Model") then tossedModels[inst] = nil end
+			if inst.Name == "HumanoidRootPart" or inst:IsA("BasePart") then tossedHRPs[inst] = nil end
+		end
+	end)
+end
+
+local function tossHRP_oneShot(hrp, centerPos, windspeedMPH)
+	if not hrp or not hrp.Parent then return end
+	if tossedHRPs[hrp] then return end
+	tossedHRPs[hrp] = true
+	if hrp:FindFirstChild("TornadoBV") then pcall(function() hrp.TornadoBV:Destroy() end) end
+	local dir = hrp.Position - centerPos
+	if dir.Magnitude == 0 then dir = Vector3.new(0,1,0) end
+	local horiz = Vector3.new(dir.X,0,dir.Z)
+	if horiz.Magnitude == 0 then horiz = Vector3.new(1,0,0) end
+	local away = horiz.Unit
+	local mag = math.min(windspeedMPH * CONFIG.TOSS_VEL_MULT, CONFIG.MAX_TOSS_VEL)
+	pcall(function() hrp.AssemblyLinearVelocity = away * mag + Vector3.new(0, math.max(10, windspeedMPH * 0.3), 0) end)
+end
+
+local function tossPart_oneShot(part, centerPos, windspeedMPH)
+	if not part or not part.Parent then return end
+	if tossedParts[part] then return end
+	tossedParts[part] = true
+	local dir = part.Position - centerPos
+	if dir.Magnitude == 0 then dir = Vector3.new(0,1,0) end
+	local horiz = Vector3.new(dir.X,0,dir.Z)
+	if horiz.Magnitude == 0 then horiz = Vector3.new(1,0,0) end
+	local away = horiz.Unit
+	local mag = math.min(windspeedMPH * CONFIG.TOSS_VEL_MULT, CONFIG.MAX_TOSS_VEL)
+	pcall(function() part.AssemblyLinearVelocity = away * mag + Vector3.new(0, math.max(10, windspeedMPH * 0.3), 0) end)
+end
+
+local function tossModel_oneShot(model, centerPos, windspeedMPH)
+	if not model then return end
+	if tossedModels[model] then return end
+	tossedModels[model] = true
+	local dir = (model.PrimaryPart and (model.PrimaryPart.Position - centerPos)) or (model:GetModelCFrame().p - centerPos)
+	if dir.Magnitude == 0 then dir = Vector3.new(0,1,0) end
+	local horiz = Vector3.new(dir.X,0,dir.Z)
+	if horiz.Magnitude == 0 then horiz = Vector3.new(1,0,0) end
+	local away = horiz.Unit
+	local mag = math.min(windspeedMPH * CONFIG.TOSS_VEL_MULT, CONFIG.MAX_TOSS_VEL)
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") then
+			pcall(function()
+				if p:FindFirstChild("TornadoBV") then p.TornadoBV:Destroy() end
+				p.AssemblyLinearVelocity = away * mag + Vector3.new(0, math.max(10, windspeedMPH * 0.3), 0)
+			end)
+		end
+	end
+end
+
+-- compute horizontal drag & vertical lift with mass factor
+-- returns targetVelocity (Vec3) and distH
+local function computeDragAndLift(partPos, centerPos, funnelDiameter, windfield, windspeedMPH, mass)
+	local horizVec = Vector3.new(centerPos.X - partPos.X, 0, centerPos.Z - partPos.Z)
+	local distH = horizVec.Magnitude
+	if distH < 0.001 then horizVec = Vector3.new(1,0,0); distH = 1 end
+	local horizDir = horizVec.Unit
+
+	local proximity = 1 - clamp(distH / (windfield + 1), 0, 1) -- 0..1
+	local proximityBoost = 1 + (proximity ^ 1.6) * 2.0
+
+	local horizBase = math.max(1, (windspeedMPH * CONFIG.MPH_PULL_MULT) * (0.5 + proximity * 1.8))
+	local massFactor = 1 + (mass * CONFIG.MASS_SCALE)
+	local horizMag = (horizBase * proximityBoost) / massFactor
+
+	local horizontalVelocity = horizDir * horizMag
+
+	local innerLiftRadius = windfield / 3
+	local verticalVelocity = 0
+	if distH <= innerLiftRadius then
+		local idealVertical = windspeedMPH * CONFIG.LIFT_VERTICAL_MULT
+		verticalVelocity = idealVertical / massFactor
+		verticalVelocity = clamp(verticalVelocity, 0, CONFIG.MAX_VERTICAL_VEL)
+	end
+
+	return Vector3.new(horizontalVelocity.X, verticalVelocity, horizontalVelocity.Z), distH
+end
+
+local function chooseSizeAndWindspeed()
+	if math.random() < 0.03 then
+		return 300, math.random(200,600)
+	end
+	local r = math.random()
+	if r < 0.6 then
+		return math.random(60,300), math.random(60,160)
+	elseif r < 0.9 then
+		return math.random(300,700), math.random(140,240)
+	else
+		return math.random(700, CONFIG.FUNNEL_MAX_DIAMETER), math.random(220, 2000)
+	end
+end
+
+local function sampleLifespan()
+	local r = math.random()
+	if r < 0.03 then return 240 elseif r > 0.97 then return 720 else return 420 + math.random(-90,90) end
+end
+
+local function tryImmediatePickupForDescendant(desc, lowerPart, windfieldRadius, windspeedMPH)
+	if not desc or not desc.Parent or not lowerPart then return end
+	if isWhitelisted(desc) then return end
+	if desc:IsA("BasePart") then
+		local d = (desc.Position - lowerPart.Position).Magnitude
+		if d <= windfieldRadius then
+			local proximity = 1 - clamp(d / (windfieldRadius + 1), 0, 1)
+			pcall(function()
+				desc.Anchored = false
+				local dir = (lowerPart.Position - desc.Position)
+				if dir.Magnitude > 0 then dir = dir.Unit else dir = Vector3.new(0,1,0) end
+				local tang = Vector3.new(-dir.Z, 0, dir.X)
+				local scale = math.max(0.08, proximity)
+				desc.AssemblyLinearVelocity = tang * (math.max(10, (windspeedMPH/80)*40) * scale) + Vector3.new(0, math.max(8, windspeedMPH*0.16) * scale, 0)
+			end)
+		end
+	elseif desc:IsA("Model") then
+		for _, part in ipairs(desc:GetDescendants()) do
+			if part:IsA("BasePart") and not isWhitelisted(part) then
+				if (part.Position - lowerPart.Position).Magnitude <= windfieldRadius then
+					pcall(function()
+						for _, p in ipairs(desc:GetDescendants()) do
+							if p:IsA("BasePart") and not isWhitelisted(p) then
+								p.Anchored = false
+								local d = (p.Position - lowerPart.Position).Magnitude
+								local proximity = 1 - clamp(d / (windfieldRadius + 1), 0, 1)
+								local scale = math.max(0.06, proximity)
+								p.AssemblyLinearVelocity = Vector3.new((p.Position - lowerPart.Position).Unit.X * (math.max(6, (windspeedMPH/80)*20) * scale),
+									math.max(8, windspeedMPH*0.14) * scale,
+									(p.Position - lowerPart.Position).Unit.Z * (math.max(6, (windspeedMPH/80)*20) * scale))
+							end
+						end
+					end)
+					break
+				end
+			end
+		end
+	end
+end
+
+-- Cleanup helper for tornado record
+local function cleanupTornadoRecord(rec)
+	if not rec then return end
+	if rec.forceEnd then return end
+	rec.forceEnd = true
+	if rec.cleanupConns then
+		for _, c in ipairs(rec.cleanupConns) do
+			if c and c.Connected then pcall(function() c:Disconnect() end) end
+		end
+	end
+	if rec.charConns then
+		for _, c in ipairs(rec.charConns) do
+			if c and c.Connected then pcall(function() c:Disconnect() end) end
+		end
+	end
+	if rec.wcGroup and rec.wcGroup.folder and rec.wcGroup.folder.Parent then
+		pcall(function() rec.wcGroup.folder:Destroy() end)
+	elseif rec.wcGroup and rec.wcGroup.parts then
+		for _, ent in ipairs(rec.wcGroup.parts) do
+			if ent.part and ent.part.Parent then ent.part:Destroy() end
+		end
+		if rec.wcGroup.folder and rec.wcGroup.folder.Parent then rec.wcGroup.folder:Destroy() end
+	end
+	if rec.bigSound and rec.bigSound.Parent then
+		pcall(function() rec.bigSound:Stop() end)
+		pcall(function() rec.bigSound:Destroy() end)
+	end
+	if rec.pausedSounds then
+		for _, s in ipairs(rec.pausedSounds) do
+			pcall(function() if s and s.Parent and not s.Playing then s:Play() end end)
+		end
+	end
+	if rec.funnelParts then
+		for _, fp in ipairs(rec.funnelParts) do
+			pcall(function() if fp.upper and fp.upper.Parent then fp.upper:Destroy() end end)
+			pcall(function() if fp.center and fp.center.Parent then fp.center:Destroy() end end)
+			pcall(function() if fp.lower and fp.lower.Parent then fp.lower:Destroy() end end)
+		end
+	end
+	if rec.activeBV then
+		for hrp, info in pairs(rec.activeBV) do
+			if info.bv and info.bv.Parent then info.bv:Destroy() end
+		end
+	end
+	-- remove from global registry
+	for i = #activeTornadoes, 1, -1 do
+		if activeTornadoes[i] == rec then
+			table.remove(activeTornadoes, i)
+			break
+		end
+	end
+end
+
+-- MAIN SPAWNER (summon-only)
+function spawnTornadoAt(spawnX, spawnZ, params, immediateFormation)
+	params = params or {}
+	local ownerUserId = params.ownerUserId
+
+	print(("[Tornado] spawnTornadoAt called by ownerUserId=%s at (%.2f, %.2f) with funnelDiameter=%s windspeedMPH=%s windfieldRadius=%s moveSpeed=%s lifespan=%s")
+		:format(tostring(ownerUserId), tonumber(spawnX) or 0, tonumber(spawnZ) or 0,
+			tostring(params.funnelDiameter), tostring(params.windspeedMPH), tostring(params.windfieldRadius), tostring(params.moveSpeed), tostring(params.lifespan)))
+
+	local origin = Vector3.new(spawnX, CONFIG.WALLCLOUD_Y + 200, spawnZ)
+	local rr2 = Workspace:Raycast(origin, Vector3.new(0, -10000, 0), RaycastParams.new())
+	if not rr2 or not rr2.Position then
+		warn(("[Tornado] No valid ground found near spawn. Aborting. origin=%s"):format(tostring(origin)))
+		return
+	end
+	local groundY = rr2.Position.Y
+
+	local funnelDiameter, windspeedMPH = params.funnelDiameter, params.windspeedMPH
+	if not funnelDiameter or not windspeedMPH then
+		local a,b = chooseSizeAndWindspeed()
+		funnelDiameter = funnelDiameter or a
+		windspeedMPH = windspeedMPH or b
+	end
+
+	-- accept numeric (no clamping)
+	funnelDiameter = tonumber(funnelDiameter) or funnelDiameter or 300
+	windspeedMPH = tonumber(windspeedMPH) or windspeedMPH or 200
+
+	local wallcloudDiameter = funnelDiameter * 6
+	local wallcloudRadius = wallcloudDiameter / 2
+
+	local numCloudParts = math.max(1, math.ceil(funnelDiameter / CONFIG.CLOUD_PART_SIZE_LIMIT))
+
+	local windfieldRadius = tonumber(params.windfieldRadius) or params.windfieldRadius or math.max(funnelDiameter + CONFIG.WINDFIELD_BUFFER, funnelDiameter * 1.2)
+	local moveSpeed = tonumber(params.moveSpeed) or params.moveSpeed or rnd(0.2, 6.0)
+	local lifespan = tonumber(params.lifespan) or params.lifespan or sampleLifespan()
+
+	local wcGroup = nil
+	if params.preSpawnedWallcloud and params.preSpawnedWallcloud.parts then
+		wcGroup = params.preSpawnedWallcloud
+		for _, entry in ipairs(wcGroup.parts) do
+			if entry.part and entry.part.Parent then
+				entry.part.Size = Vector3.new(wallcloudDiameter, 20, wallcloudDiameter)
+			end
+		end
+		wcGroup.radius = wallcloudRadius
+	else
+		wcGroup = spawnWallCloudGroup(spawnX, spawnZ, wallcloudRadius, numCloudParts)
+	end
+
+	print(("[Tornado] Spawned wallcloud group at %.1f, %.1f (%d parts) wallcloudDiameter=%.1f"):format(spawnX, spawnZ, numCloudParts, wallcloudDiameter))
+
+	if not immediateFormation then
+		local timer = rnd(4, 14)
+		local last = tick()
+		while timer > 0 and wcGroup and wcGroup.parts and #wcGroup.parts>0 do
+			if math.random() < 0.015 then
+				if wcGroup and wcGroup.folder and wcGroup.folder.Parent then wcGroup.folder:Destroy() end
+				warn("[Tornado] Wallcloud dissipated before forming.")
+				return
+			end
+			local now = tick()
+			local dt = now - last
+			last = now
+			timer = timer - dt
+			for _, ent in ipairs(wcGroup.parts) do
+				if ent.part and ent.part.Parent then
+					local cur = ent.part.Position
+					local newY = math.max(CONFIG.FUNNEL_TOP_Y + 40, cur.Y - 1.0 * dt)
+					ent.part.Position = Vector3.new(cur.X, newY, cur.Z)
+				end
+			end
+			task.wait(0.12)
+		end
+	end
+
+	-- tiling
+	local mainDia = math.min(CONFIG.MAIN_FUNNEL_LIMIT, funnelDiameter)
+	local tilesPerAxis = math.max(1, math.ceil(funnelDiameter / mainDia))
+	local halfTiles = math.floor((tilesPerAxis-1)/2)
+
+	local funnelParts = {}
+	local centerOffsets = {}
+	local tileSize = mainDia
+	for ix = -halfTiles, halfTiles do
+		for iz = -halfTiles, halfTiles do
+			local offsetX = ix * tileSize
+			local offsetZ = iz * tileSize
+			table.insert(centerOffsets, Vector3.new(offsetX, 0, offsetZ))
+		end
+	end
+
+	-- create parts for each tile
+	for i, offset in ipairs(centerOffsets) do
+		local upperPart = Instance.new("Part")
+		upperPart.Name = "Funnel_Upper_" .. GUID()
+		-- PER REQUEST: set Y to 600 so funnel visually spans downwards (fd, 600, fd)
+		upperPart.Size = Vector3.new(mainDia, 600, mainDia)
+		upperPart.Anchored = true
+		upperPart.CanCollide = false
+		upperPart.Transparency = 1
+		upperPart.Position = Vector3.new(spawnX + offset.X, CONFIG.FUNNEL_TOP_Y, spawnZ + offset.Z)
+		upperPart.Parent = Workspace
+		local upperEm = attachEmitter(upperPart, 3.0)
+
+		local centerPart = Instance.new("Part")
+		centerPart.Name = "Funnel_Center_" .. GUID()
+		centerPart.Size = Vector3.new(mainDia, 600, mainDia)
+		centerPart.Anchored = true
+		centerPart.CanCollide = false
+		centerPart.Transparency = 1
+		centerPart.Position = upperPart.Position
+		centerPart.Parent = Workspace
+		local centerEm = attachEmitter(centerPart, 2.5)
+
+		local lowerPart = Instance.new("Part")
+		lowerPart.Name = "Funnel_Lower_" .. GUID()
+		lowerPart.Size = Vector3.new(mainDia, 600, mainDia)
+		lowerPart.Anchored = true
+		lowerPart.CanCollide = false
+		lowerPart.Transparency = 1
+		lowerPart.Position = upperPart.Position
+		lowerPart.Parent = Workspace
+		local lowerEm = attachEmitter(lowerPart, 2.0)
+
+		funnelParts[#funnelParts + 1] = {
+			upper = upperPart,
+			upperEm = upperEm,
+			center = centerPart,
+			centerEm = centerEm,
+			lower = lowerPart,
+			lowerEm = lowerEm,
+			offset = offset
+		}
+	end
+
+	-- central lower part reference
+	local centralLower, centralCenter, centralUpper
+	for _, fp in ipairs(funnelParts) do
+		if fp.offset.X == 0 and fp.offset.Z == 0 then
+			centralLower = fp.lower
+			centralCenter = fp.center
+			centralUpper = fp.upper
+			break
+		end
+	end
+	if not centralLower then
+		centralLower = funnelParts[1].lower
+		centralCenter = funnelParts[1].center
+		centralUpper = funnelParts[1].upper
+	end
+
+	local bigTornado = (funnelDiameter >= 300 and windspeedMPH >= 200)
+	local pausedSounds = {}
+	local bigSound = nil
+	if bigTornado then
+		for _, ent in ipairs(wcGroup.parts) do
+			if ent.emitter then ent.emitter.Color = ColorSequence.new(Color3.fromRGB(0,0,0)) end
+			if ent.part then ent.part.Size = Vector3.new(wallcloudDiameter, 20, wallcloudDiameter) end
+		end
+		for _, fp in ipairs(funnelParts) do
+			if fp.upperEm then fp.upperEm.Color = ColorSequence.new(Color3.fromRGB(0,0,0)) end
+			if fp.centerEm then fp.centerEm.Color = ColorSequence.new(Color3.fromRGB(0,0,0)) end
+			if fp.lowerEm then fp.lowerEm.Color = ColorSequence.new(Color3.fromRGB(0,0,0)) end
+		end
+		bigSound = Instance.new("Sound")
+		bigSound.Name = "TornadoRoar_Mega"
+		bigSound.SoundId = "rbxassetid://75503031736192"
+		bigSound.Looped = true
+		bigSound.Volume = 1
+		pcall(function() bigSound.RollOffMode = Enum.RollOffMode.Linear end)
+		pcall(function() bigSound.MaxDistance = 100000 end)
+		bigSound.Parent = Workspace
+		for _, s in ipairs(Workspace:GetDescendants()) do
+			if s:IsA("Sound") and s.Playing and s ~= bigSound then
+				pausedSounds[#pausedSounds+1] = s
+				pcall(function() s:Pause() end)
+			end
+		end
+		pcall(function() bigSound:Play() end)
+	else
+		for _, ent in ipairs(wcGroup.parts) do
+			if ent.emitter then ent.emitter.Color = ColorSequence.new(Color3.fromRGB(185,185,190)) end
+			if ent.part then ent.part.Size = Vector3.new(wallcloudDiameter, 20, wallcloudDiameter) end
+		end
+		for _, fp in ipairs(funnelParts) do
+			if fp.upperEm then fp.upperEm.Color = ColorSequence.new(Color3.fromRGB(185,185,190)) end
+			if fp.centerEm then fp.centerEm.Color = ColorSequence.new(Color3.fromRGB(185,185,190)) end
+			if fp.lowerEm then fp.lowerEm.Color = ColorSequence.new(Color3.fromRGB(185,185,190)) end
+		end
+	end
+
+	local swirl = { theta = rnd(0, math.pi*2), omega = rnd(6.0, 22.0), amp = 22.0, jitterTimer = rnd(0.12,0.6) }
+
+	local activeBV = {}
+	local liftedRecords = {}
+	local cleanupConns = {}
+
+	local targetGroundY = groundY -- set the ground Y so funnel visually meets it as it descends
+	local descentSpeed = clamp((funnelDiameter / 240) * (1 + windspeedMPH / 300) * 4.0, 0.12, 64.0)
+	local lifeEnd = tick() + lifespan
+	local last = tick()
+
+	local function updateEmitterScalingForRecord(rec)
+		if not rec or not rec.funnelParts then return end
+		local fd = rec.params and rec.params.funnelDiameter or funnelDiameter
+		local mainD = math.min(CONFIG.MAIN_FUNNEL_LIMIT, fd)
+		-- stronger overall scale so particles look larger for small funnels
+		local overallScale = clamp((fd / 80), 0.2, 5000.0)
+		for i, fp in ipairs(rec.funnelParts) do
+			local function patch(em, part, extra)
+				if not em or not em.Parent or not part or not part.Parent then return end
+				local largest = math.max(part.Size.X, part.Size.Y, part.Size.Z)
+				local s0 = clamp(math.max(0.8, largest/15) * overallScale * (extra or 1.0), 0.5, CONFIG.MAX_PARTICLE_BASE)
+				local s1 = clamp(s0 * 2.0, s0, CONFIG.MAX_PARTICLE_SIZE)
+				em.Size = NumberSequence.new{ NumberSequenceKeypoint.new(0, s0), NumberSequenceKeypoint.new(1, s1) }
+				em.Rate = CONFIG.EM_RATE
+			end
+			patch(fp.upperEm, fp.upper, 1.6 + (i*0.02))
+			patch(fp.centerEm, fp.center, 1.2 + (i*0.01))
+			patch(fp.lowerEm, fp.lower, 0.9 + (i*0.005))
+		end
+		if rec.wcGroup and rec.wcGroup.parts then
+			for i, ent in ipairs(rec.wcGroup.parts) do
+				if ent.emitter and ent.part and ent.part.Parent then
+					local wl = math.max(ent.part.Size.X, ent.part.Size.Z)
+					local s0 = clamp(math.max(1.0, wl/15) * (overallScale * (1.4 + i*0.15)), 0.8, CONFIG.MAX_PARTICLE_BASE)
+					local s1 = clamp(s0 * 1.9, s0, CONFIG.MAX_PARTICLE_SIZE)
+					ent.emitter.Size = NumberSequence.new{ NumberSequenceKeypoint.new(0, s0), NumberSequenceKeypoint.new(1, s1) }
+					ent.emitter.Rate = CONFIG.EM_RATE
+				end
+			end
+		end
+	end
+
+	-- register tornado record early so clients can see it if needed
+	local tornadoRecord = {
+		ownerUserId = ownerUserId,
+		funnelParts = funnelParts,
+		wcGroup = wcGroup,
+		bigSound = bigSound,
+		pausedSounds = pausedSounds,
+		cleanupConns = cleanupConns,
+		charConns = {},
+		activeBV = activeBV,
+		liftedRecords = liftedRecords,
+		forceEnd = false,
+		params = {
+			funnelDiameter = funnelDiameter,
+			windspeedMPH = windspeedMPH,
+			windfieldRadius = windfieldRadius,
+			moveSpeed = moveSpeed,
+		},
+		lifeEnd = lifeEnd,
+		createdAt = tick(),
+		-- NEW FLAG: whether this tornado accepts live resize updates
+		acceptsLiveResize = true,
+	}
+
+	-- After a short grace window, lock the tornado so future live updates won't resize it.
+	task.delay(2, function()
+		if tornadoRecord then tornadoRecord.acceptsLiveResize = false end
+	end)
+	-- If the spawn params explicitly matched the desired funnelDiameter, lock immediately (user likely wanted fixed size)
+	-- (we can check params.funnelDiameter because that's what the client sent at summon time)
+	if params.funnelDiameter and tonumber(params.funnelDiameter) and tonumber(params.funnelDiameter) == tonumber(funnelDiameter) then
+		tornadoRecord.acceptsLiveResize = false
+	end
+
+	-- method to apply updated params at runtime (affects only THIS tornado record)
+	tornadoRecord.applyParams = function(rec, newParams)
+		pcall(function()
+			-- only allow when this record explicitly accepts live resize
+			if not rec.acceptsLiveResize then return end
+			if newParams.funnelDiameter then
+				local fd = tonumber(newParams.funnelDiameter) or newParams.funnelDiameter
+				if fd then
+					rec.params.funnelDiameter = fd
+					local mainD = math.min(CONFIG.MAIN_FUNNEL_LIMIT, fd)
+					for _, fp in ipairs(rec.funnelParts) do
+						if fp.upper and fp.upper.Parent then fp.upper.Size = Vector3.new(mainD, 600, mainD) end
+						if fp.center and fp.center.Parent then fp.center.Size = Vector3.new(mainD, 600, mainD) end
+						if fp.lower and fp.lower.Parent then fp.lower.Size = Vector3.new(mainD, 600, mainD) end
+					end
+					if rec.wcGroup and rec.wcGroup.parts then
+						local wcDiam = fd * 6
+						for _, ent in ipairs(rec.wcGroup.parts) do
+							if ent.part and ent.part.Parent then ent.part.Size = Vector3.new(wcDiam, 20, wcDiam) end
+						end
+					end
+				end
+			end
+			if newParams.windspeedMPH then
+				local ws = tonumber(newParams.windspeedMPH) or newParams.windspeedMPH
+				if ws then rec.params.windspeedMPH = ws end
+			end
+			if newParams.windfieldRadius then
+				local wr = tonumber(newParams.windfieldRadius) or newParams.windfieldRadius
+				if wr then rec.params.windfieldRadius = wr end
+			end
+			if newParams.lifespan then
+				local ls = tonumber(newParams.lifespan) or newParams.lifespan
+				if ls then
+					rec.lifeEnd = tick() + ls
+					rec.params.lifespan = ls
+				end
+			end
+			if newParams.moveSpeed then
+				local ms = tonumber(newParams.moveSpeed) or newParams.moveSpeed
+				if ms then rec.params.moveSpeed = ms end
+			end
+			updateEmitterScalingForRecord(rec)
+		end)
+	end
+
+	local childAddedConn = Workspace.DescendantAdded:Connect(function(desc)
+		pcall(function() tryImmediatePickupForDescendant(desc, centralLower, tornadoRecord.params.windfieldRadius, tornadoRecord.params.windspeedMPH) end)
+	end)
+	table.insert(cleanupConns, childAddedConn)
+
+	local function playerCharAdded(pl)
+		local conn = pl.CharacterAdded:Connect(function(ch)
+			task.defer(function()
+				if ch and ch:FindFirstChild("HumanoidRootPart") then
+					local hrp = ch:FindFirstChild("HumanoidRootPart")
+					if hrp and (hrp.Position - centralLower.Position).Magnitude <= tornadoRecord.params.windfieldRadius and not isWhitelisted(hrp) then
+						local bv = ensureBV(hrp)
+						if bv then
+							local targetVel, _ = computeDragAndLift(hrp.Position, centralLower.Position, tornadoRecord.params.funnelDiameter, tornadoRecord.params.windfieldRadius, tornadoRecord.params.windspeedMPH, 60)
+							bv.Velocity = targetVel * 0.45
+							tornadoRecord.activeBV[hrp] = {bv = bv, lastSeen = tick()}
+						end
+					end
+					-- NOTE: tornadoes no longer get destroyed when owner respawns/dies (persistent)
+				end
+			end)
+		end)
+		return conn
+	end
+
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local c = playerCharAdded(pl)
+		table.insert(tornadoRecord.charConns, c)
+	end
+	local playerAddedConn = Players.PlayerAdded:Connect(function(pl)
+		local c = playerCharAdded(pl)
+		table.insert(tornadoRecord.charConns, c)
+	end)
+	table.insert(cleanupConns, playerAddedConn)
+
+	-- register tornado record globally (allows many)
+	table.insert(activeTornadoes, tornadoRecord)
+
+	-- initial scaling
+	updateEmitterScalingForRecord(tornadoRecord)
+
+	-- MAIN LOOP
+	local lastParams = { funnelDiameter = tornadoRecord.params.funnelDiameter, windspeedMPH = tornadoRecord.params.windspeedMPH, windfieldRadius = tornadoRecord.params.windfieldRadius }
+	while tick() < tornadoRecord.lifeEnd and not tornadoRecord.forceEnd and #tornadoRecord.funnelParts > 0 and tornadoRecord.wcGroup and tornadoRecord.wcGroup.parts and #tornadoRecord.wcGroup.parts>0 do
+		local now = tick()
+		local dt = now - last
+		last = now
+
+		if tornadoRecord.params.funnelDiameter ~= lastParams.funnelDiameter then
+			updateEmitterScalingForRecord(tornadoRecord)
+			lastParams.funnelDiameter = tornadoRecord.params.funnelDiameter
+		end
+		if tornadoRecord.params.windspeedMPH ~= lastParams.windspeedMPH then
+			lastParams.windspeedMPH = tornadoRecord.params.windspeedMPH
+		end
+		if tornadoRecord.params.windfieldRadius ~= lastParams.windfieldRadius then
+			lastParams.windfieldRadius = tornadoRecord.params.windfieldRadius
+		end
+
+		-- swirl jitter
+		swirl.theta = swirl.theta + swirl.omega * dt
+		swirl.jitterTimer = swirl.jitterTimer - dt
+		if swirl.jitterTimer <= 0 then
+			swirl.omega = rnd(6.0, 22.0) * (1 + (math.random()-0.5)*0.9)
+			swirl.amp = 22.0 * (0.6 + math.random()*1.6)
+			swirl.jitterTimer = rnd(0.12, 0.8)
+		end
+
+		-- growth/fluctuation (we still keep limited growth to avoid runaway)
+		local fd_local = tornadoRecord.params.funnelDiameter
+		local growthSpeed = clamp((fd_local / 160) * dt * 2.0 * (1 + (math.sin(now*0.2) * 0.06)), 0.01, 12)
+
+		for _, fp in ipairs(tornadoRecord.funnelParts) do
+			local fdCap = math.min(CONFIG.MAIN_FUNNEL_LIMIT, fd_local)
+			fp.upper.Size = Vector3.new(
+				clamp(fp.upper.Size.X * (1 + (growthSpeed * 0.03)), 6, math.max(fdCap, fp.upper.Size.X)),
+				clamp(600, 600, 600), -- keep fixed Y=600 as requested
+				clamp(fp.upper.Size.Z * (1 + (growthSpeed * 0.03)), 6, math.max(fdCap, fp.upper.Size.Z))
+			)
+			fp.center.Size = Vector3.new(
+				clamp(fp.center.Size.X * (1 + (growthSpeed * 0.01)), 6, math.max(fdCap, fp.center.Size.X)),
+				600,
+				clamp(fp.center.Size.Z * (1 + (growthSpeed * 0.01)), 6, math.max(fdCap, fp.center.Size.Z))
+			)
+			fp.lower.Size = Vector3.new(
+				clamp(fp.lower.Size.X * (1 + (growthSpeed * 0.006)), 6, math.max(fdCap, fp.lower.Size.X)),
+				600,
+				clamp(fp.lower.Size.Z * (1 + (growthSpeed * 0.006)), 6, math.max(fdCap, fp.lower.Size.Z))
+			)
+		end
+
+		updateEmitterScalingForRecord(tornadoRecord)
+
+		-- descent toward ground: we use targetGroundY discovered earlier; funnel Y is big (600),
+		-- so the following keeps the parts moving down so the bottom intersects ground.
+		local lowerBottomY = CONFIG.FUNNEL_TOP_Y - (tornadoRecord.funnelParts[1].lower.Size.Y / 2)
+		if lowerBottomY > targetGroundY + 0.5 then
+			local progress = 1 - clamp((lowerBottomY - targetGroundY) / (CONFIG.FUNNEL_TOP_Y - targetGroundY + 1e-6), 0, 1)
+			local downMul = 0.5 + (progress * 1.6)
+			local moveAmount = descentSpeed * dt * downMul
+			for _, fp in ipairs(tornadoRecord.funnelParts) do
+				local cur = fp.upper.Position
+				local newY = math.max(targetGroundY + 40, cur.Y - moveAmount)
+				fp.upper.Position = Vector3.new(fp.upper.Position.X, newY, fp.upper.Position.Z)
+				fp.center.Position = Vector3.new(fp.center.Position.X, newY, fp.center.Position.Z)
+				fp.lower.Position = Vector3.new(fp.lower.Position.X, newY, fp.lower.Position.Z)
+			end
+		else
+			for _, fp in ipairs(tornadoRecord.funnelParts) do
+				local newY = targetGroundY + (fp.lower.Size.Y / 2)
+				fp.upper.Position = Vector3.new(fp.upper.Position.X, newY, fp.upper.Position.Z)
+				fp.center.Position = Vector3.new(fp.center.Position.X, newY, fp.center.Position.Z)
+				fp.lower.Position = Vector3.new(fp.lower.Position.X, newY, fp.lower.Position.Z)
+			end
+		end
+
+		-- update wallcloud positions to follow funnel center
+		for idx, ent in ipairs(tornadoRecord.wcGroup.parts) do
+			if ent.part and ent.part.Parent then
+				local basePos = Vector3.new(spawnX, ent.part.Position.Y, spawnZ)
+				ent.part.Position = Vector3.new(basePos.X, ent.part.Position.Y, basePos.Z)
+			end
+		end
+
+		-- swirl movement
+		local topPos = nil
+		for _, fp in ipairs(tornadoRecord.funnelParts) do
+			if fp.offset.X == 0 and fp.offset.Z == 0 then
+				topPos = fp.upper.Position
+				break
+			end
+		end
+		if not topPos then topPos = tornadoRecord.funnelParts[1].upper.Position end
+
+		for _, fp in ipairs(tornadoRecord.funnelParts) do
+			local worldOffset = Vector3.new(fp.offset.X, 0, fp.offset.Z)
+			local angle = swirl.theta + (math.atan2(fp.offset.Z, math.max(0.0001, fp.offset.X)))
+			local swirlOff = Vector3.new(math.cos(angle) * (swirl.amp * 0.02) * (1 + (fp.offset.Magnitude/ (math.min(CONFIG.MAIN_FUNNEL_LIMIT, tornadoRecord.params.funnelDiameter)*0.5))), 0, math.sin(angle) * (swirl.amp * 0.02) * (1 + (fp.offset.Magnitude/(math.min(CONFIG.MAIN_FUNNEL_LIMIT, tornadoRecord.params.funnelDiameter)*0.5))))
+			local desired = topPos + worldOffset + swirlOff
+			if fp.upper and fp.upper.Parent then fp.upper.Position = desired end
+			if fp.center and fp.center.Parent then fp.center.Position = desired end
+			if fp.lower and fp.lower.Parent then fp.lower.Position = desired end
+		end
+
+		-- windfield & region
+		local avgDia = math.min(CONFIG.MAIN_FUNNEL_LIMIT, tornadoRecord.params.funnelDiameter)
+		local progressToGround = clamp(((CONFIG.FUNNEL_TOP_Y - (centralLower.Position.Y - centralLower.Size.Y/2)) / (CONFIG.FUNNEL_TOP_Y - groundY + 1e-6)), 0, 1)
+		local windStrength = clamp((avgDia / 80) * (0.8 + progressToGround * 0.9 + (math.random()-0.5)*0.35), 0.6, 160.0)
+		local windfield = tornadoRecord.params.windfieldRadius
+		local centerPos = centralLower.Position
+
+		local regionSize = Vector3.new((windfield or 1)*2, 1200, (windfield or 1)*2)
+		local partsInRegion = Workspace:GetPartBoundsInBox(CFrame.new(centerPos), regionSize)
+
+		-- catastrophic wipe scaled by proximity
+		if tornadoRecord.params.windspeedMPH >= CONFIG.CATASTROPHIC_MPH then
+			local batchSize = 120
+			for i = 1, #partsInRegion, batchSize do
+				for j = i, math.min(i+batchSize-1, #partsInRegion) do
+					local part = partsInRegion[j]
+					if part and part:IsA("BasePart") and not isWhitelisted(part) then
+						local d = (part.Position - centerPos).Magnitude
+						local proximity = 1 - clamp(d / (windfield + 1), 0, 1)
+						if math.random() < proximity then
+							pcall(function() part:Destroy() end)
+						end
+					end
+				end
+				task.wait()
+			end
+			local candidates = {}
+			for _, part in ipairs(partsInRegion) do
+				if part and part:IsA("BasePart") then
+					local model = part:FindFirstAncestorOfClass("Model")
+					if model and not model:IsDescendantOf(whitelistFolder) then candidates[model] = true end
+				end
+			end
+			local modelList = {}
+			for m,_ in pairs(candidates) do table.insert(modelList, m) end
+			for i=1, #modelList, 20 do
+				for j=i, math.min(i+19, #modelList) do
+					local m = modelList[j]
+					pcall(function() m:Destroy() end)
+				end
+				task.wait()
+			end
+		end
+
+		-- Player processing (forces scaled by proximity)
+		for _, pl in ipairs(Players:GetPlayers()) do
+			local char = pl.Character
+			if char and char:FindFirstChild("HumanoidRootPart") and char:FindFirstChildOfClass("Humanoid") then
+				local hrp = char:FindFirstChild("HumanoidRootPart")
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				if hrp and hum and hum.Health > 0 then
+					if isWhitelisted(hrp) then
+						if hrp:FindFirstChild("TornadoBV") then pcall(function() hrp.TornadoBV:Destroy() end) end
+					else
+						if hrp.Position.Y >= CONFIG.TOSS_Y then
+							tossHRP_oneShot(hrp, centerPos, tornadoRecord.params.windspeedMPH)
+							if hrp:FindFirstChild("TornadoBV") then pcall(function() hrp.TornadoBV:Destroy() end) end
+							tornadoRecord.activeBV[hrp] = nil
+						else
+							local dist = (hrp.Position - centerPos).Magnitude
+							if dist <= (windfield or 0) then
+								local mass = 60
+								local targetVel, distH = computeDragAndLift(hrp.Position, centerPos, tornadoRecord.params.funnelDiameter, windfield, tornadoRecord.params.windspeedMPH, mass)
+								local bv = ensureBV(hrp)
+								if bv then
+									local closeness = 1 - clamp(distH / (windfield + 1), 0, 1)
+									local blend = clamp(0.04 + closeness * 0.7, 0.02, 0.98)
+									-- scale force by closeness so edge feels weaker
+									bv.Velocity = bv.Velocity * (1 - blend) + targetVel * blend * (0.2 + 0.8 * closeness)
+									tornadoRecord.activeBV[hrp] = {bv = bv, lastSeen = tick()}
+									if targetVel.Y > 6 then
+										if not tornadoRecord.liftedRecords[hrp] then tornadoRecord.liftedRecords[hrp] = {startY = hrp.Position.Y, maxY = hrp.Position.Y, player = pl}
+										else tornadoRecord.liftedRecords[hrp].maxY = math.max(tornadoRecord.liftedRecords[hrp].maxY, hrp.Position.Y) end
+									end
+								end
+							else
+								if hrp:FindFirstChild("TornadoBV") then hrp.TornadoBV:Destroy() end
+								tornadoRecord.activeBV[hrp] = nil
+							end
+						end
+					end
+				end
+			end
+		end
+
+		-- NPCs/humanoid models
+		local seenModels = {}
+		for _, part in ipairs(partsInRegion) do
+			if part and part:IsA("BasePart") and part.Parent then
+				local model = part:FindFirstAncestorOfClass("Model")
+				if model and not seenModels[model] and not model:IsDescendantOf(whitelistFolder) then
+					seenModels[model] = true
+					local humanoid = model:FindFirstChildOfClass("Humanoid")
+					local hrp = model:FindFirstChild("HumanoidRootPart")
+					if humanoid and hrp and humanoid.Health > 0 then
+						if hrp.Position.Y >= CONFIG.TOSS_Y then
+							tossModel_oneShot(model, centerPos, tornadoRecord.params.windspeedMPH)
+						else
+							local dist = (hrp.Position - centerPos).Magnitude
+							if dist <= (windfield or 0) then
+								local mm = modelMass(model)
+								local targetVel, distH = computeDragAndLift(hrp.Position, centerPos, tornadoRecord.params.funnelDiameter, windfield, tornadoRecord.params.windspeedMPH, mm)
+								local bv = ensureBV(hrp)
+								if bv then
+									local closeness = 1 - clamp(distH / (windfield + 1), 0, 1)
+									local blend = clamp(0.04 + closeness * 0.7, 0.02, 0.98)
+									bv.Velocity = bv.Velocity * (1 - blend) + targetVel * blend * (0.2 + 0.8 * closeness)
+									tornadoRecord.activeBV[hrp] = {bv = bv, lastSeen = tick()}
+									if targetVel.Y > 6 then
+										if not tornadoRecord.liftedRecords[hrp] then tornadoRecord.liftedRecords[hrp] = {startY = hrp.Position.Y, maxY = hrp.Position.Y, npc = model}
+										else tornadoRecord.liftedRecords[hrp].maxY = math.max(tornadoRecord.liftedRecords[hrp].maxY, hrp.Position.Y) end
+									end
+								end
+							else
+								if hrp:FindFirstChild("TornadoBV") then hrp.TornadoBV:Destroy() end
+								tornadoRecord.activeBV[hrp] = nil
+							end
+						end
+					end
+				end
+			end
+		end
+
+		-- Parts: horizontal drag + inner lift + toss when Y >= threshold
+		for _, part in ipairs(partsInRegion) do
+			if not part or not part:IsA("BasePart") then continue end
+			if isWhitelisted(part) then continue end
+
+			local dVec = Vector3.new(part.Position.X - centerPos.X, 0, part.Position.Z - centerPos.Z)
+			local dH = dVec.Magnitude
+			local proximityLocal = 1 - clamp(dH / (windfield + 1), 0, 1)
+
+			if part.Anchored and tornadoRecord.params.windspeedMPH >= CONFIG.UNANCHOR_MPH_THRESHOLD and not part:IsDescendantOf(whitelistFolder) and part.Name ~= "Baseplate" then
+				pcall(function() part.Anchored = false end)
+				pcall(function()
+					local dirToCenter = (centerPos - part.Position)
+					if dirToCenter.Magnitude > 0 then
+						local push = dirToCenter.Unit * ((tornadoRecord.params.windspeedMPH * 0.06) * (1 + math.random()*0.5))
+						push = push * math.max(0.05, proximityLocal)
+						part.AssemblyLinearVelocity = push + Vector3.new(0, math.max(8, tornadoRecord.params.windspeedMPH*0.12) * math.max(0.05, proximityLocal), 0)
+					end
+				end)
+			end
+
+			if part.Position.Y >= CONFIG.TOSS_Y then
+				tossPart_oneShot(part, centerPos, tornadoRecord.params.windspeedMPH)
+				continue
+			end
+
+			local ok, pm = pcall(function() return part:GetMass() end)
+			pm = (ok and pm) and pm or 0.1
+
+			local horizVec = Vector3.new(centerPos.X - part.Position.X, 0, centerPos.Z - part.Position.Z)
+			local distH = horizVec.Magnitude
+			if distH <= (windfield or 0) then
+				local targetVel, distNow = computeDragAndLift(part.Position, centerPos, tornadoRecord.params.funnelDiameter, windfield, tornadoRecord.params.windspeedMPH, pm)
+				local cur = part.AssemblyLinearVelocity or Vector3.new(0,0,0)
+				local closeness = 1 - clamp(distNow / (windfield + 1), 0, 1)
+				local blend = clamp(0.06 + closeness * 0.74, 0.02, 0.96)
+				local newVel = cur * (1-blend) + targetVel * blend * (0.2 + 0.8 * closeness)
+				pcall(function() part.AssemblyLinearVelocity = newVel end)
+				if pm < 6 and math.random() < (0.006 * (0.2 + 0.8 * closeness)) then
+					pcall(function() part:ApplyImpulse(Vector3.new(0, math.max(30, tornadoRecord.params.windspeedMPH*8) * pm * (0.2 + 0.8 * closeness), 0)) end)
+				end
+			else
+				if not part.Anchored then
+					pcall(function() part.AssemblyLinearVelocity = (part.AssemblyLinearVelocity or Vector3.new()) * 0.98 end)
+				end
+			end
+		end
+
+		-- rip weak models (scaled by proximity)
+		if tornadoRecord.params.windspeedMPH >= CONFIG.RIP_MPH and tornadoRecord.params.windspeedMPH < CONFIG.CATASTROPHIC_MPH then
+			local candidates = {}
+			for _, part in ipairs(partsInRegion) do
+				if part and part:IsA("BasePart") then
+					local model = part:FindFirstAncestorOfClass("Model")
+					if model and not model:IsDescendantOf(whitelistFolder) then candidates[model] = true end
+				end
+			end
+			for model,_ in pairs(candidates) do
+				local totalParts, anchoredCount, mm = 0,0,0
+				for _, d in ipairs(model:GetDescendants()) do
+					if d:IsA("BasePart") then
+						totalParts = totalParts + 1
+						local ok,mass = pcall(function() return d:GetMass() end)
+						if ok and mass then mm = mm + mass end
+						if d.Anchored then anchoredCount = anchoredCount + 1 end
+					end
+				end
+				if totalParts >= 3 and anchoredCount >= math.max(1, math.floor(totalParts*0.6)) then
+					local massThreshold = math.max(1, (tornadoRecord.params.windspeedMPH * 4) + (tornadoRecord.params.funnelDiameter*1.5))
+					if mm < massThreshold and not model:FindFirstChild("__tornadoRipped") then
+						local tag = Instance.new("BoolValue"); tag.Name="__tornadoRipped"; tag.Value=true; tag.Parent = model
+						for _, part in ipairs(model:GetDescendants()) do
+							if part:IsA("BasePart") then
+								pcall(function()
+									part.Anchored = false
+									local radial = Vector3.new(part.Position.X - centerPos.X, 0, part.Position.Z - centerPos.Z)
+									local dist = radial.Magnitude
+									local proximity = 1 - clamp(dist / (windfield + 1), 0, 1)
+									local push = radial.Unit * (math.max(18, (tornadoRecord.params.windspeedMPH/6) * (1 + math.random())) * (0.2 + 0.8 * proximity))
+									part.AssemblyLinearVelocity = (Vector3.new(0, math.max(60, tornadoRecord.params.windspeedMPH * 0.8) * (0.2 + 0.8 * proximity), 0) + push)
+								end)
+							end
+						end
+						task.spawn(function()
+							task.wait(1 + math.random()*2)
+							local landed, timeout = false, tick() + 60
+							while not landed and tick() < timeout do
+								for _, p in ipairs(model:GetDescendants()) do
+									if p and p:IsA("BasePart") and p.Position.Y <= groundY + 4 then
+										landed = true; break
+									end
+								end
+								if not landed then task.wait(0.4) end
+							end
+							if landed then destroyAllWeldsAndAttachments(model) end
+							if tag and tag.Parent then tag:Destroy() end
+						end)
+					end
+				end
+			end
+		end
+
+		-- cleanup stale BV entries and handle HRPs that climbed to toss altitude mid-BV
+		for hrp, info in pairs(tornadoRecord.activeBV) do
+			if not hrp.Parent or (tick() - info.lastSeen) > 1.2 then
+				if info.bv and info.bv.Parent then info.bv:Destroy() end
+				tornadoRecord.activeBV[hrp] = nil
+			else
+				if hrp.Position and hrp.Position.Y >= CONFIG.TOSS_Y then
+					tossHRP_oneShot(hrp, centerPos, tornadoRecord.params.windspeedMPH)
+					if info.bv and info.bv.Parent then info.bv:Destroy() end
+					tornadoRecord.activeBV[hrp] = nil
+				end
+			end
+		end
+
+		-- liftedRecords -> fall damage on landing
+		for hrp, rec in pairs(tornadoRecord.liftedRecords) do
+			if not hrp.Parent or (not hrp:FindFirstChild("TornadoBV")) then
+				local landY = hrp and hrp.Position and hrp.Position.Y or (rec.maxY or rec.startY)
+				local fallDist = (rec.maxY or rec.startY) - landY
+				if fallDist >= 11 then
+					local dmg = math.floor(fallDist - 10 + 0.5)
+					if rec.player and rec.player.Character and rec.player.Character:FindFirstChildOfClass("Humanoid") then
+						local h = rec.player.Character:FindFirstChildOfClass("Humanoid")
+						if h and h.Health > 0 then pcall(function() h:TakeDamage(dmg) end) end
+					elseif rec.npc and rec.npc:FindFirstChildOfClass("Humanoid") then
+						local h = rec.npc:FindFirstChildOfClass("Humanoid")
+						if h and h.Health > 0 then pcall(function() h:TakeDamage(dmg) end) end
+					end
+				end
+				tornadoRecord.liftedRecords[hrp] = nil
+			else
+				if hrp and rec then rec.maxY = math.max(rec.maxY or rec.startY, hrp.Position.Y) end
+			end
+		end
+
+		if tick() >= tornadoRecord.lifeEnd then break end
+		task.wait(CONFIG.UPDATE_RATE)
+	end
+
+	cleanupTornadoRecord(tornadoRecord)
+	print("[Tornado] Tornado finished and cleaned up.")
+end
+
+-- ===================== RemoteEvent setup & command wiring =====================
+
+local tornadoFolder = ReplicatedStorage:FindFirstChild("TornadoEvents")
+if not tornadoFolder then
+	tornadoFolder = Instance.new("Folder")
+	tornadoFolder.Name = "TornadoEvents"
+	tornadoFolder.Parent = ReplicatedStorage
+end
+
+local OpenGUIEvent = tornadoFolder:FindFirstChild("OpenGUI")
+if not OpenGUIEvent then
+	OpenGUIEvent = Instance.new("RemoteEvent")
+	OpenGUIEvent.Name = "OpenGUI"
+	OpenGUIEvent.Parent = tornadoFolder
+end
+
+local SummonTornadoEvent = tornadoFolder:FindFirstChild("SummonTornado")
+if not SummonTornadoEvent then
+	SummonTornadoEvent = Instance.new("RemoteEvent")
+	SummonTornadoEvent.Name = "SummonTornado"
+	SummonTornadoEvent.Parent = tornadoFolder
+end
+
+local UpdateTornadoEvent = tornadoFolder:FindFirstChild("UpdateTornadoParams")
+if not UpdateTornadoEvent then
+	UpdateTornadoEvent = Instance.new("RemoteEvent")
+	UpdateTornadoEvent.Name = "UpdateTornadoParams"
+	UpdateTornadoEvent.Parent = tornadoFolder
+end
+
+local function isAllowedToUseCommands(player)
+	if CONFIG.COMMAND_ACCESS == "Everyone" then return true end
+	if CONFIG.COMMAND_ACCESS == "OwnerOnly" then
+		if player.UserId == CONFIG.OWNER_USERID then return true end
+		for _, id in ipairs(CONFIG.OWNER_FRIEND_IDS) do
+			if player.UserId == id then return true end
+		end
+		return false
+	end
+	if CONFIG.COMMAND_ACCESS == "OwnerFriends" then
+		if player.UserId == CONFIG.OWNER_USERID then return true end
+		for _, id in ipairs(CONFIG.OWNER_FRIEND_IDS) do if player.UserId == id then return true end end
+		return false
+	end
+	return false
+end
+
+local function clearAllTornadoes(requester)
+	for i = #activeTornadoes, 1, -1 do
+		local rec = activeTornadoes[i]
+		if rec then
+			pcall(function() cleanupTornadoRecord(rec) end)
+		end
+	end
+	print(("[Cmd] %s cleared all tornadoes."):format(requester and requester.Name or "Server"))
+end
+
+-- Chat listeners
+Players.PlayerAdded:Connect(function(pl)
+	pl.Chatted:Connect(function(msg)
+		pcall(function()
+			local cmd = type(msg)=="string" and msg:lower():gsub("^%s+", ""):gsub("%s+$", "") or ""
+			if cmd == "/summon tornado" then
+				if not isAllowedToUseCommands(pl) then
+					warn(("[Cmd] %s tried to spawn tornado but lacks permission."):format(pl.Name)); return
+				end
+				local defaults = {funnelDiameter = 300, windfieldRadius = 360, windspeedMPH = 200, moveSpeed = 3, lifespan = 420}
+				OpenGUIEvent:FireClient(pl, defaults)
+				print(("[Cmd] %s opened tornado GUI (server told client)."):format(pl.Name))
+			elseif cmd == "/summon wallcloud" then
+				if not isAllowedToUseCommands(pl) then
+					warn(("[Cmd] %s tried to spawn wallcloud but lacks permission."):format(pl.Name)); return
+				end
+				if pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+					local hrp = pl.Character.HumanoidRootPart
+					local wcDiam = math.max(120, 300 + math.random()*1200)
+					local numParts = math.max(1, math.ceil((wcDiam/6) / CONFIG.CLOUD_PART_SIZE_LIMIT))
+					spawnWallCloudGroup(hrp.Position.X, hrp.Position.Z, wcDiam/2, numParts)
+					print(("[Cmd] %s spawned wallcloud at %.1f, %.1f"):format(pl.Name, hrp.Position.X, hrp.Position.Z))
+				end
+			elseif cmd == "/clear" then
+				if not isAllowedToUseCommands(pl) then
+					warn(("[Cmd] %s tried to clear tornadoes but lacks permission."):format(pl.Name)); return
+				end
+				clearAllTornadoes(pl)
+			end
+		end)
+	end)
+end)
+
+for _, pl in ipairs(Players:GetPlayers()) do
+	pl.Chatted:Connect(function(msg) pcall(function()
+		local cmd = type(msg)=="string" and msg:lower():gsub("^%s+", ""):gsub("%s+$", "") or ""
+		if cmd == "/summon tornado" then
+			if not isAllowedToUseCommands(pl) then warn(("[Cmd] %s tried to spawn tornado but lacks permission."):format(pl.Name)); return end
+			local defaults = {funnelDiameter = 300, windfieldRadius = 360, windspeedMPH = 200, moveSpeed = 3, lifespan = 420}
+			OpenGUIEvent:FireClient(pl, defaults)
+			print(("[Cmd] %s opened tornado GUI (server told client)."):format(pl.Name))
+		elseif cmd == "/summon wallcloud" then
+			if not isAllowedToUseCommands(pl) then warn(("[Cmd] %s tried to spawn wallcloud but lacks permission."):format(pl.Name)); return end
+			if pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+				local hrp = pl.Character.HumanoidRootPart
+				local wcDiam = math.max(120, 300 + math.random()*1200)
+				local numParts = math.max(1, math.ceil((wcDiam/6) / CONFIG.CLOUD_PART_SIZE_LIMIT))
+				spawnWallCloudGroup(hrp.Position.X, hrp.Position.Z, wcDiam/2, numParts)
+				print(("[Cmd] %s spawned wallcloud at %.1f, %.1f"):format(pl.Name, hrp.Position.X, hrp.Position.Z))
+			end
+		elseif cmd == "/clear" then
+			if not isAllowedToUseCommands(pl) then warn(("[Cmd] %s tried to clear tornadoes but lacks permission."):format(pl.Name)); return end
+			clearAllTornadoes(pl)
+		end
+	end) end)
+end
+
+-- Handle SummonTornado fired from client
+SummonTornadoEvent.OnServerEvent:Connect(function(player, params)
+	pcall(function()
+		if not isAllowedToUseCommands(player) then
+			warn(("[SummonTornado] %s tried to summon but lacks permission."):format(player.Name)); return
+		end
+		if not params or type(params) ~= "table" then
+			warn("[SummonTornado] invalid params from client."); return
+		end
+		local spawnX, spawnZ = 0, 0
+		if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+			local hrp = player.Character.HumanoidRootPart
+			spawnX, spawnZ = hrp.Position.X, hrp.Position.Z
+		else
+			if player.Character and player.Character:FindFirstChild("Head") then
+				local head = player.Character.Head
+				spawnX, spawnZ = head.Position.X, head.Position.Z
+			else
+				spawnX, spawnZ = 0, 0
+			end
+		end
+
+		local fd = tonumber(params.funnelDiameter) or params.funnelDiameter or 300
+		local wr = tonumber(params.windfieldRadius) or params.windfieldRadius or math.max(fd + CONFIG.WINDFIELD_BUFFER, fd * 1.2)
+		local ws = tonumber(params.windspeedMPH) or params.windspeedMPH or 200
+		local ms = tonumber(params.moveSpeed) or params.moveSpeed or 3
+		local ls = tonumber(params.lifespan) or params.lifespan or 420
+
+		print(("[Tornado] Summon request from %s -> spawn=(%.1f,%.1f) funnel=%s windfield=%s wind=%s move=%s life=%s")
+			:format(player.Name, spawnX, spawnZ, tostring(fd), tostring(wr), tostring(ws), tostring(ms), tostring(ls)))
+
+		task.spawn(function()
+			spawnTornadoAt(spawnX, spawnZ, {
+				funnelDiameter = fd,
+				windfieldRadius = wr,
+				windspeedMPH = ws,
+				moveSpeed = ms,
+				lifespan = ls,
+				ownerUserId = player.UserId,
+			}, true)
+		end)
+	end)
+end)
+
+-- Handle live param updates from client
+UpdateTornadoEvent.OnServerEvent:Connect(function(player, params)
+	pcall(function()
+		if not isAllowedToUseCommands(player) then return end
+		if not params or type(params) ~= "table" then return end
+		-- find the newest tornado record that belongs to this player AND still accepts live resize
+		local chosen = nil
+		local bestTimestamp = 0
+		for _, rec in ipairs(activeTornadoes) do
+			if rec.ownerUserId == player.UserId and rec.acceptsLiveResize and rec.createdAt and rec.createdAt > bestTimestamp then
+				chosen = rec
+				bestTimestamp = rec.createdAt
+			end
+		end
+		if not chosen or not chosen.applyParams then return end
+		-- apply WITHOUT clamping, but only if chosen.acceptsLiveResize == true (applyParams already checks)
+		local newParams = {}
+		if params.funnelDiameter then newParams.funnelDiameter = tonumber(params.funnelDiameter) or params.funnelDiameter end
+		if params.windspeedMPH then newParams.windspeedMPH = tonumber(params.windspeedMPH) or params.windspeedMPH end
+		if params.windfieldRadius then newParams.windfieldRadius = tonumber(params.windfieldRadius) or params.windfieldRadius end
+		if params.moveSpeed then newParams.moveSpeed = tonumber(params.moveSpeed) or params.moveSpeed end
+		if params.lifespan then newParams.lifespan = tonumber(params.lifespan) or params.lifespan end
+		pcall(function() chosen:applyParams(newParams) end)
+	end)
+end)
+
+print("[StormGenerators] Tornado System (modified — funnels touch ground, larger particles, locking updates) loaded on server.")
