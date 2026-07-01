@@ -128,50 +128,6 @@ local function getBestPartForModel(model)
     return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
 end
 
-local function getPlayerRootPart(plr)
-    if not plr or not plr.Parent then return nil end
-    local char = plr.Character
-    if not char then return nil end
-    return char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart or char:FindFirstChildWhichIsA("BasePart", true)
-end
-
-local function isPlayerAlive(plr)
-    if not plr or not plr.Parent then return false end
-    local char = plr.Character
-    if not char then return false end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    return hum ~= nil and hum.Health ~= nil and hum.Health > 0
-end
-
-local function isPlayerWhitelisted(plr)
-    if not plr or not plr.Parent then return false end
-    local v = plr:FindFirstChild("Whitelisted")
-    return v and v:IsA("BoolValue") and v.Value == true or false
-end
-
-local function isPlayerSelected(plr)
-    if not plr or not plr.Parent then return false end
-    local v = plr:FindFirstChild("Selected")
-    return v and v:IsA("BoolValue") and v.Value == true or false
-end
-
-local function getChasePlayerPool()
-    local selected = {}
-    local fallback = {}
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= player and plr.Parent and isPlayerAlive(plr) and not isPlayerWhitelisted(plr) then
-            table.insert(fallback, plr)
-            if isPlayerSelected(plr) then
-                table.insert(selected, plr)
-            end
-        end
-    end
-    if #selected > 0 then
-        return selected, true
-    end
-    return fallback, false
-end
-
 local function isAllowed(model, effectName)
     if not model or not effectName then return true end
     local t = model.Name
@@ -312,6 +268,8 @@ end
 
 -- PATH / CANCEL helpers for advanced chasing
 local npcPathTasks = setmetatable({}, { __mode = "k" }) -- store cancel funcs keyed by model
+local chaseState = setmetatable({}, { __mode = "k" })   -- running / base movement state per NPC
+local chaseAssignments = {}                               -- refreshed target assignments per NPC
 
 local function stopNPCPath(model)
     if not model then return end
@@ -320,301 +278,385 @@ local function stopNPCPath(model)
         pcall(function() info.cancel() end)
     end
     npcPathTasks[model] = nil
+    if chaseState[model] then
+        chaseState[model].running = false
+    end
 end
 
-local function getClosestPlayerForPos(pos, players)
-    local bestPlayer = nil
-    local bestDist = math.huge
-    for _, plr in ipairs(players or {}) do
-        local root = getPlayerRootPart(plr)
-        if root then
-            local dist = (root.Position - pos).Magnitude
-            if dist < bestDist then
-                bestDist = dist
-                bestPlayer = plr
-            end
-        end
-    end
-    return bestPlayer, bestDist
-end
-
-local function buildCancelChaseAssignments()
-    local players, usingSelected = getChasePlayerPool()
-    local assignments = {}
-    if #players == 0 then
-        return assignments, usingSelected
-    end
-
-    local npcInfo = {}
-    for _, model in ipairs(getNPCsArray()) do
-        if model and model.Parent and isAllowed(model, "CancelChase") then
-            local hum = model:FindFirstChildOfClass("Humanoid")
-            local hrp = getBestPartForModel(model)
-            if hum and hrp and (hum.Health == nil or hum.Health > 0) then
-                local nearestDist = math.huge
-                for _, plr in ipairs(players) do
-                    local root = getPlayerRootPart(plr)
-                    if root then
-                        local dist = (root.Position - hrp.Position).Magnitude
-                        if dist < nearestDist then
-                            nearestDist = dist
-                        end
-                    end
-                end
-                table.insert(npcInfo, {
-                    model = model,
-                    pos = hrp.Position,
-                    nearestDist = nearestDist,
-                })
-            end
-        end
-    end
-
-    if #npcInfo == 0 then
-        return assignments, usingSelected
-    end
-
-    table.sort(npcInfo, function(a, b)
-        if a.nearestDist == b.nearestDist then
-            return tostring(a.model) < tostring(b.model)
-        end
-        return a.nearestDist < b.nearestDist
-    end)
-
-    if #npcInfo == 1 then
-        local bestPlayer = getClosestPlayerForPos(npcInfo[1].pos, players)
-        assignments[npcInfo[1].model] = bestPlayer
-        return assignments, usingSelected
-    end
-
-    local npcCount = #npcInfo
-    local playerCount = #players
-
-    if npcCount < playerCount then
-        local usedPlayers = {}
-        for _, info in ipairs(npcInfo) do
-            local bestPlayer = nil
-            local bestDist = math.huge
-            for _, plr in ipairs(players) do
-                if not usedPlayers[plr] then
-                    local root = getPlayerRootPart(plr)
-                    if root then
-                        local dist = (root.Position - info.pos).Magnitude
-                        if dist < bestDist then
-                            bestDist = dist
-                            bestPlayer = plr
-                        end
-                    end
-                end
-            end
-            if not bestPlayer then
-                bestPlayer = getClosestPlayerForPos(info.pos, players)
-            end
-            assignments[info.model] = bestPlayer
-            if bestPlayer then
-                usedPlayers[bestPlayer] = true
-            end
-        end
-        return assignments, usingSelected
-    end
-
-    local playerInfo = {}
-    for _, plr in ipairs(players) do
-        local root = getPlayerRootPart(plr)
-        local minDist = math.huge
-        if root then
-            for _, info in ipairs(npcInfo) do
-                local dist = (root.Position - info.pos).Magnitude
-                if dist < minDist then
-                    minDist = dist
-                end
-            end
-        end
-        table.insert(playerInfo, {
-            player = plr,
-            minDist = minDist,
-        })
-    end
-
-    table.sort(playerInfo, function(a, b)
-        if a.minDist == b.minDist then
-            return a.player.Name < b.player.Name
-        end
-        return a.minDist < b.minDist
-    end)
-
-    local base = math.floor(npcCount / playerCount)
-    local remainder = npcCount - (base * playerCount)
-    local quotas = {}
-    for i, info in ipairs(playerInfo) do
-        quotas[info.player] = base + (i <= remainder and 1 or 0)
-    end
-
-    local remaining = table.clone(npcInfo)
-    for _, info in ipairs(playerInfo) do
-        local quota = quotas[info.player] or 0
-        if quota > 0 then
-            local root = getPlayerRootPart(info.player)
-            for _ = 1, quota do
-                if #remaining == 0 then break end
-                table.sort(remaining, function(a, b)
-                    if not root then return a.nearestDist < b.nearestDist end
-                    local da = (a.pos - root.Position).Magnitude
-                    local db = (b.pos - root.Position).Magnitude
-                    if da == db then
-                        return a.nearestDist < b.nearestDist
-                    end
-                    return da < db
-                end)
-                local taken = table.remove(remaining, 1)
-                if taken then
-                    assignments[taken.model] = info.player
-                end
-            end
-        end
-    end
-
-    for _, info in ipairs(remaining) do
-        assignments[info.model] = getClosestPlayerForPos(info.pos, players)
-    end
-
-    return assignments, usingSelected
-end
-
--- Advanced cancel-chase: assign each NPC to a selected player when any are selected,
--- otherwise chase non-whitelisted players. If there are fewer NPCs than targets,
--- closest NPCs and closest players are prioritized.
-local function cancelChaseForModel(model, forcedPlayer)
-    if not isAllowed(model, "CancelChase") then return end
-    if not model or not model.Parent then return end
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-    local hrp = getBestPartForModel(model)
-    if not hrp then return end
-
-    local targetPlayer = forcedPlayer
-    if targetPlayer and (not targetPlayer.Parent or not isPlayerAlive(targetPlayer) or isPlayerWhitelisted(targetPlayer)) then
-        targetPlayer = nil
-    end
-    if not targetPlayer then
-        local pool = getChasePlayerPool()
-        local players = pool
-        targetPlayer = getClosestPlayerForPos(hrp.Position, players)
-    end
-
-    if not targetPlayer then
+local function stopAllChasePaths()
+    for model,_ in pairs(npcPathTasks) do
         stopNPCPath(model)
-        return
+    end
+end
+
+local function getBoolValueDeep(container, name)
+    if not container then return false end
+    local obj = container:FindFirstChild(name, true)
+    return obj ~= nil and obj:IsA("BoolValue") and obj.Value == true
+end
+
+local function isPlayerFlagTrue(plr, flagName)
+    if not plr then return false end
+    if getBoolValueDeep(plr, flagName) then return true end
+    if plr.Character and getBoolValueDeep(plr.Character, flagName) then return true end
+    return false
+end
+
+local function getPlayerChaseRoot(plr)
+    if not plr then return nil end
+    local char = plr.Character
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart or char:FindFirstChildWhichIsA("BasePart", true)
+    if not hum or not root then return nil end
+    if hum.Health <= 0 then return nil end
+    return char, hum, root
+end
+
+local function isChaseEligiblePlayer(plr)
+    if not plr then return false end
+    if isPlayerFlagTrue(plr, "Whitelisted") then return false end
+    local _, hum, root = getPlayerChaseRoot(plr)
+    return hum ~= nil and root ~= nil
+end
+
+local function getActiveChaseTargets()
+    local selected = {}
+    local fallback = {}
+    for _,pl in ipairs(Players:GetPlayers()) do
+        if isChaseEligiblePlayer(pl) then
+            table.insert(fallback, pl)
+            if isPlayerFlagTrue(pl, "Selected") then
+                table.insert(selected, pl)
+            end
+        end
+    end
+    if #selected > 0 then
+        return selected, true
+    end
+    return fallback, false
+end
+
+local function distanceModelToPlayer(model, plr)
+    local part = getBestPartForModel(model)
+    local _, _, root = getPlayerChaseRoot(plr)
+    if not part or not root then return math.huge end
+    local ok, dist = pcall(function() return (part.Position - root.Position).Magnitude end)
+    return ok and dist or math.huge
+end
+
+local function chooseNearestTarget(model, targets)
+    local bestTarget = nil
+    local bestDist = math.huge
+    for _,pl in ipairs(targets) do
+        local d = distanceModelToPlayer(model, pl)
+        if d < bestDist then
+            bestDist = d
+            bestTarget = pl
+        end
+    end
+    return bestTarget
+end
+
+local function buildChaseAssignments(models, targets)
+    local assignments = {}
+    if #models == 0 or #targets == 0 then
+        return assignments
     end
 
-    local existing = npcPathTasks[model]
-    if existing and existing.targetPlayer == targetPlayer then
+    if #models <= #targets then
+        -- Too few NPCs for every selected player: each NPC goes to the nearest valid target.
+        for _,model in ipairs(models) do
+            local target = chooseNearestTarget(model, targets)
+            if target then
+                assignments[model] = target
+            end
+        end
+        return assignments
+    end
+
+    -- Enough NPCs for multiple targets: split evenly, but give the closest NPCs priority to each target.
+    local targetInfo = {}
+    for _,pl in ipairs(targets) do
+        local nearest = math.huge
+        for _,model in ipairs(models) do
+            local d = distanceModelToPlayer(model, pl)
+            if d < nearest then
+                nearest = d
+            end
+        end
+        table.insert(targetInfo, { player = pl, score = nearest })
+    end
+    table.sort(targetInfo, function(a, b)
+        return a.score < b.score
+    end)
+
+    local remaining = {}
+    for _,model in ipairs(models) do
+        table.insert(remaining, model)
+    end
+
+    local baseQuota = math.floor(#models / #targets)
+    local extra = #models % #targets
+
+    for i,info in ipairs(targetInfo) do
+        local quota = baseQuota + ((i <= extra) and 1 or 0)
+        if quota > 0 and #remaining > 0 then
+            table.sort(remaining, function(a, b)
+                return distanceModelToPlayer(a, info.player) < distanceModelToPlayer(b, info.player)
+            end)
+            local used = {}
+            for idx = 1, math.min(quota, #remaining) do
+                local model = remaining[idx]
+                assignments[model] = info.player
+                used[model] = true
+            end
+            local nextRemaining = {}
+            for _,model in ipairs(remaining) do
+                if not used[model] then
+                    table.insert(nextRemaining, model)
+                end
+            end
+            remaining = nextRemaining
+        end
+    end
+
+    for _,model in ipairs(remaining) do
+        local target = chooseNearestTarget(model, targets)
+        if target then
+            assignments[model] = target
+        end
+    end
+
+    return assignments
+end
+
+local function refreshChaseAssignments()
+    local models = getNPCsArray()
+    local targets = getActiveChaseTargets()
+    chaseAssignments = buildChaseAssignments(models, targets)
+    return models, targets
+end
+
+local function applyChaseMovement(hum, baseSpeed, baseJump, boosted, verticalGap)
+    if not hum then return end
+    local speed = baseSpeed or hum.WalkSpeed or 16
+    local jump = baseJump or (hum.UseJumpPower ~= false and (hum.JumpPower or 50) or (hum.JumpHeight or 7.2))
+    if boosted then
+        speed = math.max(speed + 6, speed * 1.3)
+        jump = math.max(jump + 6, jump * 1.25)
+        if verticalGap and verticalGap > 8 then
+            speed = math.max(speed + 4, speed * 1.1)
+            jump = math.max(jump + 8, jump * 1.15)
+        end
+    end
+    pcall(function() hum.WalkSpeed = speed end)
+    pcall(function()
+        if hum.UseJumpPower ~= false then
+            hum.JumpPower = jump
+        else
+            hum.JumpHeight = jump
+        end
+    end)
+end
+
+local function restoreChaseMovement(hum, state)
+    if not hum or not state then return end
+    pcall(function() hum.WalkSpeed = state.baseSpeed or hum.WalkSpeed end)
+    pcall(function()
+        if hum.UseJumpPower ~= false then
+            hum.JumpPower = state.baseJump or hum.JumpPower
+        else
+            hum.JumpHeight = state.baseJump or hum.JumpHeight
+        end
+    end)
+end
+
+local function startChasePath(model, targetPlayer)
+    if not model or not targetPlayer then return end
+    local state = chaseState[model] or {}
+    chaseState[model] = state
+
+    if state.running and state.target == targetPlayer then
         return
     end
 
     stopNPCPath(model)
 
-    local okHrpPos, hrpPos = pcall(function() return hrp.Position end)
-    if not okHrpPos or not hrpPos then return end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local root = getBestPartForModel(model)
+    if not hum or not root then return end
 
-    local targetChar = targetPlayer.Character
-    if not targetChar then return end
-    local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
-    local targetRoot = getPlayerRootPart(targetPlayer)
-    if not targetHum or not targetRoot or (targetHum.Health and targetHum.Health <= 0) then return end
-
-    local okTargetPos, targetPos = pcall(function() return targetRoot.Position end)
-    if not okTargetPos or not targetPos then return end
+    state.running = true
+    state.target = targetPlayer
+    state.baseSpeed = state.baseSpeed or hum.WalkSpeed or 16
+    state.baseJump = state.baseJump or (hum.UseJumpPower ~= false and (hum.JumpPower or 50) or (hum.JumpHeight or 7.2))
 
     local cancelToken = { cancelled = false }
     npcPathTasks[model] = {
-        targetPlayer = targetPlayer,
-        cancel = function() cancelToken.cancelled = true end,
+        cancel = function()
+            cancelToken.cancelled = true
+        end
     }
 
-    coroutine.wrap(function()
-        if cancelToken.cancelled then return end
-        if not hum or not hum.Parent or not model or not model.Parent then return end
-
-        local success, pathOrErr = pcall(function()
-            local p = PathfindingService:CreatePath({
-                AgentRadius = 2,
-                AgentHeight = 5,
-                AgentCanJump = true,
-                AgentMaxSlope = 45,
-            })
-            p:ComputeAsync(hrp.Position, targetPos)
-            return p
-        end)
-
-        if not success or not pathOrErr then
-            if cancelToken.cancelled then return end
-            pcall(function() hum:MoveTo(targetPos) end)
-            return
-        end
-
-        local path = pathOrErr
-        if path.Status ~= Enum.PathStatus.Success then
-            if cancelToken.cancelled then return end
-            pcall(function() hum:MoveTo(targetPos) end)
-            return
-        end
-
-        local waypoints = path:GetWaypoints()
-        for _, wp in ipairs(waypoints) do
-            if cancelToken.cancelled then break end
-            if not hum or not hum.Parent or not model or not model.Parent then break end
-            if not targetPlayer.Parent or not isPlayerAlive(targetPlayer) or isPlayerWhitelisted(targetPlayer) then
-                cancelToken.cancelled = true
-                break
+    task.spawn(function()
+        local blockedConn = nil
+        local function cleanup()
+            if blockedConn then
+                pcall(function() blockedConn:Disconnect() end)
+                blockedConn = nil
             end
-
-            local liveRoot = getPlayerRootPart(targetPlayer)
-            if not liveRoot then
-                cancelToken.cancelled = true
-                break
+            restoreChaseMovement(hum, state)
+            if chaseState[model] then
+                chaseState[model].running = false
             end
-
-            if wp.Action == Enum.PathWaypointAction.Jump then
-                pcall(function() hum.Jump = true end)
-            end
-
-            local wpPos = wp.Position
-            pcall(function() hum:MoveTo(wpPos) end)
-
-            local reached = false
-            local startT = tick()
-            while not reached and not cancelToken.cancelled and tick() - startT < 6 do
-                if not hum or not hum.Parent or not model or not model.Parent then break end
-                if not targetPlayer.Parent or not isPlayerAlive(targetPlayer) or isPlayerWhitelisted(targetPlayer) then
-                    cancelToken.cancelled = true
-                    break
-                end
-                local currentRoot = getPlayerRootPart(targetPlayer)
-                if not currentRoot then
-                    cancelToken.cancelled = true
-                    break
-                end
-                local part = getBestPartForModel(model)
-                if part and part.Parent then
-                    local dist = (part.Position - wpPos).Magnitude
-                    if dist <= 4 then
-                        reached = true
-                        break
-                    end
-                end
-                task.wait(0.12)
-            end
-            if cancelToken.cancelled then break end
-        end
-
-        if npcPathTasks[model] and npcPathTasks[model].targetPlayer == targetPlayer then
             npcPathTasks[model] = nil
         end
-    end)()
+
+        local ok, err = pcall(function()
+            local lastGoalPos = nil
+            local lastRepathAt = 0
+
+            while not cancelToken.cancelled do
+                if not model.Parent or not hum.Parent then break end
+
+                local assigned = chaseAssignments[model]
+                if not assigned or assigned ~= targetPlayer then break end
+
+                local char, targetHum, targetRoot = getPlayerChaseRoot(targetPlayer)
+                if not char or not targetHum or not targetRoot then break end
+
+                root = getBestPartForModel(model)
+                if not root then break end
+
+                local startPos = root.Position
+                local goalPos = targetRoot.Position
+                local verticalGap = goalPos.Y - startPos.Y
+                local goalMoved = lastGoalPos and (goalPos - lastGoalPos).Magnitude or math.huge
+                local now = tick()
+
+                if lastGoalPos and goalMoved < 4 and (now - lastRepathAt) < 0.35 then
+                    applyChaseMovement(hum, state.baseSpeed, state.baseJump, verticalGap > 7, verticalGap)
+                    task.wait(0.08)
+                else
+                    lastGoalPos = goalPos
+                    lastRepathAt = now
+
+                    local path = PathfindingService:CreatePath({
+                        AgentRadius = 3,
+                        AgentHeight = 6,
+                        AgentCanJump = true,
+                        AgentMaxSlope = 35,
+                        WaypointSpacing = 3,
+                    })
+                    local success = pcall(function()
+                        path:ComputeAsync(startPos, goalPos)
+                    end)
+
+                    if not success or path.Status ~= Enum.PathStatus.Success then
+                        -- Do not force a direct MoveTo fallback here; that is what was causing wall-bumps and bad sidetracks.
+                        applyChaseMovement(hum, state.baseSpeed, state.baseJump, verticalGap > 7, verticalGap)
+                        task.wait(0.2)
+                    else
+                        if blockedConn then
+                            pcall(function() blockedConn:Disconnect() end)
+                            blockedConn = nil
+                        end
+                        local blocked = false
+                        blockedConn = path.Blocked:Connect(function()
+                            blocked = true
+                        end)
+
+                        local waypoints = path:GetWaypoints()
+                        for _,wp in ipairs(waypoints) do
+                            if cancelToken.cancelled or blocked then break end
+                            if not model.Parent or not hum.Parent then break end
+
+                            assigned = chaseAssignments[model]
+                            if not assigned or assigned ~= targetPlayer then break end
+
+                            char, targetHum, targetRoot = getPlayerChaseRoot(targetPlayer)
+                            if not char or not targetHum or not targetRoot then break end
+
+                            root = getBestPartForModel(model)
+                            if not root then break end
+
+                            goalPos = targetRoot.Position
+                            verticalGap = goalPos.Y - root.Position.Y
+                            local boosted = verticalGap > 7 or wp.Action == Enum.PathWaypointAction.Jump
+                            applyChaseMovement(hum, state.baseSpeed, state.baseJump, boosted, verticalGap)
+                            if boosted then
+                                pcall(function() hum.Jump = true end)
+                            end
+                            pcall(function() hum:MoveTo(wp.Position) end)
+
+                            local wpStart = tick()
+                            while tick() - wpStart < 1.5 do
+                                if cancelToken.cancelled or blocked then break end
+                                if not model.Parent or not hum.Parent then break end
+
+                                assigned = chaseAssignments[model]
+                                if not assigned or assigned ~= targetPlayer then break end
+
+                                char, targetHum, targetRoot = getPlayerChaseRoot(targetPlayer)
+                                if not char or not targetHum or not targetRoot then break end
+
+                                root = getBestPartForModel(model)
+                                if not root then break end
+
+                                local currentGoal = targetRoot.Position
+                                if (currentGoal - goalPos).Magnitude > 6 then
+                                    blocked = true
+                                    break
+                                end
+                                if (root.Position - wp.Position).Magnitude <= 4 then
+                                    break
+                                end
+                                task.wait(0.08)
+                            end
+
+                            if blocked then break end
+                        end
+
+                        if blockedConn then
+                            pcall(function() blockedConn:Disconnect() end)
+                            blockedConn = nil
+                        end
+                        task.wait(0.03)
+                    end
+                end
+            end
+        end)
+
+        if not ok then
+            warn("CancelChase path error for", model, err)
+        end
+        cleanup()
+    end)
+end
+
+-- Advanced cancel-chase: assigns NPCs to selected players when any are selected; otherwise targets all non-whitelisted players.
+-- Paths are locked per NPC, repathed on movement, and boosted for elevated targets.
+local function cancelChaseForModel(model)
+    if not isAllowed(model, "CancelChase") then return end
+    if not model or not model.Parent then return end
+    local target = chaseAssignments[model]
+    if not target or not target.Parent or not isChaseEligiblePlayer(target) then
+        local targets = getActiveChaseTargets()
+        target = chooseNearestTarget(model, targets)
+        if target then
+            chaseAssignments[model] = target
+        end
+    end
+    if not target then
+        stopNPCPath(model)
+        return
+    end
+    startChasePath(model, target)
 end
 
 -- Void v4: PlatformStand, disable collisions, apply Y velocity (default -500). Accepts optional yVel param.
+
 local function voidV4Model(model, yVel)
     if not isAllowed(model, "VoidV4") then return end
     yVel = tonumber(yVel) or -500
@@ -2291,7 +2333,13 @@ sitLoopBtn.MouseButton1Click:Connect(function() loops.sit = not loops.sit; sitLo
 anchorBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do toggleAnchor(m) end end)
 anchorLoopBtn.MouseButton1Click:Connect(function() loops.anchor = not loops.anchor; anchorLoopBtn.Text = "Loop: " .. (loops.anchor and "On" or "Off"); if loops.anchor then startLoop("anchor", function() for _,m in ipairs(getNPCsArray()) do toggleAnchor(m) end end) else stopLoop("anchor") end end)
 
-cancelChaseBtn.MouseButton1Click:Connect(function() cancelChaseEnabled = not cancelChaseEnabled; cancelChaseBtn.Text = "Cancel-Chase: "..tostring(cancelChaseEnabled) end)
+cancelChaseBtn.MouseButton1Click:Connect(function()
+    cancelChaseEnabled = not cancelChaseEnabled
+    cancelChaseBtn.Text = "Cancel-Chase: " .. tostring(cancelChaseEnabled)
+    if not cancelChaseEnabled then
+        stopAllChasePaths()
+    end
+end)
 
 -- Void v4 handlers (global)
 v4Btn.MouseButton1Click:Connect(function()
@@ -2427,18 +2475,17 @@ do
             end
         end
         if cancelChaseEnabled then
-            local assignments = buildCancelChaseAssignments()
+            refreshChaseAssignments()
             for model,_ in pairs(NPCs) do
                 if model and model.Parent and isNPC(model) then
-                    local targetPlayer = assignments[model]
-                    if targetPlayer then
-                        pcall(function()
-                            cancelChaseForModel(model, targetPlayer)
-                        end)
-                    else
-                        stopNPCPath(model)
-                    end
+                    pcall(function()
+                        cancelChaseForModel(model)
+                    end)
                 end
+            end
+        else
+            if next(npcPathTasks) ~= nil then
+                stopAllChasePaths()
             end
         end
         updateAllTrackers()
