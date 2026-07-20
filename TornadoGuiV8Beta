@@ -1,4 +1,4 @@
--- Tornado LocalScript — v9.0 Stable Orbit + Funnel Width + Rope Wiggle + Weld Check + Nightmare Targeting
+-- Tornado LocalScript — v8.4 Compact + Stable Orbit + Freeze + Funnel Width + Rope Line + Random Distance Limit
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -29,11 +29,11 @@ local subVortexHeight = 120
 local subVortexWidth = 200
 local mainFunnelShare = 0.7
 
--- NEW: Main Funnel Width (max orbit radius for main funnel parts)
+-- Main Funnel Width (max orbit radius for main funnel parts)
 local mainFunnelWidth = 50
 
--- NEW: Max distance from player in Random mode
-local maxRandomRange = 1500
+-- Random mode: max distance the funnel can drift from the player
+local randomMaxDistance = 1500
 
 local verticalChainMinParts = 3
 local verticalChainMaxParts = 6
@@ -84,53 +84,13 @@ local nightmareMode = false
 local noodlePools = {}
 local noodlePartSet = {}
 local ropeParts = {}
-local ropeSegments = {}
+local ropeSegments = {}  -- now: list of {parts={...}, wigglePhase=..., wiggleFreq=..., wiggleAmp=...}
+local ropeLines = {}     -- each rope line = ordered list of parts forming a chain
 local nextMainNoodleId = 1
 local guiVisible = true
 
 -- Track original anchored states for freeze/unfreeze
 local frozenParts = {}  -- part -> true
-
--- ========== HELPER: Check if a part is connected (welded/constrained) to an anchored part ==========
-local function isConnectedToAnchored(part)
-    -- Check WeldConstraints
-    for _, constraint in ipairs(part:GetConstraints()) do
-        if constraint:IsA("WeldConstraint") then
-            local other = constraint.Part0 == part and constraint.Part1 or (constraint.Part1 == part and constraint.Part0)
-            if other and other:IsA("BasePart") and other.Anchored then
-                return true
-            end
-        end
-    end
-    -- Check old Weld objects (JointInstance)
-    for _, joint in ipairs(part:GetJoints()) do
-        if joint:IsA("Weld") or joint:IsA("Snap") then
-            local other = joint.Part0 == part and joint.Part1 or (joint.Part1 == part and joint.Part0)
-            if other and other:IsA("BasePart") and other.Anchored then
-                return true
-            end
-        end
-    end
-    -- Check ManualWeld/SurfaceWeld
-    for _, weld in ipairs(part:GetChildren()) do
-        if (weld:IsA("Weld") or weld:IsA("ManualWeld") or weld:IsA("SurfaceWeld")) then
-            local other = weld.Part0 == part and weld.Part1 or (weld.Part1 == part and weld.Part0)
-            if other and other:IsA("BasePart") and other.Anchored then
-                return true
-            end
-        end
-    end
-    -- Also check if the part is itself welded to something that ultimately chains to an anchored part
-    -- We do a simple one-hop check: if any neighbor via attachment/constraint is anchored
-    for _, att in ipairs(part:GetAttachments()) do
-        for _, c in ipairs(att:GetConnectedParts(true)) do
-            if c ~= part and c:IsA("BasePart") and c.Anchored then
-                return true
-            end
-        end
-    end
-    return false
-end
 
 -- ========== UI - ULTRA COMPACT 280px ==========
 local screenGui = Instance.new("ScreenGui")
@@ -142,7 +102,7 @@ screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
 
 local scale = isMobile and 1.1 or 1.0
 local guiWidth = math.floor(220 * scale)
-local guiHeight = 280  -- FIXED 280px as requested
+local guiHeight = 280  -- FIXED 280px
 local btnSize = math.floor(26 * scale)
 
 -- ========== TOGGLE BUTTON (left side) ==========
@@ -326,8 +286,7 @@ inputRefs.subVortexHeight = addTextbox("Sub Height", subVortexHeight, "Sub-vorte
 inputRefs.subVortexWidth = addTextbox("Sub Width", subVortexWidth, "Orbital radius. No limit.")
 inputRefs.mainFunnelShare = addTextbox("Main Funnel %", mainFunnelShare * 100, "% parts for main funnel.")
 inputRefs.randomPathSpeed = addTextbox("Rand Path Speed", tornadoRandomPathSpeed, "Speed for random path.")
--- NEW: Max random range textbox
-inputRefs.maxRandomRange = addTextbox("Max Random Range", maxRandomRange, "Max distance from you in Random mode.")
+inputRefs.randomMaxDist = addTextbox("Max Random Dist", randomMaxDistance, "Max funnel distance from you in Random mode.")
 
 -- ========== PATH TYPE SELECTOR ==========
 local pathContainer = Instance.new("Frame")
@@ -367,7 +326,7 @@ for i, mode in ipairs(pathModes) do
         for _, b in pairs(pathBtns) do b.BackgroundColor3 = Color3.fromRGB(50, 50, 58) end
         btn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
         if mode == "Follow" then pathExplain.Text = "Follows you."
-        elseif mode == "Random" then pathExplain.Text = "Random paths within max range."
+        elseif mode == "Random" then pathExplain.Text = "Random paths within Max Random Dist."
         elseif mode == "Stalker" then pathExplain.Text = "Follows a player. NM flings." end
     end)
 end
@@ -494,11 +453,9 @@ end)
 inputRefs.randomPathSpeed.FocusLost:Connect(function()
     local v = tonumber(inputRefs.randomPathSpeed.Text); if v then tornadoRandomPathSpeed = math.max(1, v); inputRefs.randomPathSpeed.Text = tostring(tornadoRandomPathSpeed) end
 end)
--- NEW: Max random range bind
-inputRefs.maxRandomRange.FocusLost:Connect(function()
-    local v = tonumber(inputRefs.maxRandomRange.Text)
-    if v then maxRandomRange = math.max(10, v); inputRefs.maxRandomRange.Text = tostring(maxRandomRange)
-    else inputRefs.maxRandomRange.Text = tostring(maxRandomRange) end
+inputRefs.randomMaxDist.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.randomMaxDist.Text)
+    if v then randomMaxDistance = math.max(10, v); inputRefs.randomMaxDist.Text = tostring(randomMaxDistance) end
 end)
 
 -- ========== HELPER FUNCTIONS ==========
@@ -509,16 +466,8 @@ local function isPlayerPart(part)
     return false
 end
 
--- Check if part should be skipped due to being connected to an anchored part
-local function isPartTetheredToAnchored(part)
-    if part.Anchored then return true end
-    return isConnectedToAnchored(part)
-end
-
 local function processPartForFunnel(obj)
     if obj:IsA("BasePart") and not obj.Anchored and not isPlayerPart(obj) and obj.Name ~= baseplateName then
-        -- Skip parts that are welded/connected to an anchored part (they're tethered)
-        if isPartTetheredToAnchored(obj) then return end
         if not whitelistedParts[obj] and not assignedToSatellite[obj] and not noodlePartSet[obj] and not mainFunnelSet[obj] and not ropeParts[obj] then
             pickedUpByFunnel[obj] = true; whitelistedParts[obj] = true
         end
@@ -557,58 +506,69 @@ local function reserveMainFunnelParts()
     end
 end
 
--- ========== STABLE FORCE + MAIN FUNNEL WIDTH STRONG INWARD PULL + VERTICAL BOB ==========
+-- ========== STABLE FORCE + MAIN FUNNEL WIDTH + COUNTER SPIN INWARD PULL ==========
 local function applyFunnelForceToPart(part, centerPos, delta, isMain)
     if not part or not part.Parent then return end
-    
-    -- Re-check if the part is now tethered to an anchored part (could have been welded after pickup)
-    if isPartTetheredToAnchored(part) then
-        -- Don't apply velocity, it'll be moved by the weld. Remove from tracking so it gets re-checked later.
-        return
-    end
-    
     local offset = part.Position - centerPos
     local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
     local distance = math.max(0.1, horizontalOffset.Magnitude)
     local dirToCenter = horizontalOffset.Unit
     local spinDir = Vector3.new(-dirToCenter.Z, 0, dirToCenter.X)
 
+    -- MAIN FUNNEL WIDTH: clamp the orbit radius for main funnel parts
     local maxRadius = isMain and mainFunnelWidth or tornadoWindfield
+    local clampedDist = math.min(distance, maxRadius)
 
-    -- === FUNNEL WIDTH: STRONG INWARD PULL TO COUNTER SPIN ===
-    -- The inward pull needs to directly counteract the centrifugal force from spin speed
-    -- Formula: inward pull scales with spinSpeed^2 * distance / maxRadius (centrifugal counter)
-    local centrifugalFactor = (tornadoSpinSpeed / 250) ^ 2  -- normalized to default
-    local inwardStrength = tornadoSpinSpeed * 0.6 * centrifugalFactor * (1 + distance / math.max(1, maxRadius))
+    -- === IMPROVED INWARD PULL that COUNTERS spinspeed ===
+    -- Calculate centripetal force needed for circular orbit at this speed
+    -- F_centripetal = v^2 / r
+    -- We want enough inward pull to maintain orbit without flying outward
+    local spinVelocity = tornadoSpinSpeed * (1 + (clampedDist / math.max(1, maxRadius)) * 0.1)
+    local centripetalForce = (spinVelocity * spinVelocity) / math.max(1, clampedDist)
     
-    -- Base inward pull
+    -- Inward pull: strong enough to counteract the spin, with extra damping
+    local inwardStrength = centripetalForce * 0.08 + tornadoSpinSpeed * 0.25
     local inwardPull = -dirToCenter * inwardStrength
 
-    -- EXTRA INWARD FORCE when part exceeds the funnel width boundary
+    -- If beyond max width, add aggressive inward pull back
     local extraInward = 0
     if distance > maxRadius * 0.85 then
-        -- Strong exponential pull-back when breaching the width limit
-        local breach = (distance - maxRadius * 0.85) / math.max(1, maxRadius * 0.15)
-        extraInward = breach * breach * tornadoSpinSpeed * 2.5
+        extraInward = (distance - maxRadius * 0.85) * 3.5
+        inwardPull = inwardPull - dirToCenter * extraInward
+    end
+    
+    -- Anti-spin damping: apply a slight counter-rotation resistance
+    -- so parts don't get flung out by the spin
+    local damping = 0
+    if distance > maxRadius * 0.5 then
+        damping = (distance / maxRadius) * 0.3
     end
 
-    -- Spin velocity (tangential)
-    local rotational = spinDir * (tornadoSpinSpeed * (0.8 + (distance / math.max(1, maxRadius)) * 0.2))
-
-    -- Upward with vertical bob
     local upward = Vector3.new(0, tornadoUpwardSpeed, 0)
+
+    -- Rotational force
+    local rotational = spinDir * spinVelocity
+
+    -- VERTICAL BOB: make parts go up and down repeatedly to keep structure
     local time = tick()
-    local bobFreq = 1.5 + (distance / math.max(1, maxRadius)) * 0.5
+    local bobFreq = 1.5 + (clampedDist / math.max(1, maxRadius)) * 0.5
+    local bobAmp = 8 + math.sin(time * 0.3 + distance * 0.01) * 3
     local anglePhase = math.atan2(offset.Z, offset.X) or 0
-    local bobOffset = math.sin(time * bobFreq + anglePhase) * 8
+    local bobOffset = math.sin(time * bobFreq + anglePhase) * bobAmp
     upward = upward + Vector3.new(0, bobOffset * delta * 3, 0)
 
-    -- Assemble target velocity
-    local targetVel = rotational + inwardPull + upward - dirToCenter * extraInward
+    -- Dampen existing velocity that's going outward
     local currentVel = part.AssemblyLinearVelocity
+    local outwardComponent = currentVel:Dot(dirToCenter)
+    local dampeningForce = Vector3.new(0, 0, 0)
+    if outwardComponent > 0 then
+        dampeningForce = -dirToCenter * outwardComponent * damping
+    end
 
-    -- Smooth blend (higher factor = more responsive)
-    local smoothFactor = math.min(1, delta * 8)
+    local targetVel = rotational + inwardPull + upward + dampeningForce
+
+    -- SMOOTHER BLEND for stable high-speed travel
+    local smoothFactor = math.min(1, delta * 6)
     local finalVel = currentVel:Lerp(targetVel, smoothFactor)
 
     if not part.Anchored then
@@ -639,94 +599,101 @@ local function applyTornadoPhysics(position, delta)
         if obj:IsA("BasePart") and not obj.Anchored and not isPlayerPart(obj) and obj.Name ~= baseplateName then
             processPartForFunnel(obj)
             if whitelistedParts[obj] and not assignedToSatellite[obj] and not noodlePartSet[obj] and not mainFunnelSet[obj] and not ropeParts[obj] then
-                -- Re-check tether before applying physics (in case weld was added after initial pickup)
-                if not isPartTetheredToAnchored(obj) then
-                    applyFunnelForceToPart(obj, position, delta, false)
-                    if obj.Position.Y >= (position.Y + funnelHeight) and not debrisAttachedToPlayer[obj] then snapPartDown(obj, position.Y) end
-                end
+                applyFunnelForceToPart(obj, position, delta, false)
+                if obj.Position.Y >= (position.Y + funnelHeight) and not debrisAttachedToPlayer[obj] then snapPartDown(obj, position.Y) end
             end
         end
     end
 end
 
--- ========== ROPE TORNADO — Aligned line of parts that wiggles ==========
+-- ========== ROPE TORNADO — ALIGNED LINE OF PARTS THAT WIGGLES ==========
 local function spawnRopeTornado()
     -- Clean up old rope parts
-    for part in pairs(ropeParts) do if part and part.Parent then part.AssemblyLinearVelocity = Vector3.zero; part.CanCollide = true; ropeParts[part] = nil end end
+    for part in pairs(ropeParts) do 
+        if part and part.Parent then 
+            part.AssemblyLinearVelocity = Vector3.zero
+            part.CanCollide = true
+        end
+        ropeParts[part] = nil
+    end
+    ropeLines = {}
     ropeSegments = {}
+    
     if #tornadoPositions == 0 then return end
     
     local available = {}
     for p in pairs(whitelistedParts) do 
-        if p and p.Parent and not p.Anchored and not isPartTetheredToAnchored(p) then 
-            table.insert(available, p) 
-        end 
+        if p and p.Parent and not p.Anchored then 
+            table.insert(available, p)
+        end
     end
     if #available == 0 then return end
-
-    for ti, centerPos in ipairs(tornadoPositions) do
-        local numRopes = math.max(1, math.min(6, math.floor(#available / 4)))
+    
+    local centerPos = tornadoPositions[1]
+    local numLines = math.max(2, math.min(8, math.floor(#available / 3)))
+    local partsPerLine = math.max(3, math.floor(#available / math.max(1, numLines)))
+    
+    for l = 1, numLines do
+        local lineParts = {}
+        local startAngle = (l / numLines) * math.pi * 2
+        local baseDist = math.random(8, math.max(15, subVortexWidth * 0.5))
         
-        for r = 1, numRopes do
-            local angleOffset = (r / numRopes) * math.pi * 2
-            local ropeLength = math.random(5, 12)   -- number of parts in this rope line
-            local spacing = math.random(4, 8)        -- studs between each part
-            local ropeDist = math.random(8, math.max(12, subVortexWidth * 0.3))
-            
-            local ropeLine = {}
-            
-            for s = 1, ropeLength do
-                if #available == 0 then break end
-                local idx = math.random(1, #available)
-                local p = table.remove(available, idx)
-                if p and p.Parent then
-                    ropeParts[p] = true
-                    whitelistedParts[p] = nil
-                    pickedUpByFunnel[p] = nil
-                    assignedToSatellite[p] = nil
-                    mainFunnelSet[p] = nil
-                    
-                    -- Each part sits along a rope line extending upward and slightly outward
-                    local t = (s - 1) / math.max(1, ropeLength - 1)  -- 0 to 1 along rope
-                    local baseHeight = s * spacing
-                    local spreadOut = 1 + t * 0.3  -- wider at top
-                    
-                    local baseX = math.cos(angleOffset + t * 0.5) * ropeDist * spreadOut
-                    local baseZ = math.sin(angleOffset + t * 0.5) * ropeDist * spreadOut
-                    
-                    -- Unique wiggle parameters per part for natural snake motion
-                    local phase = math.random() * math.pi * 2
-                    local freq = 0.8 + math.random() * 1.5
-                    local amp = math.random(3, 8 + s * 0.5)  -- more wiggle at tips
-                    local phase2 = math.random() * math.pi * 2
-                    local freq2 = 0.4 + math.random() * 0.8
-                    local amp2 = math.random(2, 5)
-                    
-                    table.insert(ropeLine, {
-                        part = p,
-                        segmentIndex = s,
-                        ropeLength = ropeLength,
-                        spacing = spacing,
-                        baseOffset = Vector3.new(baseX, baseHeight, baseZ),
-                        angleOffset = angleOffset,
-                        t = t,
-                        wigglePhase = phase,
-                        wiggleFreq = freq,
-                        wiggleAmp = amp,
-                        wigglePhase2 = phase2,
-                        wiggleFreq2 = freq2,
-                        wiggleAmp2 = amp2,
-                        -- For alignment: keep a relative offset from the part below
-                        prevPart = nil,  -- will link after
-                    })
-                end
+        -- Spacing between parts along the line (vertical-ish stack)
+        local vertSpacing = math.random(4, 8)
+        local horizSpread = 1.5
+        
+        for s = 1, partsPerLine do
+            if #available == 0 then break end
+            local idx = math.random(1, #available)
+            local p = table.remove(available, idx)
+            if p and p.Parent then
+                ropeParts[p] = true
+                whitelistedParts[p] = nil
+                pickedUpByFunnel[p] = nil
+                assignedToSatellite[p] = nil
+                mainFunnelSet[p] = nil
+                
+                -- Each part in the line gets an offset that creates a "stack"
+                -- The line extends upward and slightly outward
+                local angle = startAngle + (s / partsPerLine) * 0.5
+                local dist = baseDist + s * horizSpread
+                local heightOffset = s * vertSpacing
+                
+                table.insert(lineParts, {
+                    part = p,
+                    lineIndex = s,
+                    baseOffset = Vector3.new(
+                        math.cos(angle) * dist,
+                        heightOffset,
+                        math.sin(angle) * dist
+                    ),
+                    wigglePhase = math.random() * math.pi * 2,
+                    wiggleFreq = 1.2 + math.random() * 2.5,
+                    wiggleAmp = math.random(3, 10),
+                    -- Secondary wiggle for chaotic rope feel
+                    sPhase = math.random() * math.pi * 2,
+                    sFreq = 0.5 + math.random() * 1.5,
+                    sAmp = math.random(2, 6),
+                    -- Index used for sequential delay in wiggling
+                    segOrder = s
+                })
             end
+        end
+        
+        -- Sort so parts maintain order (lowest to highest)
+        table.sort(lineParts, function(a, b) return (a.segOrder or 0) < (b.segOrder or 0) end)
+        
+        if #lineParts >= 2 then
+            local lineData = {
+                parts = lineParts,
+                startAngle = startAngle,
+                baseDist = baseDist,
+                vertSpacing = vertSpacing
+            }
+            table.insert(ropeLines, lineData)
             
-            -- Link parts in the rope line
-            for i, seg in ipairs(ropeLine) do
-                if i > 1 then
-                    seg.prevPart = ropeLine[i - 1].part
-                end
+            -- Also add all segs to ropeSegments for the update loop
+            for _, seg in ipairs(lineParts) do
                 table.insert(ropeSegments, seg)
             end
         end
@@ -734,77 +701,101 @@ local function spawnRopeTornado()
 end
 
 local function updateRopeTornado(delta)
-    if #tornadoPositions == 0 then return end
+    if #tornadoPositions == 0 or #ropeLines == 0 then return end
     local time = tick()
+    local centerPos = tornadoPositions[1]
     
-    -- Build a lookup for segments grouped by tornado position affinity
-    for _, seg in ipairs(ropeSegments) do
-        local p = seg.part
-        if not p or not p.Parent or isPartTetheredToAnchored(p) then continue end
+    for _, line in ipairs(ropeLines) do
+        -- Find the center for this line (offset from main tornado position)
+        local lineAngle = line.startAngle
+        local orbitRad = math.max(5, subVortexWidth * 0.2)
+        local lineCenter = centerPos + Vector3.new(
+            math.cos(lineAngle + math.sin(time * 0.3) * 0.2) * orbitRad,
+            3 + math.sin(time * 0.5 + lineAngle) * 2,
+            math.sin(lineAngle + math.sin(time * 0.3) * 0.2) * orbitRad
+        )
         
-        -- Find nearest tornado center
-        local centerPos = tornadoPositions[1]
-        local bestDist = math.huge
-        for _, tp in ipairs(tornadoPositions) do
-            local d = (p.Position - tp).Magnitude
-            if d < bestDist then bestDist = d; centerPos = tp end
-        end
-        
-        -- === WIGGLE CALCULATION ===
-        -- Primary sine wave along the rope
-        local w1 = math.sin(time * seg.wiggleFreq + seg.wigglePhase) * seg.wiggleAmp
-        -- Secondary sine wave (perpendicular-ish) for 3D motion
-        local w2 = math.cos(time * seg.wiggleFreq2 + seg.wigglePhase2) * seg.wiggleAmp2
-        
-        -- Base position (the aligned position along the rope)
-        local basePos = centerPos + seg.baseOffset
-        
-        -- The wiggle moves the part in a helix/spiral pattern around its base position
-        -- Use the segment t (0-1 along rope) to create a wave that propagates upward
-        local wavePhase = time * 2.0 + seg.segmentIndex * 0.4 + seg.angleOffset
-        
-        -- Horizontal wiggle (circular/tornado-like)
-        local wiggleX = math.sin(wavePhase) * (seg.wiggleAmp * 0.6 + w1 * 0.3)
-        local wiggleZ = math.cos(wavePhase * 0.7 + 1.2) * (seg.wiggleAmp * 0.6 + w2 * 0.3)
-        
-        -- Vertical wave (makes the rope look like it's snaking up and down)
-        local wiggleY = math.sin(time * 1.2 + seg.segmentIndex * 0.5 + seg.angleOffset) * 3
-        
-        local targetPos = basePos + Vector3.new(wiggleX, wiggleY, wiggleZ)
-        
-        -- ALIGNMENT: if this part has a part below it in the rope, maintain spacing
-        if seg.prevPart and seg.prevPart.Parent then
-            local belowPos = seg.prevPart.Position
-            local desiredDir = (targetPos - belowPos)
-            local desiredDist = seg.spacing * 1.2
-            if desiredDir.Magnitude > 0.1 then
-                local dir = desiredDir.Unit
-                -- Pull toward aligned position relative to the part below
-                local alignedPos = belowPos + dir * desiredDist
-                -- Blend between wiggle target and alignment target (70% wiggle, 30% alignment)
-                targetPos = targetPos * 0.7 + alignedPos * 0.3
+        for segIdx, seg in ipairs(line.parts) do
+            local p = seg.part
+            if not p or not p.Parent then continue end
+            
+            -- Calculate target position: base offset + wiggles
+            -- Uses a phase delay based on position in line for wave-like motion
+            local phaseOffset = seg.segOrder * 0.7
+            
+            -- Primary wiggle (faster) + secondary wiggle (slower, chaotic)
+            local wiggle1 = Vector3.new(
+                math.sin(time * seg.wiggleFreq + seg.wigglePhase + phaseOffset) * seg.wiggleAmp,
+                math.sin(time * seg.wiggleFreq * 0.7 + seg.wigglePhase + phaseOffset) * seg.wiggleAmp * 0.5,
+                math.cos(time * seg.wiggleFreq + seg.wigglePhase + phaseOffset) * seg.wiggleAmp
+            )
+            
+            local wiggle2 = Vector3.new(
+                math.sin(time * seg.sFreq + seg.sPhase + phaseOffset * 0.3) * seg.sAmp,
+                math.cos(time * seg.sFreq * 0.5 + seg.sPhase + phaseOffset * 0.3) * seg.sAmp * 0.7,
+                math.sin(time * seg.sFreq + seg.sPhase + phaseOffset * 0.3) * seg.sAmp
+            )
+            
+            -- Base position along the line
+            local basePos = lineCenter + seg.baseOffset
+            
+            -- Add a slight rotational twist to the whole line
+            local twistAngle = math.sin(time * 0.4 + lineAngle) * 0.3
+            local relPos = basePos - lineCenter
+            local twistedPos = Vector3.new(
+                relPos.X * math.cos(twistAngle) - relPos.Z * math.sin(twistAngle),
+                relPos.Y,
+                relPos.X * math.sin(twistAngle) + relPos.Z * math.cos(twistAngle)
+            )
+            basePos = lineCenter + twistedPos
+            
+            local targetPos = basePos + wiggle1 + wiggle2
+            
+            -- Keep it within height limits
+            if targetPos.Y > centerPos.Y + funnelHeight then
+                targetPos = Vector3.new(targetPos.X, centerPos.Y + funnelHeight * 0.7, targetPos.Z)
+            end
+            
+            local vel = (targetPos - p.Position) / math.max(delta, 0.016)
+            local maxVel = 300 + seg.wiggleAmp * 8
+            if vel.Magnitude > maxVel then
+                vel = vel.Unit * maxVel
+            end
+            
+            local smoothFactor = math.min(1, delta * 5)
+            p.AssemblyLinearVelocity = p.AssemblyLinearVelocity:Lerp(vel, smoothFactor)
+            p.CanCollide = false
+            
+            -- Snap down if too high
+            if p.Position.Y >= (centerPos.Y + funnelHeight) then
+                snapPartDown(p, centerPos.Y)
             end
         end
         
-        -- Also rotate around center for the tornado spin effect
-        local toCenter = (basePos - centerPos)
-        local horiz = Vector3.new(toCenter.X, 0, toCenter.Z)
-        if horiz.Magnitude > 0.5 then
-            local perp = Vector3.new(-horiz.Z, 0, horiz.X).Unit
-            local spinAmount = math.sin(time * seg.wiggleFreq * 0.5 + seg.angleOffset) * seg.wiggleAmp * 0.8
-            targetPos = targetPos + perp * spinAmount
+        -- === CONNECTIVE FORCE: keep parts in line ===
+        -- Pull adjacent parts toward each other to maintain the "rope" shape
+        for segIdx = 2, #line.parts do
+            local prev = line.parts[segIdx - 1]
+            local curr = line.parts[segIdx]
+            if prev and curr and prev.part and curr.part and prev.part.Parent and curr.part.Parent then
+                local pp = prev.part
+                local cp = curr.part
+                local between = pp.Position - cp.Position
+                local dist = between.Magnitude
+                local idealDist = math.max(2, seg.vertSpacing or 5)
+                
+                if dist > idealDist * 1.2 then
+                    -- Pull them together
+                    local pullForce = between.Unit * (dist - idealDist) * 20
+                    if not cp.Anchored then
+                        cp.AssemblyLinearVelocity = cp.AssemblyLinearVelocity + pullForce * delta * 3
+                    end
+                    if not pp.Anchored then
+                        pp.AssemblyLinearVelocity = pp.AssemblyLinearVelocity - pullForce * delta * 3
+                    end
+                end
+            end
         end
-        
-        -- Compute velocity toward target
-        local vel = (targetPos - p.Position) / math.max(delta, 0.016)
-        local maxVel = 200 + seg.wiggleAmp * 4
-        if vel.Magnitude > maxVel then vel = vel.Unit * maxVel end
-        
-        local smoothFactor = math.min(1, delta * 6)
-        p.AssemblyLinearVelocity = p.AssemblyLinearVelocity:Lerp(vel, smoothFactor)
-        p.CanCollide = false
-        
-        if p.Position.Y >= (centerPos.Y + funnelHeight) then snapPartDown(p, centerPos.Y) end
     end
 end
 
@@ -813,8 +804,7 @@ local function pickNewRandomTarget()
     if not localPlayer.Character or not localPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
     local playerPos = localPlayer.Character.HumanoidRootPart.Position
     local angle = math.random() * math.pi * 2
-    -- Use maxRandomRange for the distance cap
-    local dist = math.random(50, maxRandomRange)
+    local dist = math.random(50, math.min(1500, randomMaxDistance))
     randomPathTarget = playerPos + Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
     randomPathSwitchTimer = tick() + math.random(5, 20)
 end
@@ -831,93 +821,154 @@ local function updateTornadoPositions()
     tornadoPositions = {}
     local root = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
     if not root then return end
-    local basePos = root.Position; local count = math.max(1, tornadoAmount)
+    local basePos = root.Position
+    local count = math.max(1, tornadoAmount)
+    
     if count == 1 then
-        if pathType == "Follow" then tornadoPositions[1] = basePos
+        if pathType == "Follow" then
+            tornadoPositions[1] = basePos
         elseif pathType == "Random" then
             if not randomPathTarget or tick() > randomPathSwitchTimer then pickNewRandomTarget() end
             if randomPathTarget then
-                local current = tornadoPositions[1] or basePos; local dir = randomPathTarget - current
-                if dir.Magnitude > tornadoRandomPathSpeed * 0.1 then tornadoPositions[1] = current + dir.Unit * math.min(dir.Magnitude, tornadoRandomPathSpeed * 0.1)
-                else pickNewRandomTarget(); tornadoPositions[1] = current end
-                -- Use maxRandomRange for distance clamp
-                if (tornadoPositions[1] - basePos).Magnitude > maxRandomRange then
-                    tornadoPositions[1] = tornadoPositions[1] + (basePos - tornadoPositions[1]).Unit * ((tornadoPositions[1] - basePos).Magnitude - maxRandomRange + 10)
+                local current = tornadoPositions[1] or basePos
+                local dir = randomPathTarget - current
+                if dir.Magnitude > tornadoRandomPathSpeed * 0.1 then
+                    tornadoPositions[1] = current + dir.Unit * math.min(dir.Magnitude, tornadoRandomPathSpeed * 0.1)
+                else
+                    pickNewRandomTarget()
+                    tornadoPositions[1] = current
                 end
-            else tornadoPositions[1] = basePos end
+                -- Enforce max distance from player
+                local fromPlayer = tornadoPositions[1] - basePos
+                if fromPlayer.Magnitude > randomMaxDistance then
+                    tornadoPositions[1] = basePos + fromPlayer.Unit * (randomMaxDistance - 10)
+                end
+            else
+                tornadoPositions[1] = basePos
+            end
         elseif pathType == "Stalker" then
             if not stalkTarget or not stalkTarget.Character or not stalkTarget.Character:FindFirstChild("HumanoidRootPart") then pickNewStalkTarget() end
             if math.random() < 0.01 then pickNewStalkTarget() end
             if stalkTarget and stalkTarget.Character and stalkTarget.Character:FindFirstChild("HumanoidRootPart") then
-                local targetPos = stalkTarget.Character.HumanoidRootPart.Position; local current = tornadoPositions[1] or basePos; local dir = targetPos - current
-                if dir.Magnitude > tornadoMoveSpeed * 0.1 then tornadoPositions[1] = current + dir.Unit * math.min(dir.Magnitude, tornadoMoveSpeed * 0.1)
-                else tornadoPositions[1] = targetPos end
+                local targetPos = stalkTarget.Character.HumanoidRootPart.Position
+                local current = tornadoPositions[1] or basePos
+                local dir = targetPos - current
+                if dir.Magnitude > tornadoMoveSpeed * 0.1 then
+                    tornadoPositions[1] = current + dir.Unit * math.min(dir.Magnitude, tornadoMoveSpeed * 0.1)
+                else
+                    tornadoPositions[1] = targetPos
+                end
                 tornadoPositions[1] = tornadoPositions[1] + Vector3.new(0, 5, 0)
-            else tornadoPositions[1] = basePos end
+            else
+                tornadoPositions[1] = basePos
+            end
         end
     else
         local center = basePos
-        if pathType == "Stalker" and stalkTarget and stalkTarget.Character and stalkTarget.Character:FindFirstChild("HumanoidRootPart") then center = stalkTarget.Character.HumanoidRootPart.Position
-        elseif pathType == "Random" and randomPathTarget then center = randomPathTarget end
+        if pathType == "Stalker" and stalkTarget and stalkTarget.Character and stalkTarget.Character:FindFirstChild("HumanoidRootPart") then
+            center = stalkTarget.Character.HumanoidRootPart.Position
+        elseif pathType == "Random" and randomPathTarget then
+            center = randomPathTarget
+        end
         local time = tick() * 0.15
         for i = 1, count do
-            local angle = (i - 1) * (2 * math.pi / count) + time; local spread = math.clamp(tornadoWindfield * 0.12 * math.sqrt(count), 10, tornadoWindfield * 0.35)
+            local angle = (i - 1) * (2 * math.pi / count) + time
+            local spread = math.clamp(tornadoWindfield * 0.12 * math.sqrt(count), 10, tornadoWindfield * 0.35)
             tornadoPositions[i] = center + Vector3.new(math.cos(angle) * spread, 0, math.sin(angle) * spread)
         end
         if pathType == "Random" then
             if not randomPathTarget or tick() > randomPathSwitchTimer then pickNewRandomTarget() end
-            if randomPathTarget then local dir = randomPathTarget - (tornadoPositions[1] or center)
-                if dir.Magnitude > 1 then for i = 1, count do local offset = tornadoPositions[i] - (tornadoPositions[1] or center); tornadoPositions[i] = tornadoPositions[i] + dir.Unit * math.min(dir.Magnitude, tornadoRandomPathSpeed * 0.1) end end end
+            if randomPathTarget then
+                local dir = randomPathTarget - (tornadoPositions[1] or center)
+                if dir.Magnitude > 1 then
+                    for i = 1, count do
+                        local offset = tornadoPositions[i] - (tornadoPositions[1] or center)
+                        tornadoPositions[i] = tornadoPositions[i] + dir.Unit * math.min(dir.Magnitude, tornadoRandomPathSpeed * 0.1)
+                    end
+                end
+            end
+            -- Enforce max distance for all positions
+            for i = 1, count do
+                local fromPlayer = tornadoPositions[i] - basePos
+                if fromPlayer.Magnitude > randomMaxDistance then
+                    tornadoPositions[i] = basePos + fromPlayer.Unit * (randomMaxDistance - 10)
+                end
+            end
+        end
+        -- Also enforce for stalker mode
+        if pathType == "Stalker" then
+            for i = 1, count do
+                local fromPlayer = tornadoPositions[i] - basePos
+                if fromPlayer.Magnitude > 2000 then
+                    tornadoPositions[i] = basePos + fromPlayer.Unit * 1990
+                end
+            end
         end
     end
 end
 
--- ========== NIGHTMARE MODE — MORE DIRECT TARGETING ==========
+-- ========== IMPROVED NIGHTMARE TARGETING ==========
 local function checkStalkerFling()
     if pathType ~= "Stalker" or not nightmareMode then return end
     if not stalkTarget or not stalkTarget.Character or not stalkTarget.Character:FindFirstChild("HumanoidRootPart") then return end
     if #tornadoPositions == 0 then return end
-    local hrp = stalkTarget.Character.HumanoidRootPart; local stalkerPos = hrp.Position
     
-    -- NIGHTMARE MODE: More direct targeting - wider detection range, stronger pull
-    local detectionRange = nightmareMode and tornadoWindfield * 0.5 or tornadoWindfield * 0.3
+    local hrp = stalkTarget.Character.HumanoidRootPart
+    local stalkerPos = hrp.Position
     
+    -- More direct targeting in nightmare mode: check all tornado positions
     for _, pos in ipairs(tornadoPositions) do
         local dist = (stalkerPos - pos).Magnitude
-        if dist <= detectionRange then
-            -- Nightmare: direct aggressive fling
+        if dist <= tornadoWindfield * 0.5 then  -- Increased range from 0.3 to 0.5
             local offset = stalkerPos - pos
             local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
             local distance = math.max(0.1, horizontalOffset.Magnitude)
-            local dirToCenter = horizontalOffset.Unit
-            local spinDir = Vector3.new(-dirToCenter.Z, 0, dirToCenter.X)
             
-            -- NIGHTMARE: higher multipliers, direct toward center, stronger upward
-            local spinMultiplier = nightmareMode and 3.5 or 2.5
-            local pullMultiplier = nightmareMode and 2.5 or 1.5
-            local upMultiplier = nightmareMode and 5 or 3
-            
-            hrp.AssemblyLinearVelocity = spinDir * (tornadoSpinSpeed * spinMultiplier) 
-                + dirToCenter * (tornadoSpinSpeed * pullMultiplier) 
-                + Vector3.new(0, tornadoUpwardSpeed * upMultiplier, 0)
-            
-            -- Also pull nearby parts toward the target for more chaos
-            if nightmareMode then
-                local nearby = Workspace:GetPartBoundsInRadius(stalkerPos, 30)
-                for _, nearPart in ipairs(nearby) do
-                    if nearPart:IsA("BasePart") and not nearPart.Anchored and nearPart ~= hrp and not isPlayerPart(nearPart) then
-                        local dirToStalker = (stalkerPos - nearPart.Position).Unit
-                        nearPart.AssemblyLinearVelocity = dirToStalker * 200 + Vector3.new(0, 100, 0)
-                    end
-                end
+            if distance > 0.1 then
+                local dirToCenter = horizontalOffset.Unit
+                local spinDir = Vector3.new(-dirToCenter.Z, 0, dirToCenter.X)
+                
+                -- MORE DIRECT: stronger forces, more upward, more aggressive
+                local flingStrength = 3.5  -- Increased from 2.5/1.5
+                local pullStrength = 2.5   -- Increased from 1.5
+                local upStrength = 4.0     -- Increased from 3
+                
+                hrp.AssemblyLinearVelocity = 
+                    spinDir * (tornadoSpinSpeed * flingStrength) + 
+                    dirToCenter * (tornadoSpinSpeed * pullStrength) + 
+                    Vector3.new(0, tornadoUpwardSpeed * upStrength, 0)
             end
             
             break
-        elseif dist <= tornadoWindfield * 0.8 and nightmareMode then
-            -- Nightmare: even at medium range, apply some suction force toward center
-            local dirToCenter = (pos - stalkerPos).Unit
-            local pullStrength = tornadoSpinSpeed * 0.5 * (1 - dist / (tornadoWindfield * 0.8))
-            hrp.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity + dirToCenter * pullStrength
+        end
+    end
+    
+    -- Nightmare mode: also fling nearby players near the stalker
+    if nightmareMode then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= localPlayer and plr ~= stalkTarget and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+                local plrHRP = plr.Character.HumanoidRootPart
+                local plrPos = plrHRP.Position
+                local toStalker = (plrPos - (stalkTarget.Character and stalkTarget.Character:FindFirstChild("HumanoidRootPart") and stalkTarget.Character.HumanoidRootPart.Position or plrPos))
+                
+                if toStalker.Magnitude < 30 then  -- Close to stalker target
+                    for _, pos in ipairs(tornadoPositions) do
+                        if (plrPos - pos).Magnitude <= tornadoWindfield * 0.5 then
+                            local offset = plrPos - pos
+                            local hOffset = Vector3.new(offset.X, 0, offset.Z)
+                            if hOffset.Magnitude > 0.1 then
+                                local dTC = hOffset.Unit
+                                local sD = Vector3.new(-dTC.Z, 0, dTC.X)
+                                plrHRP.AssemblyLinearVelocity = 
+                                    sD * (tornadoSpinSpeed * 2) + 
+                                    dTC * (tornadoSpinSpeed * 1.5) + 
+                                    Vector3.new(0, tornadoUpwardSpeed * 2.5, 0)
+                            end
+                            break
+                        end
+                    end
+                end
+            end
         end
     end
 end
@@ -926,8 +977,14 @@ local function tornadoLoop()
     while enabled do
         updateTornadoPositions()
         if #tornadoPositions > 0 then
-            if tornadoType == "Rope" then updateRopeTornado(0.1)
-            else updateMainFunnel(0.1); for _, pos in ipairs(tornadoPositions) do applyTornadoPhysics(pos, 0.1) end end
+            if tornadoType == "Rope" then
+                updateRopeTornado(0.1)
+            else
+                updateMainFunnel(0.1)
+                for _, pos in ipairs(tornadoPositions) do
+                    applyTornadoPhysics(pos, 0.1)
+                end
+            end
             checkStalkerFling()
         end
         task.wait(0.1)
@@ -937,62 +994,154 @@ end
 -- ========== SATELLITE SYSTEM ==========
 local function createSatelliteMarker(sat)
     if sat.marker and sat.marker.Parent then return end
-    local m = Instance.new("Part"); m.Name = "SatelliteMarker"; m.Size = Vector3.new(1,1,1); m.Anchored = true; m.CanCollide = false; m.Material = Enum.Material.Neon; m.Transparency = 0; m.Parent = Workspace; sat.marker = m
+    local m = Instance.new("Part")
+    m.Name = "SatelliteMarker"
+    m.Size = Vector3.new(1,1,1)
+    m.Anchored = true
+    m.CanCollide = false
+    m.Material = Enum.Material.Neon
+    m.Transparency = 0
+    m.Parent = Workspace
+    sat.marker = m
 end
+
 local function removeSatelliteMarker(sat)
-    if sat and sat.marker and sat.marker.Parent then pcall(function() sat.marker:Destroy() end); sat.marker = nil end
+    if sat and sat.marker and sat.marker.Parent then
+        pcall(function() sat.marker:Destroy() end)
+        sat.marker = nil
+    end
 end
 
 local function spawnSatelliteWithParts(pos, partsList, idOverride)
-    local id = idOverride or nextSatelliteId; if not idOverride then nextSatelliteId = nextSatelliteId + 1 end
+    local id = idOverride or nextSatelliteId
+    if not idOverride then nextSatelliteId = nextSatelliteId + 1 end
     local partsMap = {}
     for _, p in ipairs(partsList) do
         if p and p.Parent then
-            local radius = subVortexWidth * (0.3 + math.random() * 0.7); local speed = subVortexSpinSpeed * (1 + (math.random()*0.6 - 0.3))
-            partsMap[p] = {radius=radius, speed=speed, phase=math.random()*math.pi*2, floorOffset=2+math.random()*2, topOffset=subVortexHeight+math.random()*4, verticalTarget=nil, currentY=nil}
+            local radius = subVortexWidth * (0.3 + math.random() * 0.7)
+            local speed = subVortexSpinSpeed * (1 + (math.random()*0.6 - 0.3))
+            partsMap[p] = {
+                radius=radius,
+                speed=speed,
+                phase=math.random()*math.pi*2,
+                floorOffset=2+math.random()*2,
+                topOffset=subVortexHeight+math.random()*4,
+                verticalTarget=nil,
+                currentY=nil
+            }
             assignedToSatellite[p] = id
         end
     end
-    satelliteVortices[id] = {id=id, pos=pos, angleOffset=0, parts=partsMap, target=nil, verticalChains={}, lastVortexSpawnTick=tick(), marker=nil}
+    satelliteVortices[id] = {
+        id=id,
+        pos=pos,
+        angleOffset=0,
+        parts=partsMap,
+        target=nil,
+        verticalChains={},
+        lastVortexSpawnTick=tick(),
+        marker=nil
+    }
     satelliteAttackState[id] = {attackingPlayers={}, attackThreads={}}
-    local partCount = 0; for _,_ in pairs(partsMap) do partCount = partCount + 1 end
+    local partCount = 0
+    for _,_ in pairs(partsMap) do partCount = partCount + 1 end
     if partCount == 0 then createSatelliteMarker(satelliteVortices[id]) end
     return id
 end
 
 local function despawnSatellite(id)
-    local sat = satelliteVortices[id]; if not sat then return end
-    for part, _ in pairs(sat.parts) do if part and part.Parent then assignedToSatellite[part] = nil; whitelistedParts[part] = true; pickedUpByFunnel[part] = true; part.CanCollide = true end end
-    removeSatelliteMarker(sat); satelliteVortices[id] = nil; satelliteAttackState[id] = nil; noodlePools[id] = nil
+    local sat = satelliteVortices[id]
+    if not sat then return end
+    for part, _ in pairs(sat.parts) do
+        if part and part.Parent then
+            assignedToSatellite[part] = nil
+            whitelistedParts[part] = true
+            pickedUpByFunnel[part] = true
+            part.CanCollide = true
+        end
+    end
+    removeSatelliteMarker(sat)
+    satelliteVortices[id] = nil
+    satelliteAttackState[id] = nil
+    noodlePools[id] = nil
 end
 
 local function formSatellitesInstant()
-    if tornadoType == "Rope" then for id, _ in pairs(satelliteVortices) do despawnSatellite(id) end; spawnRopeTornado(); return end
+    if tornadoType == "Rope" then
+        for id, _ in pairs(satelliteVortices) do despawnSatellite(id) end
+        spawnRopeTornado()
+        return
+    end
+    
     for id, _ in pairs(satelliteVortices) do despawnSatellite(id) end
-    local count = math.max(0, maxSubVortices); if count == 0 then return end
+    
+    local count = math.max(0, maxSubVortices)
+    if count == 0 then return end
+    
     local spawnCenter = tornadoPositions[1] or (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character.HumanoidRootPart.Position) or Vector3.new(0,10,0)
     local allParts = Workspace:GetPartBoundsInRadius(spawnCenter, tornadoWindfield)
     local candidateParts = {}
-    for _, p in ipairs(allParts) do 
+    for _, p in ipairs(allParts) do
         if p and p:IsA("BasePart") and not p.Anchored and not isPlayerPart(p) and p.Name ~= baseplateName and not assignedToSatellite[p] and not noodlePartSet[p] and not mainFunnelSet[p] and not ropeParts[p] then
-            -- Skip tethered parts
-            if not isPartTetheredToAnchored(p) then
-                table.insert(candidateParts, p)
-            end
-        end 
+            table.insert(candidateParts, p)
+        end
     end
-    local total = #candidateParts; table.sort(candidateParts, function(a,b) return (a.Position - spawnCenter).Magnitude < (b.Position - spawnCenter).Magnitude end)
-    local desiredByShare = math.floor(total * mainFunnelShare + 0.5); local mainReserve = math.clamp(desiredByShare, 0, total)
+    
+    local total = #candidateParts
+    table.sort(candidateParts, function(a,b) return (a.Position - spawnCenter).Magnitude < (b.Position - spawnCenter).Magnitude end)
+    
+    local desiredByShare = math.floor(total * mainFunnelShare + 0.5)
+    local mainReserve = math.clamp(desiredByShare, 0, total)
     local remainingCount = total - mainReserve
-    while remainingCount < count and mainReserve > math.min(funnelReserveCount, total) do mainReserve = mainReserve - 1; remainingCount = total - mainReserve end
+    while remainingCount < count and mainReserve > math.min(funnelReserveCount, total) do
+        mainReserve = mainReserve - 1
+        remainingCount = total - mainReserve
+    end
     mainReserve = math.clamp(mainReserve, 0, total)
-    mainFunnelParts = {}; mainFunnelSet = {}
-    for i = 1, mainReserve do local p = candidateParts[i]; if p then mainFunnelParts[#mainFunnelParts+1] = p; mainFunnelSet[p] = true; assignedToSatellite[p] = nil; whitelistedParts[p] = nil; pickedUpByFunnel[p] = nil end end
-    local remainingParts = {}; for i = mainReserve + 1, #candidateParts do remainingParts[#remainingParts+1] = candidateParts[i] end
-    local partitions = {}; for i = 1, count do partitions[i] = {} end
-    if #remainingParts > 0 then local idx = 1; for _, p in ipairs(remainingParts) do local slot = ((idx - 1) % count) + 1; table.insert(partitions[slot], p); assignedToSatellite[p] = true; whitelistedParts[p] = nil; pickedUpByFunnel[p] = nil; idx = idx + 1 end end
+    
+    mainFunnelParts = {}
+    mainFunnelSet = {}
+    for i = 1, mainReserve do
+        local p = candidateParts[i]
+        if p then
+            mainFunnelParts[#mainFunnelParts+1] = p
+            mainFunnelSet[p] = true
+            assignedToSatellite[p] = nil
+            whitelistedParts[p] = nil
+            pickedUpByFunnel[p] = nil
+        end
+    end
+    
+    local remainingParts = {}
+    for i = mainReserve + 1, #candidateParts do
+        remainingParts[#remainingParts+1] = candidateParts[i]
+    end
+    
+    local partitions = {}
+    for i = 1, count do partitions[i] = {} end
+    
+    if #remainingParts > 0 then
+        local idx = 1
+        for _, p in ipairs(remainingParts) do
+            local slot = ((idx - 1) % count) + 1
+            table.insert(partitions[slot], p)
+            assignedToSatellite[p] = true
+            whitelistedParts[p] = nil
+            pickedUpByFunnel[p] = nil
+            idx = idx + 1
+        end
+    end
+    
     local orbitRad = subVortexWidth * 0.5
-    for i = 1, count do local angle = (2 * math.pi * (i - 1) / count); local pos = spawnCenter + Vector3.new(math.cos(angle) * orbitRad, 10 + math.random()*6, math.sin(angle) * orbitRad); spawnSatelliteWithParts(pos, partitions[i] or {}); local newId = nextSatelliteId - 1; if satelliteVortices[newId] then satelliteVortices[newId].angleOffset = angle end end
+    for i = 1, count do
+        local angle = (2 * math.pi * (i - 1) / count)
+        local pos = spawnCenter + Vector3.new(math.cos(angle) * orbitRad, 10 + math.random()*6, math.sin(angle) * orbitRad)
+        spawnSatelliteWithParts(pos, partitions[i] or {})
+        local newId = nextSatelliteId - 1
+        if satelliteVortices[newId] then
+            satelliteVortices[newId].angleOffset = angle
+        end
+    end
 end
 
 local function updateSatellites(delta)
@@ -1002,34 +1151,52 @@ local function updateSatellites(delta)
         sat.angleOffset = sat.angleOffset + (0.5 * delta)
         local orbitRad = math.clamp(subVortexWidth * 0.3, 6, subVortexWidth)
         local newPos = centerPos + Vector3.new(math.cos(sat.angleOffset) * orbitRad, 10, math.sin(sat.angleOffset) * orbitRad)
-        local dir = (newPos - sat.pos); sat.pos = sat.pos + dir * math.min(1, delta * 2)
-        if sat.marker then pcall(function() sat.marker.CFrame = CFrame.new(sat.pos + Vector3.new(0,2,0)) end) end
+        local dir = (newPos - sat.pos)
+        sat.pos = sat.pos + dir * math.min(1, delta * 2)
+        
+        if sat.marker then
+            pcall(function() sat.marker.CFrame = CFrame.new(sat.pos + Vector3.new(0,2,0)) end)
+        end
+        
         for part, meta in pairs(sat.parts) do
             if part and part.Parent then
-                -- Skip if part became tethered mid-flight
-                if isPartTetheredToAnchored(part) then
-                    sat.parts[part] = nil
-                    assignedToSatellite[part] = nil
-                    continue
-                end
-                local angle = (tick() * meta.speed) + meta.phase; local radiusPulse = meta.radius * (1 + 0.06 * math.sin(tick() * 0.5 + meta.phase))
+                local angle = (tick() * meta.speed) + meta.phase
+                local radiusPulse = meta.radius * (1 + 0.06 * math.sin(tick() * 0.5 + meta.phase))
                 local horizTarget = sat.pos + Vector3.new(math.cos(angle) * radiusPulse, 0, math.sin(angle) * radiusPulse)
-                local floorY = centerPos.Y + (meta.floorOffset or 2); local topY = centerPos.Y + (meta.topOffset or subVortexHeight)
-                if not meta.currentY then meta.currentY = math.clamp(part.Position.Y, floorY, topY) end
-                if not meta.verticalTarget then meta.verticalTarget = (floorY + topY) / 2 end
-                if math.abs(meta.currentY - meta.verticalTarget) < 0.5 then meta.verticalTarget = floorY + math.random() * (math.max(1, topY - floorY)) end
-                local interpSpeed = math.max(0.15, (meta.speed or 1) * 0.25); meta.currentY = meta.currentY + (meta.verticalTarget - meta.currentY) * math.clamp(delta * interpSpeed, 0, 1)
+                local floorY = centerPos.Y + (meta.floorOffset or 2)
+                local topY = centerPos.Y + (meta.topOffset or subVortexHeight)
+                
+                if not meta.currentY then
+                    meta.currentY = math.clamp(part.Position.Y, floorY, topY)
+                end
+                if not meta.verticalTarget then
+                    meta.verticalTarget = (floorY + topY) / 2
+                end
+                if math.abs(meta.currentY - meta.verticalTarget) < 0.5 then
+                    meta.verticalTarget = floorY + math.random() * (math.max(1, topY - floorY))
+                end
+                
+                local interpSpeed = math.max(0.15, (meta.speed or 1) * 0.25)
+                meta.currentY = meta.currentY + (meta.verticalTarget - meta.currentY) * math.clamp(delta * interpSpeed, 0, 1)
                 local targetPos = Vector3.new(horizTarget.X, meta.currentY, horizTarget.Z)
+                
                 if not part.Anchored then
                     local desiredVel = (targetPos - part.Position) / math.max(delta, 0.016)
                     local maxVel = math.max(orbitVelocityMinCap, math.abs(radiusPulse * meta.speed * orbitVelocityMultiplier))
-                    if desiredVel.Magnitude > maxVel then desiredVel = desiredVel.Unit * maxVel end
+                    if desiredVel.Magnitude > maxVel then
+                        desiredVel = desiredVel.Unit * maxVel
+                    end
                     local smoothFactor = math.min(1, delta * 8)
                     part.AssemblyLinearVelocity = part.AssemblyLinearVelocity:Lerp(Vector3.new(desiredVel.X, math.clamp(desiredVel.Y, -140, 140), desiredVel.Z), smoothFactor)
                     part.CanCollide = false
                 end
-                if part.Position.Y >= (centerPos.Y + funnelHeight) and not debrisAttachedToPlayer[part] then snapPartDown(part, centerPos.Y) end
-            else sat.parts[part] = nil end
+                
+                if part.Position.Y >= (centerPos.Y + funnelHeight) and not debrisAttachedToPlayer[part] then
+                    snapPartDown(part, centerPos.Y)
+                end
+            else
+                sat.parts[part] = nil
+            end
         end
     end
 end
@@ -1043,10 +1210,32 @@ local function toggleFreeze()
     if partsFrozen then
         -- Anchor all affected parts
         frozenParts = {}
-        for part in pairs(whitelistedParts) do if part and part.Parent then frozenParts[part] = part.Anchored; part.Anchored = true end end
-        for part in pairs(mainFunnelParts) do if part and part.Parent then frozenParts[part] = part.Anchored; part.Anchored = true end end
-        for part in pairs(ropeParts) do if part and part.Parent then frozenParts[part] = part.Anchored; part.Anchored = true end end
-        for _, sat in pairs(satelliteVortices) do for part, _ in pairs(sat.parts) do if part and part.Parent then frozenParts[part] = part.Anchored; part.Anchored = true end end end
+        for part in pairs(whitelistedParts) do
+            if part and part.Parent then
+                frozenParts[part] = part.Anchored
+                part.Anchored = true
+            end
+        end
+        for _, p in ipairs(mainFunnelParts) do
+            if p and p.Parent then
+                frozenParts[p] = p.Anchored
+                p.Anchored = true
+            end
+        end
+        for part in pairs(ropeParts) do
+            if part and part.Parent then
+                frozenParts[part] = part.Anchored
+                part.Anchored = true
+            end
+        end
+        for _, sat in pairs(satelliteVortices) do
+            for part, _ in pairs(sat.parts) do
+                if part and part.Parent then
+                    frozenParts[part] = part.Anchored
+                    part.Anchored = true
+                end
+            end
+        end
     else
         -- Unanchor all
         for part, wasAnchored in pairs(frozenParts) do
@@ -1063,7 +1252,16 @@ freezeBtn.MouseButton1Click:Connect(toggleFreeze)
 -- ========== WORKSPACE SCANNING ==========
 Workspace.DescendantAdded:Connect(function(desc)
     if desc and desc:IsA("BasePart") then
-        task.defer(function() if enabled then for _, pos in ipairs(tornadoPositions) do if (desc.Position - pos).Magnitude <= tornadoWindfield then if not desc.Anchored and not isPartTetheredToAnchored(desc) then processPartForFunnel(desc) end; break end end end end)
+        task.defer(function()
+            if enabled then
+                for _, pos in ipairs(tornadoPositions) do
+                    if (desc.Position - pos).Magnitude <= tornadoWindfield then
+                        if not desc.Anchored then processPartForFunnel(desc) end
+                        break
+                    end
+                end
+            end
+        end)
     end
 end)
 
@@ -1072,32 +1270,52 @@ spawn(function()
         if enabled and #tornadoPositions > 0 then
             for _, pos in ipairs(tornadoPositions) do
                 local parts = Workspace:GetPartBoundsInRadius(pos, tornadoWindfield)
-                for _, p in ipairs(parts) do if p and p:IsA("BasePart") and not p.Anchored then processPartForFunnel(p) end end
+                for _, p in ipairs(parts) do
+                    if p and p:IsA("BasePart") and not p.Anchored then
+                        processPartForFunnel(p)
+                    end
+                end
             end
             if tornadoType ~= "Rope" then reserveMainFunnelParts() end
-        end; task.wait(1) end
+        end
+        task.wait(1)
+    end
 end)
 
 RunService.Heartbeat:Connect(function(delta)
     if enabled then
         updateTornadoPositions()
-        if tornadoType == "Classic" then updateSatellites(delta); updateMainFunnel(delta)
-        elseif tornadoType == "Rope" then updateRopeTornado(delta) end
+        if tornadoType == "Classic" then
+            updateSatellites(delta)
+            updateMainFunnel(delta)
+        elseif tornadoType == "Rope" then
+            updateRopeTornado(delta)
+        end
     end
 end)
 
 local function onCharacterAdded(character)
     task.wait(0.1)
-    if character:FindFirstChild("HumanoidRootPart") then updateTornadoPositions() end
+    if character:FindFirstChild("HumanoidRootPart") then
+        updateTornadoPositions()
+    end
     if enabled then
-        if tornadoType == "Rope" then spawnRopeTornado() else formSatellitesInstant() end
+        if tornadoType == "Rope" then
+            spawnRopeTornado()
+        else
+            formSatellitesInstant()
+        end
     end
 end
-if localPlayer.Character then onCharacterAdded(localPlayer.Character) end
+
+if localPlayer.Character then
+    onCharacterAdded(localPlayer.Character)
+end
 localPlayer.CharacterAdded:Connect(onCharacterAdded)
 
 toggleBtn.MouseButton1Click:Connect(function()
-    guiVisible = not guiVisible; mainFrame.Visible = guiVisible
+    guiVisible = not guiVisible
+    mainFrame.Visible = guiVisible
 end)
 
 startStopBtn.MouseButton1Click:Connect(function()
@@ -1105,32 +1323,77 @@ startStopBtn.MouseButton1Click:Connect(function()
     startStopBtn.Text = enabled and "Stop" or "Start"
     startStopBtn.BackgroundColor3 = enabled and Color3.fromRGB(180, 40, 40) or Color3.fromRGB(50, 120, 50)
     statusDot.BackgroundColor3 = enabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(180, 40, 40)
+    
     if enabled then
-        pickedUpByFunnel = {}; whitelistedParts = {}; assignedToSatellite = {}
-        satelliteVortices = {}; satelliteAttackState = {}; nextSatelliteId = 1
-        debrisAttachedToPlayer = {}; noodlePools = {}; noodlePartSet = {}
-        mainFunnelParts = {}; mainFunnelSet = {}; ropeParts = {}; ropeSegments = {}
-        randomPathTarget = nil; stalkTarget = nil
+        pickedUpByFunnel = {}
+        whitelistedParts = {}
+        assignedToSatellite = {}
+        satelliteVortices = {}
+        satelliteAttackState = {}
+        nextSatelliteId = 1
+        debrisAttachedToPlayer = {}
+        noodlePools = {}
+        noodlePartSet = {}
+        mainFunnelParts = {}
+        mainFunnelSet = {}
+        ropeParts = {}
+        ropeSegments = {}
+        ropeLines = {}
+        randomPathTarget = nil
+        stalkTarget = nil
+        
         updateTornadoPositions()
         if #tornadoPositions > 0 then
             for _, pos in ipairs(tornadoPositions) do
                 local parts = Workspace:GetPartBoundsInRadius(pos, tornadoWindfield)
-                for _, p in ipairs(parts) do if p and p:IsA("BasePart") and not p.Anchored then processPartForFunnel(p) end end
+                for _, p in ipairs(parts) do
+                    if p and p:IsA("BasePart") and not p.Anchored then
+                        processPartForFunnel(p)
+                    end
+                end
             end
-            if tornadoType == "Rope" then spawnRopeTornado() else reserveMainFunnelParts(); formSatellitesInstant() end
+            if tornadoType == "Rope" then
+                spawnRopeTornado()
+            else
+                reserveMainFunnelParts()
+                formSatellitesInstant()
+            end
         end
         spawn(tornadoLoop)
     else
         -- If frozen, unfreeze first
         if partsFrozen then toggleFreeze() end
-        for part in pairs(whitelistedParts) do if part and part:IsA("BasePart") and part.Parent then pcall(function() part.AssemblyLinearVelocity = Vector3.zero end); part.CanCollide = true end end
+        
+        for part in pairs(whitelistedParts) do
+            if part and part:IsA("BasePart") and part.Parent then
+                pcall(function() part.AssemblyLinearVelocity = Vector3.zero end)
+                part.CanCollide = true
+            end
+        end
         for id, _ in pairs(satelliteVortices) do despawnSatellite(id) end
-        for part in pairs(ropeParts) do if part and part.Parent then part.AssemblyLinearVelocity = Vector3.zero; part.CanCollide = true end end
-        ropeParts = {}; ropeSegments = {}; debrisAttachedToPlayer = {}; whitelistedParts = {}; pickedUpByFunnel = {}
-        assignedToSatellite = {}; satelliteVortices = {}; satelliteAttackState = {}
-        noodlePools = {}; noodlePartSet = {}; mainFunnelParts = {}; mainFunnelSet = {}
-        tornadoPositions = {}; randomPathTarget = nil; stalkTarget = nil
+        for part in pairs(ropeParts) do
+            if part and part.Parent then
+                part.AssemblyLinearVelocity = Vector3.zero
+                part.CanCollide = true
+            end
+        end
+        ropeParts = {}
+        ropeSegments = {}
+        ropeLines = {}
+        debrisAttachedToPlayer = {}
+        whitelistedParts = {}
+        pickedUpByFunnel = {}
+        assignedToSatellite = {}
+        satelliteVortices = {}
+        satelliteAttackState = {}
+        noodlePools = {}
+        noodlePartSet = {}
+        mainFunnelParts = {}
+        mainFunnelSet = {}
+        tornadoPositions = {}
+        randomPathTarget = nil
+        stalkTarget = nil
     end
 end)
 
-print("Tornado GUI v9.0 — 280px height, funnel width inward pull, rope wiggle alignment, weld check, nightmare direct targeting, max random range")
+print("Tornado GUI v8.4 — Funnel width fix, rope line system, random max dist textbox, nightmare targeting boost")
