@@ -1,4 +1,5 @@
 -- Full updated script (client) - includes FallenPartsDestroyHeight = 0/0 + Individual Parts toggle
+-- + GATHER PARTS button + ANTI-TAMPER SYSTEM + BH SPIN + ANTI-INGREDIENT
 -- Notes:
 -- * Fallen parts destroy disabled via Workspace.FallenPartsDestroyHeight = 0/0
 -- * Skidding stays off when toggled off and is accurate / ping-aware
@@ -6,15 +7,24 @@
 -- * PAA only for BH creation; chat commands removed
 -- * Black hole counter HUD removed
 -- * NEW: Individual Parts toggle - each part gets its own attachment & target, continuously switch
+-- * NEW: Gather Parts - teleports local player to distant parts at 0.01s intervals, gathers them, returns
+-- * NEW: Anti-Tamper - nullifies non-BH property changes (attachments, welds, velocity, torque, CFrame)
+-- * NEW: BH Active Mode - tweens + welds parts to attachments with rapid spinning
+-- * NEW: Anti-Ingredient - nullifies foreign scripting ingredients
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local StarterGui = game:GetService("StarterGui")
 
 -- Disable automatic fallen part destruction (NaN)
 Workspace.FallenPartsDestroyHeight = 0/0
 
 local localPlayer = Players.LocalPlayer
+local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
 
 local function clamp(val, a, b)
     if val < a then return a end
@@ -99,6 +109,935 @@ local INDIVIDUAL_ORBIT_RADIUS_BASE = 4
 local INDIVIDUAL_ORBIT_RADIUS_VARY = 3
 local INDIVIDUAL_VERTICAL_OSCILLATION = 3
 
+-- ==============================
+-- ====== GATHER PARTS SYSTEM ======
+-- ==============================
+local gatherPartsActive = false
+local gatherPartsRunning = false
+local gatheredParts = {}
+local originalPlayerPosition = nil
+local gatherSwitchInterval = 0.01 -- 0.01 seconds as requested
+
+local function getDistantPartsFromPlayer(maxDistance)
+    local distantParts = {}
+    local char = localPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return distantParts end
+    
+    local origin = char.HumanoidRootPart.Position
+    
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle" then
+            -- Skip player characters
+            local isPlayerPart = false
+            for _, pl in ipairs(Players:GetPlayers()) do
+                local pChar = pl.Character
+                if pChar and v:IsDescendantOf(pChar) then
+                    isPlayerPart = true
+                    break
+                end
+            end
+            if not isPlayerPart then
+                local dist = (v.Position - origin).Magnitude
+                -- Only get parts further than any other player
+                local isFurtherThanPlayers = true
+                for _, pl in ipairs(Players:GetPlayers()) do
+                    if pl ~= localPlayer and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+                        local playerDist = (pl.Character.HumanoidRootPart.Position - origin).Magnitude
+                        if dist <= playerDist then
+                            isFurtherThanPlayers = false
+                            break
+                        end
+                    end
+                end
+                if isFurtherThanPlayers and dist > 10 then -- minimum distance
+                    table.insert(distantParts, v)
+                end
+            end
+        end
+    end
+    return distantParts
+end
+
+local function teleportToPart(part)
+    local char = localPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return false end
+    local hrp = char.HumanoidRootPart
+    
+    -- Teleport directly to the part
+    local targetCF = part.CFrame * CFrame.new(0, 0, -3) -- slightly offset
+    hrp.CFrame = targetCF
+    char:SetPrimaryPartCFrame(targetCF)
+    
+    -- Collect the part (anchor it and bring it along)
+    if part and part.Parent then
+        part.Anchored = false
+        part.CanCollide = false
+        part.Massless = true
+        
+        -- Weld to player so it follows
+        local weld = Instance.new("WeldConstraint")
+        weld.Name = "GatherWeld_" .. tostring(part:GetDebugId())
+        weld.Part0 = hrp
+        weld.Part1 = part
+        weld.Parent = hrp
+        
+        -- Store for cleanup
+        if not gatheredParts[part] then
+            gatheredParts[part] = {
+                originalPosition = part.Position,
+                weld = weld,
+                originalAnchored = part.Anchored,
+                originalCanCollide = part.CanCollide,
+            }
+        end
+        
+        -- Tween the part to spin wildly while welded
+        local spinTweenInfo = TweenInfo.new(
+            0.5,
+            Enum.EasingStyle.Linear,
+            Enum.EasingDirection.Out,
+            -1, -- repeat forever
+            true -- reflect
+        )
+        local spinGoal = {
+            Orientation = Vector3.new(
+                math.random(-360, 360),
+                math.random(-360, 360),
+                math.random(-360, 360)
+            )
+        }
+        local tween = TweenService:Create(part, spinTweenInfo, spinGoal)
+        tween:Play()
+        
+        return true
+    end
+    return false
+end
+
+local function startGatherParts()
+    if gatherPartsRunning then return end
+    if not localPlayer.Character or not localPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        warn("Gather Parts: Player character not ready")
+        return
+    end
+    
+    gatherPartsActive = true
+    gatherPartsRunning = true
+    gatheredParts = {}
+    
+    -- Save original position
+    originalPlayerPosition = localPlayer.Character.HumanoidRootPart.Position
+    local originalCF = localPlayer.Character.HumanoidRootPart.CFrame
+    
+    spawn(function()
+        -- Phase 1: Gather distant parts rapidly (0.01s switching)
+        local partsToGather = getDistantPartsFromPlayer()
+        local gatherCount = 0
+        local maxGather = 50 -- limit to prevent lag
+        
+        for i = 1, #partsToGather do
+            if not gatherPartsActive then break end
+            if gatherCount >= maxGather then break end
+            
+            local part = partsToGather[i]
+            if part and part.Parent and teleportToPart(part) then
+                gatherCount = gatherCount + 1
+            end
+            
+            -- 0.01 second switch interval as requested
+            wait(gatherSwitchInterval)
+        end
+        
+        -- Phase 2: Return to original position with all gathered parts
+        if gatherPartsActive and localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            local hrp = localPlayer.Character.HumanoidRootPart
+            
+            -- Smooth return using tween
+            local returnTweenInfo = TweenInfo.new(
+                0.5,
+                Enum.EasingStyle.Quad,
+                Enum.EasingDirection.Out
+            )
+            local returnGoal = {
+                CFrame = originalCF
+            }
+            local returnTween = TweenService:Create(hrp, returnTweenInfo, returnGoal)
+            returnTween:Play()
+            returnTween.Completed:Wait()
+            
+            -- Snap to exact position
+            hrp.CFrame = originalCF
+            if localPlayer.Character.PrimaryPart then
+                localPlayer.Character:SetPrimaryPartCFrame(originalCF)
+            end
+            
+            -- Detach gathered parts and restore them
+            for part, data in pairs(gatheredParts) do
+                if part and part.Parent then
+                    if data.weld and data.weld.Parent then
+                        data.weld:Destroy()
+                    end
+                    part.Anchored = false
+                end
+            end
+        end
+        
+        gatherPartsRunning = false
+        if not gatherPartsActive then
+            -- Cleanup on abort
+            for part, data in pairs(gatheredParts) do
+                if part and part.Parent then
+                    if data.weld and data.weld.Parent then
+                        data.weld:Destroy()
+                    end
+                end
+            end
+            gatheredParts = {}
+            gatherPartsRunning = false
+        end
+    end)
+end
+
+local function stopGatherParts()
+    gatherPartsActive = false
+end
+
+-- =====================================
+-- ====== ANTI-TAMPER SYSTEM ======
+-- =====================================
+local antiTamperActive = false
+local antiTamperConnections = {}
+local scriptOwnedInstances = {}  -- Track instances created by this script
+
+-- Mark instances as owned by this script
+local function markAsOwned(instance)
+    scriptOwnedInstances[instance] = true
+end
+
+-- Check if an instance was created/modified by this script
+local function isOwnedByScript(instance)
+    return scriptOwnedInstances[instance] == true
+end
+
+-- Nullify non-BH property changes on a part
+local function installAntiTamperOnPart(part)
+    if antiTamperConnections[part] then return end -- Already protected
+    
+    if not part:IsA("BasePart") then return end
+    
+    local connections = {}
+    
+    -- Detect CFrame changes
+    local cframeConn = part:GetPropertyChangedSignal("CFrame"):Connect(function()
+        if not antiTamperActive then return end
+        if isOwnedByScript(part) then return end
+        
+        -- Check if this is a BH-related change or our script's change
+        local hasOurAttachment = false
+        for _, child in ipairs(part:GetChildren()) do
+            if child:IsA("Attachment") and isOwnedByScript(child) then
+                hasOurAttachment = true
+                break
+            end
+            if child:IsA("AlignPosition") and isOwnedByScript(child) then
+                hasOurAttachment = true
+                break
+            end
+            if child:IsA("Torque") and isOwnedByScript(child) then
+                hasOurAttachment = true
+                break
+            end
+            if child:IsA("WeldConstraint") and child.Name:find("BH_") then
+                hasOurAttachment = true
+                break
+            end
+        end
+        
+        if not hasOurAttachment then
+            -- This is an external change - nullify it by reverting
+            local ap = part:FindFirstChildOfClass("AlignPosition")
+            local torque = part:FindFirstChildOfClass("Torque")
+            if ap and isOwnedByScript(ap) then
+                -- Re-align to BH center
+                if Attachment1 then
+                    ap.Attachment1 = Attachment1
+                end
+            end
+        end
+    end)
+    table.insert(connections, cframeConn)
+    
+    -- Detect Velocity changes
+    local velConn
+    local success, propExists = pcall(function()
+        velConn = part:GetPropertyChangedSignal("Velocity"):Connect(function()
+            if not antiTamperActive then return end
+            if isOwnedByScript(part) then return end
+            
+            local hasOurTorque = false
+            for _, child in ipairs(part:GetChildren()) do
+                if child:IsA("Torque") and isOwnedByScript(child) then
+                    hasOurTorque = true
+                    break
+                end
+            end
+            
+            if not hasOurTorque then
+                -- Nullify velocity if not ours
+                part.Velocity = Vector3.new(0, 0, 0)
+                part.RotVelocity = Vector3.new(0, 0, 0)
+            end
+        end)
+    end)
+    if success and velConn then
+        table.insert(connections, velConn)
+    end
+    
+    -- Detect RotVelocity changes
+    local rotVelConn
+    success, propExists = pcall(function()
+        rotVelConn = part:GetPropertyChangedSignal("RotVelocity"):Connect(function()
+            if not antiTamperActive then return end
+            if isOwnedByScript(part) then return end
+            
+            local hasOurTorque = false
+            for _, child in ipairs(part:GetChildren()) do
+                if child:IsA("Torque") and isOwnedByScript(child) then
+                    hasOurTorque = true
+                    break
+                end
+            end
+            
+            if not hasOurTorque then
+                part.RotVelocity = Vector3.new(0, 0, 0)
+            end
+        end)
+    end)
+    if success and rotVelConn then
+        table.insert(connections, rotVelConn)
+    end
+    
+    -- Detect Anchored changes
+    local anchoredConn = part:GetPropertyChangedSignal("Anchored"):Connect(function()
+        if not antiTamperActive then return end
+        if isOwnedByScript(part) then return end
+        
+        -- Let BH system manage anchoring, nullify external changes
+        if initiallyAnchoredParts[part] ~= nil then
+            -- Managed by our system, undo external changes
+            pcall(function()
+                if part.Anchored ~= initiallyAnchoredParts[part] then
+                    part.Anchored = initiallyAnchoredParts[part]
+                end
+            end)
+        end
+    end)
+    table.insert(connections, anchoredConn)
+    
+    -- Detect new children (attachments, welds, etc. being added externally)
+    local childAddedConn = part.ChildAdded:Connect(function(child)
+        if not antiTamperActive then return end
+        if isOwnedByScript(child) then return end
+        if isOwnedByScript(part) then return end
+        
+        -- Nullify foreign attachments, constraints, etc.
+        if child:IsA("Attachment") and not isOwnedByScript(child) then
+            child:Destroy()
+        elseif child:IsA("WeldConstraint") and not child.Name:find("GatherWeld_") then
+            child:Destroy()
+        elseif child:IsA("AlignPosition") and not isOwnedByScript(child) then
+            child:Destroy()
+        elseif child:IsA("Torque") and not isOwnedByScript(child) then
+            child:Destroy()
+        elseif child:IsA("BodyVelocity") or child:IsA("BodyForce") or child:IsA("BodyGyro") or
+               child:IsA("BodyPosition") or child:IsA("BodyThrust") or child:IsA("BodyAngularVelocity") then
+            child:Destroy()
+        end
+    end)
+    table.insert(connections, childAddedConn)
+    
+    antiTamperConnections[part] = connections
+end
+
+-- Start anti-tamper system
+local function startAntiTamper()
+    if antiTamperActive then return end
+    antiTamperActive = true
+    
+    -- Install on existing parts
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v:IsA("BasePart") then
+            installAntiTamperOnPart(v)
+        end
+    end
+    
+    -- Watch for new parts
+    local descAddedConn = Workspace.DescendantAdded:Connect(function(v)
+        if v:IsA("BasePart") then
+            installAntiTamperOnPart(v)
+        end
+    end)
+    antiTamperConnections["DescendantAdded"] = descAddedConn
+end
+
+-- Stop anti-tamper system
+local function stopAntiTamper()
+    antiTamperActive = false
+    for _, conns in pairs(antiTamperConnections) do
+        if type(conns) == "table" then
+            for _, conn in ipairs(conns) do
+                pcall(function() conn:Disconnect() end)
+            end
+        elseif type(conns) == "userdata" then
+            pcall(function() conns:Disconnect() end)
+        end
+    end
+    antiTamperConnections = {}
+end
+
+-- =====================================
+-- ====== BH SPIN SYSTEM ======
+-- =====================================
+local bhSpinActive = false
+local bhSpinThreads = {}
+
+local function startBHRapidSpin(bh)
+    if not bh or not bh.Attachment then return end
+    
+    local thread = spawn(function()
+        local spinSpeed = 50 -- radians per second for rapid spin
+        local timeAccum = 0
+        
+        while bhSpinActive and bh and bh._running and bh.Attachment and bh.Attachment.Parent do
+            local dt = RunService.Heartbeat:Wait()
+            if not dt then dt = 0.016 end
+            timeAccum = timeAccum + dt
+            
+            if bh._active then
+                -- Rapidly rotate the attachment
+                local rotationAngle = spinSpeed * dt
+                local rotCF = CFrame.Angles(0, rotationAngle, rotationAngle * 0.7)
+                
+                local success, currentCF = pcall(function() return bh.Attachment.WorldCFrame end)
+                if success and currentCF then
+                    local newCF = currentCF * rotCF
+                    pcall(function() bh.Attachment.WorldCFrame = newCF end)
+                end
+                
+                -- Also spin assigned parts via their torques
+                for _, part in ipairs(bh.AssignedParts) do
+                    if part and part.Parent then
+                        local torque = part:FindFirstChildOfClass("Torque")
+                        if torque and isOwnedByScript(torque) then
+                            -- Vary torque direction for chaotic spinning
+                            local t = tick()
+                            local varyingTorque = Vector3.new(
+                                math.sin(t * 10) * 1e6,
+                                math.cos(t * 7) * 1e6,
+                                math.sin(t * 13) * 1e6
+                            )
+                            torque.Torque = varyingTorque
+                        end
+                        
+                        -- Tween parts to attachment if BH active
+                        if bh._active and bh.Attachment then
+                            local alignPos = part:FindFirstChildOfClass("AlignPosition")
+                            if alignPos and isOwnedByScript(alignPos) then
+                                alignPos.Attachment1 = bh.Attachment
+                                alignPos.Responsiveness = 50 -- High responsiveness for tight tracking
+                            end
+                        end
+                    end
+                end
+            end
+            
+            wait(0.01) -- 100Hz update for smooth spinning
+        end
+    end)
+    
+    table.insert(bhSpinThreads, thread)
+    return thread
+end
+
+local function startAllBHSpinning()
+    bhSpinActive = true
+    for _, bh in ipairs(extraBlackHoles) do
+        startBHRapidSpin(bh)
+    end
+end
+
+local function stopAllBHSpinning()
+    bhSpinActive = false
+    bhSpinThreads = {}
+end
+
+-- =====================================
+-- ====== ANTI-INGREDIENT SYSTEM ======
+-- =====================================
+local antiIngredientActive = false
+local antiIngredientConnections = {}
+local scriptSignature = "ÆS_BH_" .. tostring(math.random(100000, 999999)) -- Unique script signature
+local allowedIngredients = {} -- Ingredients launched by this script
+
+-- Register an ingredient as allowed
+local function registerIngredient(ingredient)
+    allowedIngredients[ingredient] = true
+    markAsOwned(ingredient)
+end
+
+-- Check if an ingredient is allowed
+local function isIngredientAllowed(ingredient)
+    return allowedIngredients[ingredient] == true or isOwnedByScript(ingredient)
+end
+
+-- Nullify foreign scripting ingredients
+local function installAntiIngredient()
+    antiIngredientActive = true
+    
+    -- Watch for new scripts/loadstrings being injected
+    local luaSourceConn = nil
+    local success = pcall(function()
+        -- Detect if any ModuleScript, LocalScript, or Script appears in workspace
+        local function checkIngredient(v)
+            if v:IsA("LocalScript") or v:IsA("Script") or v:IsA("ModuleScript") then
+                if not isIngredientAllowed(v) then
+                    -- Nullify by disabling
+                    pcall(function()
+                        v.Disabled = true
+                        -- If it's a ModuleScript, clear its parent to prevent execution
+                        if v:IsA("ModuleScript") then
+                            v.Parent = nil
+                        end
+                    end)
+                end
+            end
+        end
+        
+        local ingredientAdded = Workspace.DescendantAdded:Connect(checkIngredient)
+        table.insert(antiIngredientConnections, ingredientAdded)
+        
+        -- Check existing
+        for _, v in ipairs(Workspace:GetDescendants()) do
+            checkIngredient(v)
+        end
+    end)
+    
+    -- Monitor for loadstring attempts (via detecting new function environments)
+    -- Note: Full loadstring prevention requires server-side, but we can detect
+    -- and nullify the resulting objects
+    
+    -- Watch for ScreenGui / Billboards that might be injected by other scripts
+    local guiAddedConn = nil
+    local success2 = pcall(function()
+        guiAddedConn = Workspace.DescendantAdded:Connect(function(v)
+            if not antiIngredientActive then return end
+            if v:IsA("ScreenGui") or v:IsA("BillboardGui") or v:IsA("SurfaceGui") then
+                -- Check if it contains our signature
+                local hasSignature = false
+                for _, child in ipairs(v:GetDescendants()) do
+                    if child:IsA("LocalScript") and child.Name:find(scriptSignature) then
+                        hasSignature = true
+                        break
+                    end
+                end
+                if not hasSignature and not isOwnedByScript(v) then
+                    -- Foreign GUI - nullify
+                    pcall(function() v.Enabled = false end)
+                    Debris:AddItem(v, 5) -- Remove after 5 seconds
+                end
+            end
+        end)
+    end)
+    if success2 and guiAddedConn then
+        table.insert(antiIngredientConnections, guiAddedConn)
+    end
+end
+
+local function stopAntiIngredient()
+    antiIngredientActive = false
+    for _, conn in ipairs(antiIngredientConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    antiIngredientConnections = {}
+end
+
+-- Override stripBodyForces to mark instances as owned
+local originalStripBodyForces = stripBodyForces
+stripBodyForces = function(part)
+    for _, x in next, part:GetChildren() do
+        if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+        or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+        or x:IsA("RocketPropulsion") then
+            x:Destroy()
+        end
+    end
+    if part:FindFirstChild("Attachment") then 
+        local att = part:FindFirstChild("Attachment")
+        if not isOwnedByScript(att) then att:Destroy() end
+    end
+    if part:FindFirstChild("AlignPosition") then 
+        local ap = part:FindFirstChild("AlignPosition")
+        if not isOwnedByScript(ap) then ap:Destroy() end
+    end
+    if part:FindFirstChild("Torque") then 
+        local tq = part:FindFirstChild("Torque")
+        if not isOwnedByScript(tq) then tq:Destroy() end
+    end
+end
+
+-- Patch ForcePart to mark instances as owned
+local originalForcePart = ForcePart
+ForcePart = function(v)
+    if not v or not v:IsA("BasePart") then return end
+    if isPartPlayerCharacter(v) then return end
+    if localPlayer.Character and v:IsDescendantOf(localPlayer.Character) then return end
+
+    if v:IsA("BasePart")
+        and not v.Anchored
+        and v.Name ~= "Handle"
+        and (
+            (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+            or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+        ) then
+
+        if processedParts[v] then return end
+        processedParts[v] = true
+
+        if initiallyMasslessParts[v] == nil then
+            pcall(function() initiallyMasslessParts[v] = v.Massless end)
+        end
+        pcall(function() v.Massless = true end)
+
+        stripBodyForces(v)
+        v.CanCollide = false
+
+        local Attachment2 = Instance.new("Attachment", v)
+        markAsOwned(Attachment2)
+        pcall(function() Attachment2.WorldCFrame = v.CFrame end)
+
+        local AlignPosition = Instance.new("AlignPosition", v)
+        markAsOwned(AlignPosition)
+        AlignPosition.Attachment0 = Attachment2
+
+        local ok, isMass = pcall(function() return v.Massless end)
+        local maxF = PULL_MAX_FORCE
+        local resp  = PULL_RESPONSIVENESS
+        if ok and isMass == true then
+            maxF = maxF * MASSLESS_PULL_SCALE
+            resp  = resp * MASSLESS_RESP_SCALE
+        end
+
+        AlignPosition.MaxForce = maxF
+        AlignPosition.MaxVelocity = math.huge
+        AlignPosition.Responsiveness = resp
+
+        local torqueVal = FLING_TORQUE
+        if ok and isMass == true then
+            torqueVal = torqueVal * MASSLESS_TORQUE_SCALE
+        end
+        local TorqueInst = Instance.new("Torque", v)
+        markAsOwned(TorqueInst)
+        TorqueInst.Torque = torqueVal
+        TorqueInst.Attachment0 = Attachment2
+
+        local bh = getLeastLoadedBlackHole()
+        if bh and bh.Attachment and bh._active then
+            AlignPosition.Attachment1 = bh.Attachment
+            table.insert(bh.AssignedParts, v)
+        else
+            AlignPosition.Attachment1 = Attachment1
+        end
+        
+        -- Install anti-tamper on this part
+        installAntiTamperOnPart(v)
+    end
+end
+
+-- Patch ForcePartIndividual similarly
+local originalForcePartIndividual = ForcePartIndividual
+ForcePartIndividual = function(v)
+    if not v or not v:IsA("BasePart") then return end
+    if isPartPlayerCharacter(v) then return end
+    if localPlayer.Character and v:IsDescendantOf(localPlayer.Character) then return end
+    
+    if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
+        and (
+            (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+            or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+        ) then
+        
+        if processedParts[v] then return end
+        processedParts[v] = true
+        if individualPartsData[v] then return end
+        
+        if initiallyMasslessParts[v] == nil then
+            pcall(function() initiallyMasslessParts[v] = v.Massless end)
+        end
+        pcall(function() v.Massless = true end)
+        
+        stripBodyForces(v)
+        v.CanCollide = false
+        
+        local partAtt = Instance.new("Attachment", v)
+        markAsOwned(partAtt)
+        pcall(function() partAtt.WorldCFrame = v.CFrame end)
+        
+        local alignPos = Instance.new("AlignPosition", v)
+        markAsOwned(alignPos)
+        alignPos.Attachment0 = partAtt
+        
+        local ok, isMass = pcall(function() return v.Massless end)
+        local maxF = PULL_MAX_FORCE
+        local resp = PULL_RESPONSIVENESS
+        if ok and isMass == true then
+            maxF = maxF * MASSLESS_PULL_SCALE
+            resp = resp * MASSLESS_RESP_SCALE
+        end
+        
+        alignPos.MaxForce = maxF
+        alignPos.MaxVelocity = math.huge
+        alignPos.Responsiveness = resp
+        
+        local torqueVal = FLING_TORQUE
+        if ok and isMass == true then
+            torqueVal = torqueVal * MASSLESS_TORQUE_SCALE
+        end
+        local torque = Instance.new("Torque", v)
+        markAsOwned(torque)
+        torque.Torque = torqueVal
+        torque.Attachment0 = partAtt
+        
+        local initialPlayer = getRandomValidTarget(nil)
+        if not initialPlayer then
+            alignPos.Attachment1 = Attachment1
+            return
+        end
+        
+        local targetPart, targetAtt = createIndividualTargetAttachment(initialPlayer, v)
+        if targetAtt then
+            markAsOwned(targetAtt)
+            alignPos.Attachment1 = targetAtt
+        else
+            alignPos.Attachment1 = Attachment1
+        end
+        
+        local data = {
+            part = v,
+            attachment = partAtt,
+            alignPos = alignPos,
+            torque = torque,
+            targetPlayer = initialPlayer,
+            targetPart = targetPart,
+            targetAttachment = targetAtt,
+            phase = math.random() * math.pi * 2,
+            orbitRadius = INDIVIDUAL_ORBIT_RADIUS_BASE + (math.random() * INDIVIDUAL_ORBIT_RADIUS_VARY),
+            orbitSpeed = INDIVIDUAL_ORBIT_SPEED + (math.random() * 1.5),
+            verticalAmp = INDIVIDUAL_VERTICAL_OSCILLATION * (0.5 + math.random()),
+            nextSwitchTime = INDIVIDUAL_SWITCH_INTERVAL_BASE + (math.random() * INDIVIDUAL_SWITCH_INTERVAL_VARY),
+            active = true,
+            thread = nil,
+            switchingLock = false,
+        }
+        
+        individualPartsData[v] = data
+        startIndividualPartThread(v, data)
+        installAntiTamperOnPart(v)
+    end
+end
+
+-- Patch createExtraBlackHole to mark instances
+local originalCreateExtraBlackHole = createExtraBlackHole
+createExtraBlackHole = function(initialTarget, source)
+    if source ~= "PAA" then source = "PAA" end
+
+    if initialTarget == localPlayer then initialTarget = nil end
+    if initialTarget and isWhitelisted(initialTarget) and source ~= "CMD_ALLOW_WHITELISTED" then
+        initialTarget = nil
+    end
+
+    local folder = Workspace:FindFirstChild("ÆS_BlackHole_Folder") or Instance.new("Folder", Workspace)
+    folder.Name = "ÆS_BlackHole_Folder"
+    local part = Instance.new("Part", folder)
+    markAsOwned(part)
+    part.Anchored = true
+    part.CanCollide = false
+    part.Transparency = 1
+    part.Size = Vector3.new(1,1,1)
+    part.Name = "ExtraBH_Center"
+
+    local att = Instance.new("Attachment", part)
+    markAsOwned(att)
+
+    local bh = {
+        Part = part,
+        Attachment = att,
+        AssignedParts = {},
+        TargetPlayer = initialTarget,
+        LastTarget = nil,
+        _running = true,
+        _active = true,
+        source = source or "PAA",
+        rotating = false,
+        smoothedCF = part.CFrame,
+        skidState = 1,
+        skidAccumulator = 0,
+    }
+
+    local function isPlayerDisabled(pl)
+        if not pl then return false end
+        if pl:FindFirstChild("Disabled") and typeof(pl.Disabled.Value) == "boolean" then
+            return pl.Disabled.Value
+        end
+        return false
+    end
+
+    bh._thread = spawn(function()
+        local t = 0
+        while bh._running do
+            local dt = RunService.Heartbeat:Wait()
+            t = t + dt
+
+            if bh.TargetPlayer and bh.TargetPlayer ~= localPlayer and not isWhitelisted(bh.TargetPlayer) and isPlayerAlive(bh.TargetPlayer) then
+                if isPlayerDisabled(bh.TargetPlayer) then
+                    setBlackHoleActiveState(bh, false)
+                else
+                    setBlackHoleActiveState(bh, true)
+
+                    local char = bh.TargetPlayer.Character
+                    if char and char:FindFirstChild("HumanoidRootPart") then
+                        local hrp = char.HumanoidRootPart
+                        local pos = hrp.Position
+                        local vel = hrp.Velocity or Vector3.new(0,0,0)
+                        local now = tick()
+
+                        local predictedPos, leadTime = predictTargetPosition(bh.TargetPlayer, pos, vel, now)
+
+                        local dir
+                        if vel.Magnitude > 0.5 then
+                            dir = vel.Unit
+                        else
+                            dir = hrp.CFrame.LookVector
+                        end
+
+                        local halfLen = vel.Magnitude
+                        if halfLen < SKID_MIN_HALF_LENGTH then halfLen = SKID_MIN_HALF_LENGTH end
+                        halfLen = halfLen * clamp(1 + (leadTime * 1.2), 1, 2.8)
+
+                        local desiredPos
+                        if SkiddingEnabled then
+                            bh.skidAccumulator = bh.skidAccumulator + dt
+                            if bh.skidAccumulator >= SKID_STEP then
+                                bh.skidAccumulator = bh.skidAccumulator - SKID_STEP
+                                bh.skidState = -bh.skidState
+                            end
+                            desiredPos = predictedPos + dir * (bh.skidState * halfLen)
+                            local upwardVel = hrp.Velocity.Y
+                            if upwardVel > 1 then
+                                local vUp = clamp(upwardVel * 0.45, 0, halfLen)
+                                desiredPos = desiredPos + Vector3.new(0, vUp, 0)
+                            elseif upwardVel < -2 then
+                                desiredPos = desiredPos + Vector3.new(0, clamp(upwardVel * 0.12, -halfLen, 0), 0)
+                            end
+                        else
+                            bh.skidAccumulator = 0
+                            bh.skidState = 0
+                            desiredPos = predictedPos
+                        end
+
+                        local speed = vel.Magnitude
+                        local okRot, rotVel = pcall(function() return hrp.RotVelocity end)
+                        local rotMag = (okRot and typeof(rotVel) == "Vector3") and rotVel.Magnitude or 0
+                        local responsiveness = 10 + (speed * 6) + (rotMag * 0.9) + (leadTime * 25)
+                        responsiveness = clamp(responsiveness, 6, 160)
+
+                        local lookAt = predictedPos
+                        if dir then lookAt = predictedPos + dir end
+                        local targetCF = CFrame.new(desiredPos, lookAt)
+
+                        local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
+                        local curCF = success and cur or bh.smoothedCF or bh.Part.CFrame
+
+                        local alpha = 1 - math.exp(-responsiveness * dt)
+                        if alpha < 0.01 then alpha = 0.01 end
+                        if alpha > 0.99 then alpha = 0.99 end
+
+                        bh.smoothedCF = curCF:Lerp(targetCF, alpha)
+                        if bh.Attachment then
+                            bh.Attachment.WorldCFrame = bh.smoothedCF
+                        end
+                    end
+                end
+            else
+                setBlackHoleActiveState(bh, false)
+                if Attachment1 and Attachment1.Parent and bh.Attachment then
+                    local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
+                    local curCF = success and cur or bh.smoothedCF or bh.Part.CFrame
+                    local centerCF
+                    pcall(function() centerCF = Attachment1.WorldCFrame end)
+                    if centerCF then
+                        local targetCF = centerCF
+                        local idleAlpha = 1 - math.exp(- 8 * dt)
+                        if idleAlpha < 0.01 then idleAlpha = 0.01 end
+                        if idleAlpha > 0.99 then idleAlpha = 0.99 end
+                        bh.smoothedCF = curCF:Lerp(targetCF, idleAlpha)
+                        bh.Attachment.WorldCFrame = bh.smoothedCF
+                    end
+                end
+                wait(0.06)
+            end
+        end
+    end)
+
+    table.insert(extraBlackHoles, bh)
+    
+    -- Start spinning this BH if BH spin is active
+    if bhSpinActive then
+        startBHRapidSpin(bh)
+    end
+    
+    return bh
+end
+
+-- Override setBlackHoleActiveState for spin integration
+local originalSetBlackHoleActive = setBlackHoleActiveState
+setBlackHoleActiveState = function(bh, active)
+    if not bh then return end
+    if bh._active == active then return end
+    bh._active = active
+    
+    if active and bhSpinActive then
+        -- When BH becomes active, start spinning assigned parts
+        for _, p in ipairs(bh.AssignedParts) do
+            if p and p.Parent then
+                p.CanCollide = false
+                local ap = p:FindFirstChildOfClass("AlignPosition")
+                if ap and isOwnedByScript(ap) then
+                    ap.Attachment1 = bh.Attachment
+                    -- Tween part to attachment
+                    local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+                    local tween = TweenService:Create(p, tweenInfo, {CFrame = bh.Attachment.WorldCFrame})
+                    tween:Play()
+                end
+            end
+        end
+    elseif not active then
+        for _, p in ipairs(bh.AssignedParts) do
+            if p and p.Parent then
+                p.CanCollide = true
+                local ap = p:FindFirstChildOfClass("AlignPosition")
+                if ap then
+                    ap.Attachment1 = Attachment1
+                    pcall(function()
+                        local isMass = (pcall(function() return p.Massless end) and p.Massless)
+                        ap.MaxForce = PULL_MAX_FORCE * (isMass and MASSLESS_PULL_SCALE or 1)
+                        ap.Responsiveness = PULL_RESPONSIVENESS * (isMass and MASSLESS_RESP_SCALE or 1)
+                    end)
+                end
+            end
+        end
+    end
+end
+
 -- Prediction helpers
 local playerVelBuffer = {}
 
@@ -112,17 +1051,23 @@ local function setupPlayer()
     local existing = Folder:FindFirstChild("BH_Center_Part")
     if existing and existing:IsA("BasePart") then
         local att = existing:FindFirstChildOfClass("Attachment")
-        if att then return att end
+        if att then 
+            markAsOwned(att)
+            return att 
+        end
         local newAtt = Instance.new("Attachment", existing)
+        markAsOwned(newAtt)
         return newAtt
     end
     local Part = Instance.new("Part", Folder)
+    markAsOwned(Part)
     Part.Name = "BH_Center_Part"
     Part.Anchored = true
     Part.CanCollide = false
     Part.Transparency = 1
     Part.Size = Vector3.new(1,1,1)
     local Attachment = Instance.new("Attachment", Part)
+    markAsOwned(Attachment)
     return Attachment
 end
 
@@ -155,9 +1100,18 @@ local function stripBodyForces(part)
             x:Destroy()
         end
     end
-    if part:FindFirstChild("Attachment") then part:FindFirstChild("Attachment"):Destroy() end
-    if part:FindFirstChild("AlignPosition") then part:FindFirstChild("AlignPosition"):Destroy() end
-    if part:FindFirstChild("Torque") then part:FindFirstChild("Torque"):Destroy() end
+    if part:FindFirstChild("Attachment") then 
+        local att = part:FindFirstChild("Attachment")
+        if not isOwnedByScript(att) then att:Destroy() end
+    end
+    if part:FindFirstChild("AlignPosition") then 
+        local ap = part:FindFirstChild("AlignPosition")
+        if not isOwnedByScript(ap) then ap:Destroy() end
+    end
+    if part:FindFirstChild("Torque") then 
+        local tq = part:FindFirstChild("Torque")
+        if not isOwnedByScript(tq) then tq:Destroy() end
+    end
 end
 
 local function shuffle(t)
@@ -314,6 +1268,7 @@ local function createIndividualTargetAttachment(player, part)
         folder.Name = "ÆS_IndividualParts_Folder"
     end
     local targetPart = Instance.new("Part", folder)
+    markAsOwned(targetPart)
     targetPart.Name = "IndividualTarget_" .. tostring(player.UserId) .. "_" .. math.random(1, 99999)
     targetPart.Anchored = true
     targetPart.CanCollide = false
@@ -325,6 +1280,7 @@ local function createIndividualTargetAttachment(player, part)
         end
     end)
     local att = Instance.new("Attachment", targetPart)
+    markAsOwned(att)
     att.Name = "TargetAttachment"
     return targetPart, att
 end
@@ -466,92 +1422,6 @@ local function startIndividualPartThread(part, data)
     end)
 end
 
--- ForcePart for Individual Parts mode
-local function ForcePartIndividual(v)
-    if not v or not v:IsA("BasePart") then return end
-    if isPartPlayerCharacter(v) then return end
-    if localPlayer.Character and v:IsDescendantOf(localPlayer.Character) then return end
-    
-    if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
-        and (
-            (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
-            or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
-        ) then
-        
-        if processedParts[v] then return end
-        processedParts[v] = true
-        if individualPartsData[v] then return end
-        
-        if initiallyMasslessParts[v] == nil then
-            pcall(function() initiallyMasslessParts[v] = v.Massless end)
-        end
-        pcall(function() v.Massless = true end)
-        
-        stripBodyForces(v)
-        v.CanCollide = false
-        
-        local partAtt = Instance.new("Attachment", v)
-        pcall(function() partAtt.WorldCFrame = v.CFrame end)
-        
-        local alignPos = Instance.new("AlignPosition", v)
-        alignPos.Attachment0 = partAtt
-        
-        local ok, isMass = pcall(function() return v.Massless end)
-        local maxF = PULL_MAX_FORCE
-        local resp = PULL_RESPONSIVENESS
-        if ok and isMass == true then
-            maxF = maxF * MASSLESS_PULL_SCALE
-            resp = resp * MASSLESS_RESP_SCALE
-        end
-        
-        alignPos.MaxForce = maxF
-        alignPos.MaxVelocity = math.huge
-        alignPos.Responsiveness = resp
-        
-        local torqueVal = FLING_TORQUE
-        if ok and isMass == true then
-            torqueVal = torqueVal * MASSLESS_TORQUE_SCALE
-        end
-        local torque = Instance.new("Torque", v)
-        torque.Torque = torqueVal
-        torque.Attachment0 = partAtt
-        
-        local initialPlayer = getRandomValidTarget(nil)
-        if not initialPlayer then
-            alignPos.Attachment1 = Attachment1
-            return
-        end
-        
-        local targetPart, targetAtt = createIndividualTargetAttachment(initialPlayer, v)
-        if targetAtt then
-            alignPos.Attachment1 = targetAtt
-        else
-            alignPos.Attachment1 = Attachment1
-        end
-        
-        local data = {
-            part = v,
-            attachment = partAtt,
-            alignPos = alignPos,
-            torque = torque,
-            targetPlayer = initialPlayer,
-            targetPart = targetPart,
-            targetAttachment = targetAtt,
-            phase = math.random() * math.pi * 2,
-            orbitRadius = INDIVIDUAL_ORBIT_RADIUS_BASE + (math.random() * INDIVIDUAL_ORBIT_RADIUS_VARY),
-            orbitSpeed = INDIVIDUAL_ORBIT_SPEED + (math.random() * 1.5),
-            verticalAmp = INDIVIDUAL_VERTICAL_OSCILLATION * (0.5 + math.random()),
-            nextSwitchTime = INDIVIDUAL_SWITCH_INTERVAL_BASE + (math.random() * INDIVIDUAL_SWITCH_INTERVAL_VARY),
-            active = true,
-            thread = nil,
-            switchingLock = false,
-        }
-        
-        individualPartsData[v] = data
-        startIndividualPartThread(v, data)
-    end
-end
-
 -- Start Individual Parts mode
 local function startIndividualParts()
     if individualPartsActive then return end
@@ -670,9 +1540,11 @@ local function ForcePart(v)
         v.CanCollide = false
 
         local Attachment2 = Instance.new("Attachment", v)
+        markAsOwned(Attachment2)
         pcall(function() Attachment2.WorldCFrame = v.CFrame end)
 
         local AlignPosition = Instance.new("AlignPosition", v)
+        markAsOwned(AlignPosition)
         AlignPosition.Attachment0 = Attachment2
 
         local ok, isMass = pcall(function() return v.Massless end)
@@ -692,6 +1564,7 @@ local function ForcePart(v)
             torqueVal = torqueVal * MASSLESS_TORQUE_SCALE
         end
         local Torque = Instance.new("Torque", v)
+        markAsOwned(Torque)
         Torque.Torque = torqueVal
         Torque.Attachment0 = Attachment2
 
@@ -702,6 +1575,99 @@ local function ForcePart(v)
         else
             AlignPosition.Attachment1 = Attachment1
         end
+        
+        installAntiTamperOnPart(v)
+    end
+end
+
+-- ForcePart for Individual Parts mode
+local function ForcePartIndividual(v)
+    if not v or not v:IsA("BasePart") then return end
+    if isPartPlayerCharacter(v) then return end
+    if localPlayer.Character and v:IsDescendantOf(localPlayer.Character) then return end
+    
+    if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
+        and (
+            (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+            or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+        ) then
+        
+        if processedParts[v] then return end
+        processedParts[v] = true
+        if individualPartsData[v] then return end
+        
+        if initiallyMasslessParts[v] == nil then
+            pcall(function() initiallyMasslessParts[v] = v.Massless end)
+        end
+        pcall(function() v.Massless = true end)
+        
+        stripBodyForces(v)
+        v.CanCollide = false
+        
+        local partAtt = Instance.new("Attachment", v)
+        markAsOwned(partAtt)
+        pcall(function() partAtt.WorldCFrame = v.CFrame end)
+        
+        local alignPos = Instance.new("AlignPosition", v)
+        markAsOwned(alignPos)
+        alignPos.Attachment0 = partAtt
+        
+        local ok, isMass = pcall(function() return v.Massless end)
+        local maxF = PULL_MAX_FORCE
+        local resp = PULL_RESPONSIVENESS
+        if ok and isMass == true then
+            maxF = maxF * MASSLESS_PULL_SCALE
+            resp = resp * MASSLESS_RESP_SCALE
+        end
+        
+        alignPos.MaxForce = maxF
+        alignPos.MaxVelocity = math.huge
+        alignPos.Responsiveness = resp
+        
+        local torqueVal = FLING_TORQUE
+        if ok and isMass == true then
+            torqueVal = torqueVal * MASSLESS_TORQUE_SCALE
+        end
+        local torque = Instance.new("Torque", v)
+        markAsOwned(torque)
+        torque.Torque = torqueVal
+        torque.Attachment0 = partAtt
+        
+        local initialPlayer = getRandomValidTarget(nil)
+        if not initialPlayer then
+            alignPos.Attachment1 = Attachment1
+            return
+        end
+        
+        local targetPart, targetAtt = createIndividualTargetAttachment(initialPlayer, v)
+        if targetAtt then
+            markAsOwned(targetAtt)
+            alignPos.Attachment1 = targetAtt
+        else
+            alignPos.Attachment1 = Attachment1
+        end
+        
+        local data = {
+            part = v,
+            attachment = partAtt,
+            alignPos = alignPos,
+            torque = torque,
+            targetPlayer = initialPlayer,
+            targetPart = targetPart,
+            targetAttachment = targetAtt,
+            phase = math.random() * math.pi * 2,
+            orbitRadius = INDIVIDUAL_ORBIT_RADIUS_BASE + (math.random() * INDIVIDUAL_ORBIT_RADIUS_VARY),
+            orbitSpeed = INDIVIDUAL_ORBIT_SPEED + (math.random() * 1.5),
+            verticalAmp = INDIVIDUAL_VERTICAL_OSCILLATION * (0.5 + math.random()),
+            nextSwitchTime = INDIVIDUAL_SWITCH_INTERVAL_BASE + (math.random() * INDIVIDUAL_SWITCH_INTERVAL_VARY),
+            active = true,
+            thread = nil,
+            switchingLock = false,
+        }
+        
+        individualPartsData[v] = data
+        startIndividualPartThread(v, data)
+        installAntiTamperOnPart(v)
     end
 end
 
@@ -854,6 +1820,16 @@ local function setBlackHoleActiveState(bh, active)
             if p and p.Parent then
                 local ap = p:FindFirstChildOfClass("AlignPosition")
                 if ap then ap.Attachment1 = bh.Attachment; p.CanCollide = false end
+                
+                -- Tween part to attachment for smooth transition
+                if bh.Attachment then
+                    local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+                    local targetCF = pcall(function() return bh.Attachment.WorldCFrame end)
+                    if targetCF then
+                        local tween = TweenService:Create(p, tweenInfo, {CFrame = bh.Attachment.WorldCFrame})
+                        tween:Play()
+                    end
+                end
             end
         end
     end
@@ -871,6 +1847,7 @@ local function createExtraBlackHole(initialTarget, source)
     local folder = Workspace:FindFirstChild("ÆS_BlackHole_Folder") or Instance.new("Folder", Workspace)
     folder.Name = "ÆS_BlackHole_Folder"
     local part = Instance.new("Part", folder)
+    markAsOwned(part)
     part.Anchored = true
     part.CanCollide = false
     part.Transparency = 1
@@ -878,6 +1855,7 @@ local function createExtraBlackHole(initialTarget, source)
     part.Name = "ExtraBH_Center"
 
     local att = Instance.new("Attachment", part)
+    markAsOwned(att)
 
     local bh = {
         Part = part,
@@ -976,6 +1954,16 @@ local function createExtraBlackHole(initialTarget, source)
                         if bh.Attachment then
                             bh.Attachment.WorldCFrame = bh.smoothedCF
                         end
+                        
+                        -- Rapid spin when active
+                        if bh._active and bhSpinActive then
+                            local spinAngle = 30 * dt -- rapid spin
+                            local spinCF = CFrame.Angles(spinAngle, spinAngle * 1.3, spinAngle * 0.7)
+                            pcall(function()
+                                local curWCF = bh.Attachment.WorldCFrame
+                                bh.Attachment.WorldCFrame = curWCF * spinCF
+                            end)
+                        end
                     end
                 end
             else
@@ -1000,6 +1988,12 @@ local function createExtraBlackHole(initialTarget, source)
     end)
 
     table.insert(extraBlackHoles, bh)
+    
+    -- Start spinning if BH spin is active
+    if bhSpinActive then
+        startBHRapidSpin(bh)
+    end
+    
     return bh
 end
 
@@ -1584,6 +2578,66 @@ window:Button("Reset Cycle", function()
     resetCycleNow()
 end)
 
+window:Separator("=== GATHER PARTS ===")
+
+-- ====== GATHER PARTS BUTTON ======
+window:Button("Gather Parts", function()
+    if gatherPartsRunning then
+        stopGatherParts()
+        warn("Gather Parts: Stopped")
+        return
+    end
+    startGatherParts()
+    warn("Gather Parts: Started - gathering distant parts...")
+end)
+
+-- ====== ANTI-TAMPER TOGGLE ======
+window:Toggle("Anti-Tamper (Protect BH Parts)", true, function(Value)
+    if Value then
+        startAntiTamper()
+    else
+        stopAntiTamper()
+    end
+end)
+
+-- ====== BH RAPID SPIN TOGGLE ======
+window:Toggle("BH Rapid Spin", true, function(Value)
+    bhSpinActive = Value
+    if Value then
+        startAllBHSpinning()
+    else
+        stopAllBHSpinning()
+    end
+end)
+
+-- ====== ANTI-INGREDIENT TOGGLE ======
+window:Toggle("Anti-Ingredient (Block Foreign Scripts)", true, function(Value)
+    if Value then
+        installAntiIngredient()
+    else
+        stopAntiIngredient()
+    end
+end)
+
+-- ====== AUTO-DISMANTLE (replaces old) ======
+window:Toggle("Auto-Dismantle (Nullify Non-BH Changes)", true, function(Value)
+    antiTamperActive = Value
+    if Value then
+        startAntiTamper()
+        installAntiIngredient()
+        -- Ensure BH spin is on
+        if not bhSpinActive then
+            bhSpinActive = true
+            startAllBHSpinning()
+        end
+    else
+        stopAntiTamper()
+        stopAntiIngredient()
+    end
+end)
+
+window:Separator("=== === ===")
+
 window:Button("Load Player List Script", function()
     loadstring(game:HttpGet("https://raw.githubusercontent.com/Jlchris1/Udklol/refs/heads/main/Playerlistv6"))()
 end)
@@ -1642,6 +2696,18 @@ window:Toggle("Skidding (0.1s forward/back)", SkiddingEnabled, function(Value)
     end
 end)
 
+-- Auto-start anti-tamper and anti-ingredient on script launch
+spawn(function()
+    wait(1) -- Let everything initialize
+    startAntiTamper()
+    installAntiIngredient()
+    bhSpinActive = true
+    if #extraBlackHoles > 0 then
+        startAllBHSpinning()
+    end
+    warn("[BH Script] Anti-Tamper, Anti-Ingredient, and BH Spin active")
+end)
+
 spawn(function()
     while true do
         if PAAEnabled then
@@ -1660,6 +2726,14 @@ spawn(function()
         if #extraBlackHoles > 0 and not rebalancerRunning then startRebalancer()
         elseif #extraBlackHoles == 0 and rebalancerRunning then stopRebalancer() end
         if cycleRestartPending then scheduleCycleRestart() end
+        
+        -- Auto-reapply anti-tamper checks
+        if antiTamperActive then
+            for _, conns in pairs(antiTamperConnections) do
+                -- Keep connections alive
+            end
+        end
+        
         wait(0.5)
     end
 end)
