@@ -1,0 +1,898 @@
+-- Tornado LocalScript — v8.3 Compact + Stable Orbit + Freeze + Funnel Width
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local localPlayer = Players.LocalPlayer
+
+local isMobile = UserInputService.TouchEnabled
+
+-- ========== Config (defaults) ==========
+local enabled = false
+local tornadoSpinSpeed = 250
+local tornadoUpwardSpeed = 50
+local tornadoWindfield = 500
+local tornadoMoveSpeed = 10
+local baseplateName = "Baseplate"
+
+local maxSubVortices = 3
+local satelliteChaseSpeed = 20
+local satelliteOrbitRadius = 10
+local satelliteRotationSpeed = 3.5
+local horizontalVortexAttachRadius = 30
+local satelliteMainOrbitAttackCount = 3
+local satelliteMainOrbitAttackRate = 1
+
+local subVortexSpinSpeed = 3.5
+local subVortexHeight = 120
+local subVortexWidth = 200
+local mainFunnelShare = 0.7
+
+-- NEW: Main Funnel Width (max orbit radius for main funnel parts)
+local mainFunnelWidth = 50
+
+local verticalChainMinParts = 3
+local verticalChainMaxParts = 6
+local verticalChainSpeed = 0.7
+local verticalChainAmplitude = 4
+local verticalChainFrequency = 6
+local verticalChainSegmentDelay = 0.12
+local verticalAttachDistance = 2.0
+
+local noodleFlingInterval = 0.6
+local noodleLaunchBaseSpeed = 300
+local noodleLaunchRandomAdd = 200
+local noodleLaunchAngular = 80
+
+local orbitVelocityMinCap = 200
+local orbitVelocityMultiplier = 2.5
+
+local funnelReserveCount = 8
+local funnelHeight = 500
+
+local tornadoAmount = 1
+local tornadoType = "Classic"
+
+-- Path type system
+local pathType = "Follow"
+local tornadoRandomPathSpeed = 100
+local stalkTarget = nil
+local randomPathTarget = nil
+local randomPathSwitchTimer = 0
+
+-- Freeze state
+local partsFrozen = false
+
+-- ========== Runtime State ==========
+local tornadoPositions = {}
+local pickedUpByFunnel = {}
+local whitelistedParts = {}
+local assignedToSatellite = {}
+local debrisAttachedToPlayer = {}
+local mainFunnelParts = {}
+local mainFunnelSet = {}
+local satelliteVortices = {}
+local satelliteAttackState = {}
+local nextSatelliteId = 1
+local playerAttachmentMap = {}
+local playerTargetThreads = {}
+local nightmareMode = false
+local noodlePools = {}
+local noodlePartSet = {}
+local ropeParts = {}
+local ropeSegments = {}
+local nextMainNoodleId = 1
+local guiVisible = true
+
+-- Track original anchored states for freeze/unfreeze
+local frozenParts = {}  -- part -> true
+
+-- ========== UI - ULTRA COMPACT 280px ==========
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "TornadoBlastGUI"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 100
+screenGui.IgnoreGuiInset = false
+screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+local scale = isMobile and 1.1 or 1.0
+local guiWidth = math.floor(220 * scale)
+local guiHeight = 280  -- FIXED 280px as requested
+local btnSize = math.floor(26 * scale)
+
+-- ========== TOGGLE BUTTON (left side) ==========
+local toggleBtn = Instance.new("ImageButton")
+toggleBtn.Size = UDim2.new(0, btnSize, 0, btnSize)
+toggleBtn.Position = UDim2.new(0, 4, 0.5, -btnSize/2)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+toggleBtn.BorderColor3 = Color3.fromRGB(80, 80, 90)
+toggleBtn.BorderSizePixel = 1
+toggleBtn.Image = "rbxassetid://0"
+toggleBtn.Parent = screenGui
+
+local toggleIcon = Instance.new("TextLabel")
+toggleIcon.Size = UDim2.new(1, 0, 1, 0)
+toggleIcon.BackgroundTransparency = 1
+toggleIcon.Text = "🌀"
+toggleIcon.TextColor3 = Color3.fromRGB(200, 200, 210)
+toggleIcon.Font = Enum.Font.SourceSans
+toggleIcon.TextSize = math.floor(14 * scale)
+toggleIcon.Parent = toggleBtn
+
+local statusDot = Instance.new("Frame")
+statusDot.Size = UDim2.new(0, 5, 0, 5)
+statusDot.Position = UDim2.new(1, -7, 0, 1)
+statusDot.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+statusDot.BorderSizePixel = 0
+statusDot.Parent = toggleBtn
+
+-- ========== MAIN FRAME ==========
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, guiWidth, 0, guiHeight)
+mainFrame.Position = UDim2.new(0, btnSize + 8, 0.5, -guiHeight/2)
+mainFrame.BackgroundColor3 = Color3.fromRGB(32, 32, 38)
+mainFrame.BorderColor3 = Color3.fromRGB(55, 55, 65)
+mainFrame.BorderSizePixel = 1
+mainFrame.Active = true
+mainFrame.Visible = guiVisible
+mainFrame.Parent = screenGui
+
+-- Title bar
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 22)
+titleBar.Position = UDim2.new(0, 0, 0, 0)
+titleBar.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = mainFrame
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(0.5, -5, 1, 0)
+titleLabel.Position = UDim2.new(0, 5, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "TORNADO"
+titleLabel.TextColor3 = Color3.fromRGB(170, 170, 185)
+titleLabel.Font = Enum.Font.SourceSansBold
+titleLabel.TextSize = 12
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = titleBar
+
+local nModeBtn = Instance.new("TextButton")
+nModeBtn.Size = UDim2.new(0.5, -5, 0, 16)
+nModeBtn.Position = UDim2.new(0.5, 0, 0, 3)
+nModeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+nModeBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
+nModeBtn.Font = Enum.Font.SourceSans
+nModeBtn.TextSize = 10
+nModeBtn.Text = "Friendly"
+nModeBtn.BorderSizePixel = 0
+nModeBtn.Parent = titleBar
+
+nModeBtn.MouseButton1Click:Connect(function()
+    nightmareMode = not nightmareMode
+    nModeBtn.Text = nightmareMode and "Nightmare" or "Friendly"
+    nModeBtn.BackgroundColor3 = nightmareMode and Color3.fromRGB(100, 35, 35) or Color3.fromRGB(50, 50, 58)
+end)
+
+-- ========== SCROLLING FRAME ==========
+local scrollingFrame = Instance.new("ScrollingFrame")
+scrollingFrame.Size = UDim2.new(1, -6, 1, -66)
+scrollingFrame.Position = UDim2.new(0, 3, 0, 24)
+scrollingFrame.BackgroundTransparency = 1
+scrollingFrame.BorderSizePixel = 0
+scrollingFrame.ScrollBarThickness = 3
+scrollingFrame.ScrollBarImageColor3 = Color3.fromRGB(70, 70, 80)
+scrollingFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+scrollingFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scrollingFrame.Parent = mainFrame
+
+-- ========== BOTTOM BAR ==========
+local bottomBar = Instance.new("Frame")
+bottomBar.Size = UDim2.new(1, 0, 0, 36)
+bottomBar.Position = UDim2.new(0, 0, 1, -36)
+bottomBar.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+bottomBar.BorderSizePixel = 0
+bottomBar.Parent = mainFrame
+
+local startStopBtn = Instance.new("TextButton")
+startStopBtn.Size = UDim2.new(0, 70, 0, 24)
+startStopBtn.Position = UDim2.new(0.2, -35, 0, 6)
+startStopBtn.BackgroundColor3 = Color3.fromRGB(50, 120, 50)
+startStopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+startStopBtn.Font = Enum.Font.SourceSansBold
+startStopBtn.TextSize = 12
+startStopBtn.Text = "Start"
+startStopBtn.BorderSizePixel = 0
+startStopBtn.Parent = bottomBar
+
+-- FREEZE BUTTON on bottom bar
+local freezeBtn = Instance.new("TextButton")
+freezeBtn.Size = UDim2.new(0, 70, 0, 24)
+freezeBtn.Position = UDim2.new(0.8, -35, 0, 6)
+freezeBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+freezeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+freezeBtn.Font = Enum.Font.SourceSans
+freezeBtn.TextSize = 11
+freezeBtn.Text = "Freeze"
+freezeBtn.BorderSizePixel = 0
+freezeBtn.Parent = bottomBar
+
+-- ========== HELPER: ULTRA COMPACT TEXTBOX ==========
+local yOffset = 0
+local function addTextbox(labelText, default, explanation)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, -6, 0, 40)
+    container.Position = UDim2.new(0, 3, 0, yOffset)
+    container.BackgroundTransparency = 1
+    container.Parent = scrollingFrame
+    yOffset = yOffset + 42
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, -3, 0, 14)
+    label.Position = UDim2.new(0, 1, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(190, 190, 200)
+    label.Font = Enum.Font.SourceSansBold
+    label.TextSize = 10
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = container
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(0.5, -3, 0, 16)
+    box.Position = UDim2.new(0.5, 1, 0, 0)
+    box.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    box.TextColor3 = Color3.fromRGB(220, 220, 230)
+    box.Font = Enum.Font.SourceSans
+    box.TextSize = 10
+    box.Text = tostring(default)
+    box.ClearTextOnFocus = false
+    box.BorderSizePixel = 0
+    box.Parent = container
+
+    local explain = Instance.new("TextLabel")
+    explain.Size = UDim2.new(1, -2, 0, 20)
+    explain.Position = UDim2.new(0, 1, 0, 18)
+    explain.BackgroundTransparency = 1
+    explain.Text = explanation
+    explain.TextColor3 = Color3.fromRGB(110, 110, 125)
+    explain.Font = Enum.Font.SourceSans
+    explain.TextSize = 8
+    explain.TextXAlignment = Enum.TextXAlignment.Left
+    explain.TextWrapped = true
+    explain.Parent = container
+
+    return box
+end
+
+-- ========== BUILD UI ==========
+local inputRefs = {}
+
+inputRefs.tornadoAmount = addTextbox("Tornado Amount", tornadoAmount, "More = wider spread.")
+inputRefs.spinSpeed = addTextbox("Spin Speed", tornadoSpinSpeed, "Rotation speed.")
+inputRefs.upwardSpeed = addTextbox("Upward Speed", tornadoUpwardSpeed, "Lift strength.")
+inputRefs.windfield = addTextbox("Windfield Radius", tornadoWindfield, "Affect range (studs).")
+inputRefs.moveSpeed = addTextbox("Move Speed", tornadoMoveSpeed, "Chase speed.")
+inputRefs.maxSubVortices = addTextbox("Sub-Vortices", maxSubVortices, "Mini-vortices count.")
+inputRefs.funnelReserve = addTextbox("Funnel Reserve", funnelReserveCount, "Min main funnel parts.")
+inputRefs.mainFunnelWidth = addTextbox("Main Funnel Width", mainFunnelWidth, "Max orbit radius for main funnel.")
+inputRefs.funnelHeight = addTextbox("Funnel Height", funnelHeight, "Max height before reset.")
+inputRefs.subVortexSpin = addTextbox("Sub Spin", subVortexSpinSpeed, "Sub-vortex rotation.")
+inputRefs.subVortexHeight = addTextbox("Sub Height", subVortexHeight, "Sub-vortex vertical range.")
+inputRefs.subVortexWidth = addTextbox("Sub Width", subVortexWidth, "Orbital radius. No limit.")
+inputRefs.mainFunnelShare = addTextbox("Main Funnel %", mainFunnelShare * 100, "% parts for main funnel.")
+inputRefs.randomPathSpeed = addTextbox("Rand Path Speed", tornadoRandomPathSpeed, "Speed for random path.")
+
+-- ========== PATH TYPE SELECTOR ==========
+local pathContainer = Instance.new("Frame")
+pathContainer.Size = UDim2.new(1, -6, 0, 46)
+pathContainer.Position = UDim2.new(0, 3, 0, yOffset)
+pathContainer.BackgroundTransparency = 1
+pathContainer.Parent = scrollingFrame
+yOffset = yOffset + 48
+
+local pathLabel = Instance.new("TextLabel")
+pathLabel.Size = UDim2.new(0.5, -3, 0, 14)
+pathLabel.Position = UDim2.new(0, 1, 0, 0)
+pathLabel.BackgroundTransparency = 1
+pathLabel.Text = "Path Type"
+pathLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+pathLabel.Font = Enum.Font.SourceSansBold
+pathLabel.TextSize = 10
+pathLabel.TextXAlignment = Enum.TextXAlignment.Left
+pathLabel.Parent = pathContainer
+
+local pathBtns = {}
+local pathModes = {"Follow", "Random", "Stalker"}
+for i, mode in ipairs(pathModes) do
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.33, -2, 0, 16)
+    btn.Position = UDim2.new((i-1) * 0.33, 1, 0, 15)
+    btn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    btn.TextColor3 = Color3.fromRGB(220, 220, 230)
+    btn.Font = Enum.Font.SourceSans
+    btn.TextSize = 9
+    btn.Text = mode
+    btn.BorderSizePixel = 0
+    btn.Parent = pathContainer
+    pathBtns[mode] = btn
+    btn.MouseButton1Click:Connect(function()
+        pathType = mode
+        for _, b in pairs(pathBtns) do b.BackgroundColor3 = Color3.fromRGB(50, 50, 58) end
+        btn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
+        if mode == "Follow" then pathExplain.Text = "Follows you."
+        elseif mode == "Random" then pathExplain.Text = "Random paths, max 1500 away."
+        elseif mode == "Stalker" then pathExplain.Text = "Follows a player. NM flings." end
+    end)
+end
+pathBtns["Follow"].BackgroundColor3 = Color3.fromRGB(80, 80, 100)
+
+local pathExplain = Instance.new("TextLabel")
+pathExplain.Size = UDim2.new(1, -2, 0, 14)
+pathExplain.Position = UDim2.new(0, 1, 0, 32)
+pathExplain.BackgroundTransparency = 1
+pathExplain.Text = "Follows you."
+pathExplain.TextColor3 = Color3.fromRGB(110, 110, 125)
+pathExplain.Font = Enum.Font.SourceSans
+pathExplain.TextSize = 8
+pathExplain.TextXAlignment = Enum.TextXAlignment.Left
+pathExplain.TextWrapped = true
+pathExplain.Parent = pathContainer
+
+-- ========== TORNADO TYPE SELECTOR ==========
+local typeContainer = Instance.new("Frame")
+typeContainer.Size = UDim2.new(1, -6, 0, 36)
+typeContainer.Position = UDim2.new(0, 3, 0, yOffset)
+typeContainer.BackgroundTransparency = 1
+typeContainer.Parent = scrollingFrame
+yOffset = yOffset + 38
+
+local typeLabel = Instance.new("TextLabel")
+typeLabel.Size = UDim2.new(0.5, -3, 0, 14)
+typeLabel.Position = UDim2.new(0, 1, 0, 0)
+typeLabel.BackgroundTransparency = 1
+typeLabel.Text = "Type"
+typeLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+typeLabel.Font = Enum.Font.SourceSansBold
+typeLabel.TextSize = 10
+typeLabel.TextXAlignment = Enum.TextXAlignment.Left
+typeLabel.Parent = typeContainer
+
+local classicBtn = Instance.new("TextButton")
+classicBtn.Size = UDim2.new(0.25, -1, 0, 16)
+classicBtn.Position = UDim2.new(0.5, 1, 0, 0)
+classicBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
+classicBtn.TextColor3 = Color3.fromRGB(220, 220, 230)
+classicBtn.Font = Enum.Font.SourceSans
+classicBtn.TextSize = 9
+classicBtn.Text = "Classic"
+classicBtn.BorderSizePixel = 0
+classicBtn.Parent = typeContainer
+
+local ropeBtn = Instance.new("TextButton")
+ropeBtn.Size = UDim2.new(0.25, -1, 0, 16)
+ropeBtn.Position = UDim2.new(0.75, 1, 0, 0)
+ropeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+ropeBtn.TextColor3 = Color3.fromRGB(220, 220, 230)
+ropeBtn.Font = Enum.Font.SourceSans
+ropeBtn.TextSize = 9
+ropeBtn.Text = "Rope"
+ropeBtn.BorderSizePixel = 0
+ropeBtn.Parent = typeContainer
+
+local typeExplain = Instance.new("TextLabel")
+typeExplain.Size = UDim2.new(1, -2, 0, 14)
+typeExplain.Position = UDim2.new(0, 1, 0, 18)
+typeExplain.BackgroundTransparency = 1
+typeExplain.Text = "Classic=funnel+vortices. Rope=wiggling lines."
+typeExplain.TextColor3 = Color3.fromRGB(110, 110, 125)
+typeExplain.Font = Enum.Font.SourceSans
+typeExplain.TextSize = 8
+typeExplain.TextXAlignment = Enum.TextXAlignment.Left
+typeExplain.TextWrapped = true
+typeExplain.Parent = typeContainer
+
+classicBtn.MouseButton1Click:Connect(function()
+    tornadoType = "Classic"; classicBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100); ropeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+end)
+ropeBtn.MouseButton1Click:Connect(function()
+    tornadoType = "Rope"; ropeBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100); classicBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+end)
+
+-- ========== BIND EVENTS ==========
+inputRefs.tornadoAmount.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.tornadoAmount.Text)
+    if v then tornadoAmount = math.max(1, math.floor(v)); inputRefs.tornadoAmount.Text = tostring(tornadoAmount)
+    else inputRefs.tornadoAmount.Text = tostring(tornadoAmount) end
+end)
+inputRefs.spinSpeed.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.spinSpeed.Text); if v then tornadoSpinSpeed = v else inputRefs.spinSpeed.Text = tostring(tornadoSpinSpeed) end
+end)
+inputRefs.upwardSpeed.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.upwardSpeed.Text); if v then tornadoUpwardSpeed = v else inputRefs.upwardSpeed.Text = tostring(tornadoUpwardSpeed) end
+end)
+inputRefs.windfield.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.windfield.Text); if v then tornadoWindfield = v else inputRefs.windfield.Text = tostring(tornadoWindfield) end
+end)
+inputRefs.moveSpeed.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.moveSpeed.Text); if v then tornadoMoveSpeed = v else inputRefs.moveSpeed.Text = tostring(tornadoMoveSpeed) end
+end)
+inputRefs.maxSubVortices.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.maxSubVortices.Text)
+    if v then maxSubVortices = math.max(0, math.floor(v)); inputRefs.maxSubVortices.Text = tostring(maxSubVortices) end
+end)
+inputRefs.funnelReserve.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.funnelReserve.Text)
+    if v then funnelReserveCount = math.max(0, math.floor(v)); inputRefs.funnelReserve.Text = tostring(funnelReserveCount) end
+end)
+inputRefs.mainFunnelWidth.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.mainFunnelWidth.Text)
+    if v then mainFunnelWidth = math.max(1, v); inputRefs.mainFunnelWidth.Text = tostring(mainFunnelWidth) end
+end)
+inputRefs.funnelHeight.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.funnelHeight.Text); if v then funnelHeight = math.max(0, v); inputRefs.funnelHeight.Text = tostring(funnelHeight) end
+end)
+inputRefs.subVortexSpin.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.subVortexSpin.Text); if v then subVortexSpinSpeed = math.max(0, v); inputRefs.subVortexSpin.Text = tostring(subVortexSpinSpeed) end
+end)
+inputRefs.subVortexHeight.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.subVortexHeight.Text); if v then subVortexHeight = math.max(0, v); inputRefs.subVortexHeight.Text = tostring(subVortexHeight) end
+end)
+inputRefs.subVortexWidth.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.subVortexWidth.Text); if v then subVortexWidth = v; inputRefs.subVortexWidth.Text = tostring(subVortexWidth) end
+end)
+inputRefs.mainFunnelShare.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.mainFunnelShare.Text)
+    if v then mainFunnelShare = math.clamp(v / 100, 0, 0.98); inputRefs.mainFunnelShare.Text = tostring(mainFunnelShare * 100) end
+end)
+inputRefs.randomPathSpeed.FocusLost:Connect(function()
+    local v = tonumber(inputRefs.randomPathSpeed.Text); if v then tornadoRandomPathSpeed = math.max(1, v); inputRefs.randomPathSpeed.Text = tostring(tornadoRandomPathSpeed) end
+end)
+
+-- ========== HELPER FUNCTIONS ==========
+local function isPlayerPart(part)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr.Character and part:IsDescendantOf(plr.Character) then return true end
+    end
+    return false
+end
+
+local function processPartForFunnel(obj)
+    if obj:IsA("BasePart") and not obj.Anchored and not isPlayerPart(obj) and obj.Name ~= baseplateName then
+        if not whitelistedParts[obj] and not assignedToSatellite[obj] and not noodlePartSet[obj] and not mainFunnelSet[obj] and not ropeParts[obj] then
+            pickedUpByFunnel[obj] = true; whitelistedParts[obj] = true
+        end
+    end
+end
+
+local function snapPartDown(part, targetY)
+    if not part or not part.Parent then return end
+    if debrisAttachedToPlayer[part] then return end
+    local vel = part.AssemblyLinearVelocity
+    part.AssemblyLinearVelocity = Vector3.new(vel.X, -math.abs(vel.Y) - math.abs(tornadoUpwardSpeed * 1.5), vel.Z)
+end
+
+local function reserveMainFunnelParts()
+    mainFunnelParts = {}; mainFunnelSet = {}
+    local candidates = {}
+    for p in pairs(whitelistedParts) do
+        if p and p.Parent and not p.Anchored and not assignedToSatellite[p] and not noodlePartSet[p] and not ropeParts[p] then
+            local d = 0
+            local center = tornadoPositions[1] or (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character.HumanoidRootPart.Position) or Vector3.new(0,10,0)
+            if p.Position then d = (p.Position - center).Magnitude end
+            table.insert(candidates, {part = p, dist = d})
+        end
+    end
+    if #candidates == 0 then return end
+    table.sort(candidates, function(a,b) return a.dist < b.dist end)
+    local available = #candidates
+    local desiredByShare = math.floor(available * mainFunnelShare + 0.5)
+    local take = math.min(available, math.max(funnelReserveCount, desiredByShare))
+    for i = 1, take do
+        local p = candidates[i].part
+        if p then
+            mainFunnelParts[#mainFunnelParts + 1] = p; mainFunnelSet[p] = true
+            whitelistedParts[p] = nil; pickedUpByFunnel[p] = nil; assignedToSatellite[p] = nil
+        end
+    end
+end
+
+-- ========== STABLE FORCE + MAIN FUNNEL WIDTH + VERTICAL BOB ==========
+local function applyFunnelForceToPart(part, centerPos, delta, isMain)
+    if not part or not part.Parent then return end
+    local offset = part.Position - centerPos
+    local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
+    local distance = math.max(0.1, horizontalOffset.Magnitude)
+    local dirToCenter = horizontalOffset.Unit
+    local spinDir = Vector3.new(-dirToCenter.Z, 0, dirToCenter.X)
+
+    -- MAIN FUNNEL WIDTH: clamp the orbit radius for main funnel parts
+    local maxRadius = isMain and mainFunnelWidth or tornadoWindfield
+    local clampedDist = math.min(distance, maxRadius)
+
+    -- Inward pull scales with distance: stronger when too far to keep orbit stable
+    local inwardStrength = tornadoSpinSpeed * 0.4 * (1 + (clampedDist / math.max(1, maxRadius)))
+    local inwardPull = -dirToCenter * inwardStrength
+
+    -- If beyond max width, add extra inward force to pull back
+    local extraInward = 0
+    if distance > maxRadius * 0.9 then
+        extraInward = (distance - maxRadius * 0.9) * 2
+    end
+
+    local upward = Vector3.new(0, tornadoUpwardSpeed, 0)
+    local rotational = spinDir * (tornadoSpinSpeed * (1 + (clampedDist / math.max(1, maxRadius)) * 0.1))
+
+    -- VERTICAL BOB: make parts go up and down repeatedly to keep structure
+    local time = tick()
+    local bobFreq = 1.5 + (clampedDist / math.max(1, maxRadius)) * 0.5
+    local bobAmp = 8 + math.sin(time * 0.3 + distance * 0.01) * 3
+    -- Each part gets a unique phase based on its angle
+    local anglePhase = math.atan2(offset.Z, offset.X) or 0
+    local bobOffset = math.sin(time * bobFreq + anglePhase) * bobAmp
+    upward = upward + Vector3.new(0, bobOffset * delta * 3, 0)
+
+    local targetVel = rotational + inwardPull + upward - dirToCenter * extraInward
+    local currentVel = part.AssemblyLinearVelocity
+
+    -- SMOOTHER BLEND for stable high-speed travel
+    local smoothFactor = math.min(1, delta * 6)
+    local finalVel = currentVel:Lerp(targetVel, smoothFactor)
+
+    if not part.Anchored then
+        part.AssemblyLinearVelocity = finalVel
+        part.CanCollide = false
+    end
+    return finalVel
+end
+
+local function updateMainFunnel(delta)
+    if #tornadoPositions == 0 then return end
+    local centerPos = tornadoPositions[1]
+    for i, p in ipairs(mainFunnelParts) do
+        if not p or not p.Parent then mainFunnelParts[i] = nil
+        else
+            local finalVel = applyFunnelForceToPart(p, centerPos, delta, true)
+            if p.Position.Y >= (centerPos.Y + funnelHeight) then snapPartDown(p, centerPos.Y) end
+        end
+    end
+    local newMain = {}
+    for _, v in ipairs(mainFunnelParts) do if v then table.insert(newMain, v) end end
+    mainFunnelParts = newMain
+end
+
+local function applyTornadoPhysics(position, delta)
+    local parts = Workspace:GetPartBoundsInRadius(position, tornadoWindfield)
+    for _, obj in ipairs(parts) do
+        if obj:IsA("BasePart") and not obj.Anchored and not isPlayerPart(obj) and obj.Name ~= baseplateName then
+            processPartForFunnel(obj)
+            if whitelistedParts[obj] and not assignedToSatellite[obj] and not noodlePartSet[obj] and not mainFunnelSet[obj] and not ropeParts[obj] then
+                applyFunnelForceToPart(obj, position, delta, false)
+                if obj.Position.Y >= (position.Y + funnelHeight) and not debrisAttachedToPlayer[obj] then snapPartDown(obj, position.Y) end
+            end
+        end
+    end
+end
+
+-- ========== ROPE TORNADO ==========
+local function spawnRopeTornado()
+    for part in pairs(ropeParts) do if part and part.Parent then part.AssemblyLinearVelocity = Vector3.zero; part.CanCollide = true; ropeParts[part] = nil end end
+    ropeSegments = {}
+    if #tornadoPositions == 0 then return end
+    local available = {}
+    for p in pairs(whitelistedParts) do if p and p.Parent and not p.Anchored then table.insert(available, p) end end
+    if #available == 0 then return end
+    for ti, centerPos in ipairs(tornadoPositions) do
+        local numRopes = math.max(2, math.min(8, math.floor(#available / 3)))
+        local partsPerRope = math.max(2, math.floor(#available / math.max(1, numRopes)))
+        for r = 1, numRopes do
+            local rope = {}
+            for s = 1, partsPerRope do
+                if #available == 0 then break end
+                local idx = math.random(1, #available)
+                local p = table.remove(available, idx)
+                if p and p.Parent then
+                    ropeParts[p] = true; whitelistedParts[p] = nil; pickedUpByFunnel[p] = nil; assignedToSatellite[p] = nil; mainFunnelSet[p] = nil
+                    local angle = (s / partsPerRope) * math.pi * 2 + (r / numRopes) * math.pi * 2
+                    local dist = math.random(10, math.max(20, subVortexWidth))
+                    table.insert(rope, {part=p, baseOffset=Vector3.new(math.cos(angle)*dist, s*math.random(3,8), math.sin(angle)*dist), wigglePhase=math.random()*math.pi*2, wiggleFreq=1.5+math.random()*3, wiggleAmp=math.random(5,15), wiggleDir=Vector3.new(math.random()-0.5, math.random()-0.5, math.random()-0.5).Unit, secondaryPhase=math.random()*math.pi*2, secondaryFreq=0.8+math.random()*2, secondaryAmp=math.random(3,8), secondaryDir=Vector3.new(math.random()-0.5, math.random()-0.5, math.random()-0.5).Unit})
+                end
+            end
+            for _, seg in ipairs(rope) do table.insert(ropeSegments, seg) end
+        end
+    end
+end
+
+local function updateRopeTornado(delta)
+    if #tornadoPositions == 0 then return end
+    local time = tick()
+    for _, seg in ipairs(ropeSegments) do
+        local p = seg.part; if not p or not p.Parent then continue end
+        local centerPos = tornadoPositions[1]; local bestDist = math.huge
+        for _, tp in ipairs(tornadoPositions) do local d = (p.Position - tp).Magnitude; if d < bestDist then bestDist = d; centerPos = tp end end
+        local wiggle1 = seg.wiggleDir * math.sin(time * seg.wiggleFreq + seg.wigglePhase) * seg.wiggleAmp
+        local wiggle2 = seg.secondaryDir * math.sin(time * seg.secondaryFreq + seg.secondaryPhase) * seg.secondaryAmp
+        local basePos = centerPos + seg.baseOffset; local targetPos = basePos + wiggle1 + wiggle2
+        local toCenter = (basePos - centerPos); local horiz = Vector3.new(toCenter.X, 0, toCenter.Z)
+        if horiz.Magnitude > 0.1 then local perp = Vector3.new(-horiz.Z, 0, horiz.X).Unit; local rotOffset = perp * math.sin(time * (1.5 + seg.wiggleFreq * 0.3)) * seg.wiggleAmp * 0.5; targetPos = targetPos + rotOffset end
+        local vel = (targetPos - p.Position) / math.max(delta, 0.016); local maxVel = 250 + seg.wiggleAmp * 5
+        if vel.Magnitude > maxVel then vel = vel.Unit * maxVel end
+        local smoothFactor = math.min(1, delta * 6)
+        p.AssemblyLinearVelocity = p.AssemblyLinearVelocity:Lerp(vel, smoothFactor); p.CanCollide = false
+        if p.Position.Y >= (centerPos.Y + funnelHeight) then snapPartDown(p, centerPos.Y) end
+    end
+end
+
+-- ========== PATH TYPE MOVEMENT ==========
+local function pickNewRandomTarget()
+    if not localPlayer.Character or not localPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
+    local playerPos = localPlayer.Character.HumanoidRootPart.Position
+    local angle = math.random() * math.pi * 2; local dist = math.random(50, 1500)
+    randomPathTarget = playerPos + Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+    randomPathSwitchTimer = tick() + math.random(5, 20)
+end
+
+local function pickNewStalkTarget()
+    local nonLocal = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= localPlayer and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then table.insert(nonLocal, plr) end
+    end
+    stalkTarget = #nonLocal > 0 and nonLocal[math.random(1, #nonLocal)] or nil
+end
+
+local function updateTornadoPositions()
+    tornadoPositions = {}
+    local root = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    local basePos = root.Position; local count = math.max(1, tornadoAmount)
+    if count == 1 then
+        if pathType == "Follow" then tornadoPositions[1] = basePos
+        elseif pathType == "Random" then
+            if not randomPathTarget or tick() > randomPathSwitchTimer then pickNewRandomTarget() end
+            if randomPathTarget then
+                local current = tornadoPositions[1] or basePos; local dir = randomPathTarget - current
+                if dir.Magnitude > tornadoRandomPathSpeed * 0.1 then tornadoPositions[1] = current + dir.Unit * math.min(dir.Magnitude, tornadoRandomPathSpeed * 0.1)
+                else pickNewRandomTarget(); tornadoPositions[1] = current end
+                if (tornadoPositions[1] - basePos).Magnitude > 1500 then tornadoPositions[1] = tornadoPositions[1] + (basePos - tornadoPositions[1]).Unit * ((tornadoPositions[1] - basePos).Magnitude - 1480) end
+            else tornadoPositions[1] = basePos end
+        elseif pathType == "Stalker" then
+            if not stalkTarget or not stalkTarget.Character or not stalkTarget.Character:FindFirstChild("HumanoidRootPart") then pickNewStalkTarget() end
+            if math.random() < 0.01 then pickNewStalkTarget() end
+            if stalkTarget and stalkTarget.Character and stalkTarget.Character:FindFirstChild("HumanoidRootPart") then
+                local targetPos = stalkTarget.Character.HumanoidRootPart.Position; local current = tornadoPositions[1] or basePos; local dir = targetPos - current
+                if dir.Magnitude > tornadoMoveSpeed * 0.1 then tornadoPositions[1] = current + dir.Unit * math.min(dir.Magnitude, tornadoMoveSpeed * 0.1)
+                else tornadoPositions[1] = targetPos end
+                tornadoPositions[1] = tornadoPositions[1] + Vector3.new(0, 5, 0)
+            else tornadoPositions[1] = basePos end
+        end
+    else
+        local center = basePos
+        if pathType == "Stalker" and stalkTarget and stalkTarget.Character and stalkTarget.Character:FindFirstChild("HumanoidRootPart") then center = stalkTarget.Character.HumanoidRootPart.Position
+        elseif pathType == "Random" and randomPathTarget then center = randomPathTarget end
+        local time = tick() * 0.15
+        for i = 1, count do
+            local angle = (i - 1) * (2 * math.pi / count) + time; local spread = math.clamp(tornadoWindfield * 0.12 * math.sqrt(count), 10, tornadoWindfield * 0.35)
+            tornadoPositions[i] = center + Vector3.new(math.cos(angle) * spread, 0, math.sin(angle) * spread)
+        end
+        if pathType == "Random" then
+            if not randomPathTarget or tick() > randomPathSwitchTimer then pickNewRandomTarget() end
+            if randomPathTarget then local dir = randomPathTarget - (tornadoPositions[1] or center)
+                if dir.Magnitude > 1 then for i = 1, count do local offset = tornadoPositions[i] - (tornadoPositions[1] or center); tornadoPositions[i] = tornadoPositions[i] + dir.Unit * math.min(dir.Magnitude, tornadoRandomPathSpeed * 0.1) end end end
+        end
+    end
+end
+
+local function checkStalkerFling()
+    if pathType ~= "Stalker" or not nightmareMode then return end
+    if not stalkTarget or not stalkTarget.Character or not stalkTarget.Character:FindFirstChild("HumanoidRootPart") then return end
+    if #tornadoPositions == 0 then return end
+    local hrp = stalkTarget.Character.HumanoidRootPart; local stalkerPos = hrp.Position
+    for _, pos in ipairs(tornadoPositions) do
+        if (stalkerPos - pos).Magnitude <= tornadoWindfield * 0.3 then
+            local offset = stalkerPos - pos; local horizontalOffset = Vector3.new(offset.X, 0, offset.Z); local distance = math.max(0.1, horizontalOffset.Magnitude)
+            local dirToCenter = horizontalOffset.Unit; local spinDir = Vector3.new(-dirToCenter.Z, 0, dirToCenter.X)
+            hrp.AssemblyLinearVelocity = spinDir * (tornadoSpinSpeed * 2.5) + dirToCenter * (tornadoSpinSpeed * 1.5) + Vector3.new(0, tornadoUpwardSpeed * 3, 0)
+            break
+        end
+    end
+end
+
+local function tornadoLoop()
+    while enabled do
+        updateTornadoPositions()
+        if #tornadoPositions > 0 then
+            if tornadoType == "Rope" then updateRopeTornado(0.1)
+            else updateMainFunnel(0.1); for _, pos in ipairs(tornadoPositions) do applyTornadoPhysics(pos, 0.1) end end
+            checkStalkerFling()
+        end
+        task.wait(0.1)
+    end
+end
+
+-- ========== SATELLITE SYSTEM ==========
+local function createSatelliteMarker(sat)
+    if sat.marker and sat.marker.Parent then return end
+    local m = Instance.new("Part"); m.Name = "SatelliteMarker"; m.Size = Vector3.new(1,1,1); m.Anchored = true; m.CanCollide = false; m.Material = Enum.Material.Neon; m.Transparency = 0; m.Parent = Workspace; sat.marker = m
+end
+local function removeSatelliteMarker(sat)
+    if sat and sat.marker and sat.marker.Parent then pcall(function() sat.marker:Destroy() end); sat.marker = nil end
+end
+
+local function spawnSatelliteWithParts(pos, partsList, idOverride)
+    local id = idOverride or nextSatelliteId; if not idOverride then nextSatelliteId = nextSatelliteId + 1 end
+    local partsMap = {}
+    for _, p in ipairs(partsList) do
+        if p and p.Parent then
+            local radius = subVortexWidth * (0.3 + math.random() * 0.7); local speed = subVortexSpinSpeed * (1 + (math.random()*0.6 - 0.3))
+            partsMap[p] = {radius=radius, speed=speed, phase=math.random()*math.pi*2, floorOffset=2+math.random()*2, topOffset=subVortexHeight+math.random()*4, verticalTarget=nil, currentY=nil}
+            assignedToSatellite[p] = id
+        end
+    end
+    satelliteVortices[id] = {id=id, pos=pos, angleOffset=0, parts=partsMap, target=nil, verticalChains={}, lastVortexSpawnTick=tick(), marker=nil}
+    satelliteAttackState[id] = {attackingPlayers={}, attackThreads={}}
+    local partCount = 0; for _,_ in pairs(partsMap) do partCount = partCount + 1 end
+    if partCount == 0 then createSatelliteMarker(satelliteVortices[id]) end
+    return id
+end
+
+local function despawnSatellite(id)
+    local sat = satelliteVortices[id]; if not sat then return end
+    for part, _ in pairs(sat.parts) do if part and part.Parent then assignedToSatellite[part] = nil; whitelistedParts[part] = true; pickedUpByFunnel[part] = true; part.CanCollide = true end end
+    removeSatelliteMarker(sat); satelliteVortices[id] = nil; satelliteAttackState[id] = nil; noodlePools[id] = nil
+end
+
+local function formSatellitesInstant()
+    if tornadoType == "Rope" then for id, _ in pairs(satelliteVortices) do despawnSatellite(id) end; spawnRopeTornado(); return end
+    for id, _ in pairs(satelliteVortices) do despawnSatellite(id) end
+    local count = math.max(0, maxSubVortices); if count == 0 then return end
+    local spawnCenter = tornadoPositions[1] or (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and localPlayer.Character.HumanoidRootPart.Position) or Vector3.new(0,10,0)
+    local allParts = Workspace:GetPartBoundsInRadius(spawnCenter, tornadoWindfield)
+    local candidateParts = {}
+    for _, p in ipairs(allParts) do if p and p:IsA("BasePart") and not p.Anchored and not isPlayerPart(p) and p.Name ~= baseplateName and not assignedToSatellite[p] and not noodlePartSet[p] and not mainFunnelSet[p] and not ropeParts[p] then table.insert(candidateParts, p) end end
+    local total = #candidateParts; table.sort(candidateParts, function(a,b) return (a.Position - spawnCenter).Magnitude < (b.Position - spawnCenter).Magnitude end)
+    local desiredByShare = math.floor(total * mainFunnelShare + 0.5); local mainReserve = math.clamp(desiredByShare, 0, total)
+    local remainingCount = total - mainReserve
+    while remainingCount < count and mainReserve > math.min(funnelReserveCount, total) do mainReserve = mainReserve - 1; remainingCount = total - mainReserve end
+    mainReserve = math.clamp(mainReserve, 0, total)
+    mainFunnelParts = {}; mainFunnelSet = {}
+    for i = 1, mainReserve do local p = candidateParts[i]; if p then mainFunnelParts[#mainFunnelParts+1] = p; mainFunnelSet[p] = true; assignedToSatellite[p] = nil; whitelistedParts[p] = nil; pickedUpByFunnel[p] = nil end end
+    local remainingParts = {}; for i = mainReserve + 1, #candidateParts do remainingParts[#remainingParts+1] = candidateParts[i] end
+    local partitions = {}; for i = 1, count do partitions[i] = {} end
+    if #remainingParts > 0 then local idx = 1; for _, p in ipairs(remainingParts) do local slot = ((idx - 1) % count) + 1; table.insert(partitions[slot], p); assignedToSatellite[p] = true; whitelistedParts[p] = nil; pickedUpByFunnel[p] = nil; idx = idx + 1 end end
+    local orbitRad = subVortexWidth * 0.5
+    for i = 1, count do local angle = (2 * math.pi * (i - 1) / count); local pos = spawnCenter + Vector3.new(math.cos(angle) * orbitRad, 10 + math.random()*6, math.sin(angle) * orbitRad); spawnSatelliteWithParts(pos, partitions[i] or {}); local newId = nextSatelliteId - 1; if satelliteVortices[newId] then satelliteVortices[newId].angleOffset = angle end end
+end
+
+local function updateSatellites(delta)
+    if tornadoType == "Rope" or #tornadoPositions == 0 then return end
+    local centerPos = tornadoPositions[1]
+    for id, sat in pairs(satelliteVortices) do
+        sat.angleOffset = sat.angleOffset + (0.5 * delta)
+        local orbitRad = math.clamp(subVortexWidth * 0.3, 6, subVortexWidth)
+        local newPos = centerPos + Vector3.new(math.cos(sat.angleOffset) * orbitRad, 10, math.sin(sat.angleOffset) * orbitRad)
+        local dir = (newPos - sat.pos); sat.pos = sat.pos + dir * math.min(1, delta * 2)
+        if sat.marker then pcall(function() sat.marker.CFrame = CFrame.new(sat.pos + Vector3.new(0,2,0)) end) end
+        for part, meta in pairs(sat.parts) do
+            if part and part.Parent then
+                local angle = (tick() * meta.speed) + meta.phase; local radiusPulse = meta.radius * (1 + 0.06 * math.sin(tick() * 0.5 + meta.phase))
+                local horizTarget = sat.pos + Vector3.new(math.cos(angle) * radiusPulse, 0, math.sin(angle) * radiusPulse)
+                local floorY = centerPos.Y + (meta.floorOffset or 2); local topY = centerPos.Y + (meta.topOffset or subVortexHeight)
+                if not meta.currentY then meta.currentY = math.clamp(part.Position.Y, floorY, topY) end
+                if not meta.verticalTarget then meta.verticalTarget = (floorY + topY) / 2 end
+                if math.abs(meta.currentY - meta.verticalTarget) < 0.5 then meta.verticalTarget = floorY + math.random() * (math.max(1, topY - floorY)) end
+                local interpSpeed = math.max(0.15, (meta.speed or 1) * 0.25); meta.currentY = meta.currentY + (meta.verticalTarget - meta.currentY) * math.clamp(delta * interpSpeed, 0, 1)
+                local targetPos = Vector3.new(horizTarget.X, meta.currentY, horizTarget.Z)
+                if not part.Anchored then
+                    local desiredVel = (targetPos - part.Position) / math.max(delta, 0.016)
+                    local maxVel = math.max(orbitVelocityMinCap, math.abs(radiusPulse * meta.speed * orbitVelocityMultiplier))
+                    if desiredVel.Magnitude > maxVel then desiredVel = desiredVel.Unit * maxVel end
+                    local smoothFactor = math.min(1, delta * 8)
+                    part.AssemblyLinearVelocity = part.AssemblyLinearVelocity:Lerp(Vector3.new(desiredVel.X, math.clamp(desiredVel.Y, -140, 140), desiredVel.Z), smoothFactor)
+                    part.CanCollide = false
+                end
+                if part.Position.Y >= (centerPos.Y + funnelHeight) and not debrisAttachedToPlayer[part] then snapPartDown(part, centerPos.Y) end
+            else sat.parts[part] = nil end
+        end
+    end
+end
+
+-- ========== FREEZE/UNFREEZE ==========
+local function toggleFreeze()
+    partsFrozen = not partsFrozen
+    freezeBtn.Text = partsFrozen and "Unfreeze" or "Freeze"
+    freezeBtn.BackgroundColor3 = partsFrozen and Color3.fromRGB(100, 80, 40) or Color3.fromRGB(60, 60, 70)
+
+    if partsFrozen then
+        -- Anchor all affected parts
+        frozenParts = {}
+        for part in pairs(whitelistedParts) do if part and part.Parent then frozenParts[part] = part.Anchored; part.Anchored = true end end
+        for part in pairs(mainFunnelParts) do if part and part.Parent then frozenParts[part] = part.Anchored; part.Anchored = true end end
+        for part in pairs(ropeParts) do if part and part.Parent then frozenParts[part] = part.Anchored; part.Anchored = true end end
+        for _, sat in pairs(satelliteVortices) do for part, _ in pairs(sat.parts) do if part and part.Parent then frozenParts[part] = part.Anchored; part.Anchored = true end end end
+    else
+        -- Unanchor all
+        for part, wasAnchored in pairs(frozenParts) do
+            if part and part.Parent then
+                part.Anchored = wasAnchored
+            end
+        end
+        frozenParts = {}
+    end
+end
+
+freezeBtn.MouseButton1Click:Connect(toggleFreeze)
+
+-- ========== WORKSPACE SCANNING ==========
+Workspace.DescendantAdded:Connect(function(desc)
+    if desc and desc:IsA("BasePart") then
+        task.defer(function() if enabled then for _, pos in ipairs(tornadoPositions) do if (desc.Position - pos).Magnitude <= tornadoWindfield then if not desc.Anchored then processPartForFunnel(desc) end; break end end end end)
+    end
+end)
+
+spawn(function()
+    while true do
+        if enabled and #tornadoPositions > 0 then
+            for _, pos in ipairs(tornadoPositions) do
+                local parts = Workspace:GetPartBoundsInRadius(pos, tornadoWindfield)
+                for _, p in ipairs(parts) do if p and p:IsA("BasePart") and not p.Anchored then processPartForFunnel(p) end end
+            end
+            if tornadoType ~= "Rope" then reserveMainFunnelParts() end
+        end; task.wait(1) end
+end)
+
+RunService.Heartbeat:Connect(function(delta)
+    if enabled then
+        updateTornadoPositions()
+        if tornadoType == "Classic" then updateSatellites(delta); updateMainFunnel(delta)
+        elseif tornadoType == "Rope" then updateRopeTornado(delta) end
+    end
+end)
+
+local function onCharacterAdded(character)
+    task.wait(0.1)
+    if character:FindFirstChild("HumanoidRootPart") then updateTornadoPositions() end
+    if enabled then
+        if tornadoType == "Rope" then spawnRopeTornado() else formSatellitesInstant() end
+    end
+end
+if localPlayer.Character then onCharacterAdded(localPlayer.Character) end
+localPlayer.CharacterAdded:Connect(onCharacterAdded)
+
+toggleBtn.MouseButton1Click:Connect(function()
+    guiVisible = not guiVisible; mainFrame.Visible = guiVisible
+end)
+
+startStopBtn.MouseButton1Click:Connect(function()
+    enabled = not enabled
+    startStopBtn.Text = enabled and "Stop" or "Start"
+    startStopBtn.BackgroundColor3 = enabled and Color3.fromRGB(180, 40, 40) or Color3.fromRGB(50, 120, 50)
+    statusDot.BackgroundColor3 = enabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(180, 40, 40)
+    if enabled then
+        pickedUpByFunnel = {}; whitelistedParts = {}; assignedToSatellite = {}
+        satelliteVortices = {}; satelliteAttackState = {}; nextSatelliteId = 1
+        debrisAttachedToPlayer = {}; noodlePools = {}; noodlePartSet = {}
+        mainFunnelParts = {}; mainFunnelSet = {}; ropeParts = {}; ropeSegments = {}
+        randomPathTarget = nil; stalkTarget = nil
+        updateTornadoPositions()
+        if #tornadoPositions > 0 then
+            for _, pos in ipairs(tornadoPositions) do
+                local parts = Workspace:GetPartBoundsInRadius(pos, tornadoWindfield)
+                for _, p in ipairs(parts) do if p and p:IsA("BasePart") and not p.Anchored then processPartForFunnel(p) end end
+            end
+            if tornadoType == "Rope" then spawnRopeTornado() else reserveMainFunnelParts(); formSatellitesInstant() end
+        end
+        spawn(tornadoLoop)
+    else
+        -- If frozen, unfreeze first
+        if partsFrozen then toggleFreeze() end
+        for part in pairs(whitelistedParts) do if part and part:IsA("BasePart") and part.Parent then pcall(function() part.AssemblyLinearVelocity = Vector3.zero end); part.CanCollide = true end end
+        for id, _ in pairs(satelliteVortices) do despawnSatellite(id) end
+        for part in pairs(ropeParts) do if part and part.Parent then part.AssemblyLinearVelocity = Vector3.zero; part.CanCollide = true end end
+        ropeParts = {}; ropeSegments = {}; debrisAttachedToPlayer = {}; whitelistedParts = {}; pickedUpByFunnel = {}
+        assignedToSatellite = {}; satelliteVortices = {}; satelliteAttackState = {}
+        noodlePools = {}; noodlePartSet = {}; mainFunnelParts = {}; mainFunnelSet = {}
+        tornadoPositions = {}; randomPathTarget = nil; stalkTarget = nil
+    end
+end)
+
+print("Tornado GUI v8.3 — 280px height, stable orbit, funnel width, vertical bob, freeze/unfreeze")
