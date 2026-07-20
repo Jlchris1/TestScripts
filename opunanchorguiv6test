@@ -2086,6 +2086,7 @@ window:Toggle("Skidding (0.1s forward/back)", SkiddingEnabled, function(Value)
     end
 end)
 
+-- Background maintenance loops
 spawn(function()
     while true do
         if PAAEnabled then
@@ -2101,9 +2102,14 @@ end)
 
 spawn(function()
     while true do
-        if #extraBlackHoles > 0 and not rebalancerRunning then startRebalancer()
-        elseif #extraBlackHoles == 0 and rebalancerRunning then stopRebalancer() end
-        if cycleRestartPending then scheduleCycleRestart() end
+        if #extraBlackHoles > 0 and not rebalancerRunning then 
+            startRebalancer()
+        elseif #extraBlackHoles == 0 and rebalancerRunning then 
+            stopRebalancer() 
+        end
+        if cycleRestartPending then 
+            scheduleCycleRestart() 
+        end
         wait(0.5)
     end
 end)
