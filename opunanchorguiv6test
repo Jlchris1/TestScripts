@@ -1,15 +1,12 @@
--- Full updated script (client) - Custom 2-tab GUI with persistent settings
+-- Full optimized script (client) - Lag optimized, crash resistant
 -- Tab 1: Toggles (main BH controls)
 -- Tab 2: Buttons (Gather Parts, Reset Cycle, Load Scripts, Tween/Weld/Spin)
 -- Notes:
--- * Fallen parts destroy disabled via Workspace.FallenPartsDestroyHeight = 0/0
--- * Skidding stays off when toggled off and is accurate / ping-aware
--- * Cycle behavior preserved
--- * PAA only for BH creation; chat commands removed
--- * Gather Parts - teleports to groups of unanchored parts closer to other players, force collects them
--- * Anti-tamper system - nullifies non-BH property adjustments
--- * Tween + Weld + Spin when BH attachments are active
--- * Custom 2-tab GUI with persistent settings & reopen button
+-- * Optimized to prevent lag spikes and crashes
+-- * Respawn-safe with delay+reconnect logic
+-- * Throttled workspace scanning
+-- * Anti-tamper with performance budgets
+-- * Self-healing if connections break
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -18,19 +15,161 @@ local TweenService = game:GetService("TweenService")
 local Debris = game:GetService("Debris")
 local UserInputService = game:GetService("UserInputService")
 local CoreGui = game:GetService("CoreGui")
+local Stats = game:GetService("Stats")
 
 -- Disable automatic fallen part destruction (NaN)
 Workspace.FallenPartsDestroyHeight = 0/0
 
 local localPlayer = Players.LocalPlayer
-local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
-local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+local character = localPlayer.Character
+local humanoidRootPart = character and character:FindFirstChild("HumanoidRootPart")
 
 local function clamp(val, a, b)
     if val < a then return a end
     if val > b then return b end
     return val
 end
+
+-- ====== LAG MANAGEMENT ======
+local lagMonitorRunning = false
+local lagSpikeDetected = false
+local PERFORMANCE_MODE = false
+local lastFrameTime = tick()
+local frameTimes = {}
+
+-- Monitor framerate and auto-throttle on lag
+local function startLagMonitor()
+    if lagMonitorRunning then return end
+    lagMonitorRunning = true
+    spawn(function()
+        while true do
+            local now = tick()
+            local dt = now - lastFrameTime
+            lastFrameTime = now
+            table.insert(frameTimes, dt)
+            if #frameTimes > 30 then table.remove(frameTimes, 1) end
+            
+            -- Calculate average FPS over last 30 frames
+            local avg = 0
+            for _, t in ipairs(frameTimes) do
+                avg = avg + t
+            end
+            avg = avg / #frameTimes
+            local fps = avg > 0 and 1 / avg or 60
+            
+            -- If FPS drops below 15, enable performance mode
+            if fps < 15 and not PERFORMANCE_MODE then
+                PERFORMANCE_MODE = true
+                lagSpikeDetected = true
+                -- Throttle everything
+                switchDelay = 0.3
+                rebalancerFreq = 0.5
+                -- Clear some processed parts to reduce load
+                local count = 0
+                for part, _ in pairs(processedParts) do
+                    if count > 50 then break end
+                    if part and part.Parent then
+                        local ap = part:FindFirstChildOfClass("AlignPosition")
+                        if ap then ap.Attachment1 = Attachment1 end
+                    end
+                    processedParts[part] = nil
+                    count = count + 1
+                end
+            elseif fps > 30 and PERFORMANCE_MODE then
+                PERFORMANCE_MODE = false
+                lagSpikeDetected = false
+                switchDelay = 0.13
+                rebalancerFreq = 0.10
+            end
+            
+            wait(1)
+        end
+    end)
+end
+startLagMonitor()
+
+-- Throttled workspace scanning - scan in chunks to avoid lag
+local function throttledDescendantScan(callback, chunkSize)
+    chunkSize = chunkSize or 50
+    local allDescendants = Workspace:GetDescendants()
+    local index = 1
+    local total = #allDescendants
+    
+    while index <= total do
+        local endIdx = math.min(index + chunkSize - 1, total)
+        for i = index, endIdx do
+            pcall(function() callback(allDescendants[i]) end)
+        end
+        index = endIdx + 1
+        -- Yield between chunks to let other processes run
+        if index <= total then
+            wait()
+        end
+        -- Stop if lag spike
+        if lagSpikeDetected then
+            wait(0.1)
+        end
+    end
+end
+
+-- ====== RESPAWN SAFETY ======
+local respawnGuard = false
+local respawnTimer = nil
+
+local function onCharacterAdded(newChar)
+    -- Wait a bit before re-initializing to let the character load
+    wait(1)
+    
+    character = newChar
+    humanoidRootPart = newChar:WaitForChild("HumanoidRootPart", 5)
+    
+    -- Re-setup attachment if needed
+    if not Attachment1 or not Attachment1.Parent then
+        Attachment1 = setupPlayer()
+    end
+    
+    -- If BH modes were active, restart them after respawn
+    if targetAllActive or targetSelectedActive then
+        processedParts = {}
+        wait(0.5)
+        startPrimaryLoop()
+    end
+    
+    if IndividualPartsEnabled then
+        processedParts = {}
+        wait(0.5)
+        startIndividualParts()
+    end
+    
+    respawnGuard = false
+end
+
+-- Handle respawn safely
+localPlayer.CharacterAdded:Connect(function(newChar)
+    -- Clear processed parts to prevent stale references
+    respawnGuard = true
+    processedParts = {}
+    individualPartsData = {}
+    gatheredPartsList = {}
+    
+    -- Stop heavy processes
+    if gatherPartsActive then
+        gatherPartsActive = false
+        if gatherPartsHeartbeat then
+            gatherPartsHeartbeat:Disconnect()
+            gatherPartsHeartbeat = nil
+        end
+    end
+    
+    -- Delayed re-init
+    if respawnTimer then
+        respawnTimer:Cancel()
+    end
+    spawn(function()
+        wait(1.5)
+        onCharacterAdded(newChar)
+    end)
+end)
 
 -- ====== CONFIG / STATE ======
 local targetAllActive = false
@@ -116,8 +255,6 @@ local gatherPartsOriginalPos = nil
 local gatherPartsOriginalCF = nil
 local gatherPartsHeartbeat = nil
 local gatheredPartsList = {}
-local gatherTimerThread = nil
-local GATHER_INTERVAL = 0.01
 
 -- ====== ANTI-TAMPER STATE ======
 local antiTamperActive = false
@@ -187,13 +324,6 @@ local function isScriptOwned(instance)
     for _, owned in ipairs(scriptOwnedInstances) do
         if owned == instance then return true end
     end
-    local current = instance
-    while current do
-        for _, owned in ipairs(scriptOwnedInstances) do
-            if owned == current then return true end
-        end
-        current = current.Parent
-    end
     return false
 end
 
@@ -201,18 +331,13 @@ local function markScriptOwned(instance)
     table.insert(scriptOwnedInstances, instance)
 end
 
+-- Optimized stripBodyForces - only runs when necessary
 local function stripBodyForces(part)
+    -- Only strip non-script-owned items on first processing
     for _, x in next, part:GetChildren() do
-        if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
-        or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
-        or x:IsA("RocketPropulsion") then
-            if not isScriptOwned(x) then
-                x:Destroy()
-            end
-        end
-    end
-    for _, x in next, part:GetChildren() do
-        if (x:IsA("Attachment") or x:IsA("AlignPosition") or x:IsA("Torque") or x:IsA("Weld") or x:IsA("WeldConstraint")) then
+        if x:IsA("Attachment") or x:IsA("AlignPosition") or x:IsA("Torque") or x:IsA("BodyAngularVelocity") 
+           or x:IsA("BodyForce") or x:IsA("BodyGyro") or x:IsA("BodyPosition") or x:IsA("BodyThrust")
+           or x:IsA("BodyVelocity") or x:IsA("RocketPropulsion") or x:IsA("Weld") or x:IsA("WeldConstraint") then
             if not isScriptOwned(x) then
                 x:Destroy()
             end
@@ -220,12 +345,13 @@ local function stripBodyForces(part)
     end
 end
 
--- Anti-tamper
+-- Anti-tamper - lightweight version
 local function setupAntiTamper(part)
     if not part or antiTamperConnections[part] then return end
     
     local conns = {}
     
+    -- Only monitor child additions (most important for preventing external attachments)
     local childConn = part.ChildAdded:Connect(function(child)
         if not antiTamperActive then return end
         if child:IsA("Attachment") or child:IsA("AlignPosition") or child:IsA("AlignOrientation") 
@@ -238,47 +364,6 @@ local function setupAntiTamper(part)
         end
     end)
     table.insert(conns, childConn)
-    
-    local propConn = part:GetPropertyChangedSignal("Velocity"):Connect(function()
-        if not antiTamperActive then return end
-        local currentVel = part.Velocity
-        if currentVel.Magnitude > 1000 then
-            local alignPos = part:FindFirstChildOfClass("AlignPosition")
-            if alignPos and isScriptOwned(alignPos) then else
-                pcall(function() part.Velocity = Vector3.new(0,0,0) end)
-            end
-        end
-    end)
-    table.insert(conns, propConn)
-    
-    local rotConn = part:GetPropertyChangedSignal("RotVelocity"):Connect(function()
-        if not antiTamperActive then return end
-        pcall(function() part.RotVelocity = Vector3.new(0,0,0) end)
-    end)
-    table.insert(conns, rotConn)
-    
-    local lastCF = part.CFrame
-    local cfConn = RunService.Heartbeat:Connect(function()
-        if not antiTamperActive then return end
-        local currentCF = part.CFrame
-        if lastCF then
-            local diff = (currentCF.Position - lastCF.Position).Magnitude
-            if diff > 500 then
-                local isGatherPart = false
-                for gp, _ in pairs(gatheredPartsList) do
-                    if gp == part then isGatherPart = true; break end
-                end
-                if not isGatherPart then
-                    local ap = part:FindFirstChildOfClass("AlignPosition")
-                    if not ap or not isScriptOwned(ap) then
-                        pcall(function() part.CFrame = lastCF end)
-                    end
-                end
-            end
-        end
-        lastCF = part.CFrame
-    end)
-    table.insert(conns, cfConn)
     
     antiTamperConnections[part] = conns
 end
@@ -293,7 +378,7 @@ end
 local function smoothLerpCFrame(curCF, targetCF, dt)
     local alpha = 1 - math.exp(-TARGET_SMOOTHNESS * dt)
     if alpha < 0.001 then alpha = 0.001 end
-    if alpha > 1 then alpha = 1 end
+    if alpha > 0.99 then alpha = 0.99 end
     return curCF:Lerp(targetCF, alpha)
 end
 
@@ -375,7 +460,7 @@ local function pushVelocitySample(pl, vel, now)
     playerVelBuffer[pl] = playerVelBuffer[pl] or {}
     local buf = playerVelBuffer[pl]
     table.insert(buf, 1, {t = now, v = vel})
-    while #buf > 6 do table.remove(buf) end
+    while #buf > 4 do table.remove(buf) end  -- Reduced from 6 to 4
 end
 
 local function estimateAccelFromBuffer(pl)
@@ -427,10 +512,9 @@ local function predictTargetPosition(pl, pos, vel, now)
     return predicted, leadTime, accel_est, ping
 end
 
--- ====== GATHER PARTS SYSTEM (FIXED - single use, teleports to groups) ======
+-- ====== GATHER PARTS SYSTEM (Lag Optimized) ======
 
 local function findPartGroups()
-    -- Find groups of unanchored parts that are closer to other players than to local
     local localChar = localPlayer.Character
     if not localChar or not localChar:FindFirstChild("HumanoidRootPart") then return {} end
     local localPos = localChar.HumanoidRootPart.Position
@@ -446,36 +530,34 @@ local function findPartGroups()
         end
     end
     
-    -- Find all candidate parts
+    if #otherPlayers == 0 then return {} end
+    
+    -- Use throttled scan
     local allCandidates = {}
-    for _, v in ipairs(Workspace:GetDescendants()) do
-        pcall(function()
-            if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
-                and not isPartPlayerCharacter(v)
-                and not (localChar and v:IsDescendantOf(localChar))
-                and v.Transparency < 1 then
-                
-                local partPos = v.Position
-                local distToLocal = (partPos - localPos).Magnitude
-                
-                -- Check if closer to any other player than to local
-                for _, op in ipairs(otherPlayers) do
-                    local distToOther = (partPos - op.position).Magnitude
-                    if distToOther < distToLocal and distToLocal > 15 then
-                        table.insert(allCandidates, {
-                            part = v,
-                            position = partPos,
-                            distance = distToLocal,
-                            closestPlayerDist = distToOther
-                        })
-                        break
-                    end
+    throttledDescendantScan(function(v)
+        if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
+            and not isPartPlayerCharacter(v)
+            and not (localChar and v:IsDescendantOf(localChar))
+            and v.Transparency < 1 then
+            
+            local partPos = v.Position
+            local distToLocal = (partPos - localPos).Magnitude
+            
+            for _, op in ipairs(otherPlayers) do
+                local distToOther = (partPos - op.position).Magnitude
+                if distToOther < distToLocal and distToLocal > 15 then
+                    table.insert(allCandidates, {
+                        part = v,
+                        position = partPos,
+                        distance = distToLocal
+                    })
+                    break
                 end
             end
-        end)
-    end
+        end
+    end, 100) -- Larger chunks since this is a one-time scan
     
-    -- Group by proximity (within 30 studs = same group)
+    -- Group by proximity
     local groups = {}
     local processed = {}
     
@@ -498,24 +580,25 @@ local function findPartGroups()
         end
     end
     
-    -- Sort groups by size (largest first)
     table.sort(groups, function(a, b) return #a > #b end)
+    
+    -- Limit to top 5 groups max to prevent overload
+    if #groups > 5 then
+        groups = {table.unpack(groups, 1, 5)}
+    end
     
     return groups
 end
 
 local function forceCollectGroup(group)
-    -- Teleport to the group center and force collect all parts
     if #group == 0 then return end
     
-    -- Calculate group center
     local center = Vector3.new(0, 0, 0)
     for _, item in ipairs(group) do
         center = center + item.position
     end
     center = center / #group
     
-    -- Teleport local player to group center
     local char = localPlayer.Character
     if char and char:FindFirstChild("HumanoidRootPart") then
         local hrp = char.HumanoidRootPart
@@ -524,21 +607,16 @@ local function forceCollectGroup(group)
         end)
     end
     
-    -- Force collect each part in the group
+    -- Collect parts in this group
     for _, item in ipairs(group) do
         local part = item.part
         if part and part.Parent then
-            -- Save original state
             if not gatheredPartsList[part] then
                 gatheredPartsList[part] = {
                     originalCF = part.CFrame,
-                    originalPos = part.Position,
-                    originalAnchored = part.Anchored,
-                    originalCanCollide = part.CanCollide
                 }
             end
             
-            -- Teleport part to local player
             local char = localPlayer.Character
             if char and char:FindFirstChild("HumanoidRootPart") then
                 local hrp = char.HumanoidRootPart
@@ -556,11 +634,12 @@ local function forceCollectGroup(group)
 end
 
 local function runGatherParts()
-    if gatherPartsActive then return end
+    if gatherPartsActive then 
+        return -- Don't restart if already running
+    end
     gatherPartsActive = true
     antiTamperActive = true
     
-    -- Save original position
     local char = localPlayer.Character
     if char and char:FindFirstChild("HumanoidRootPart") then
         gatherPartsOriginalPos = char.HumanoidRootPart.Position
@@ -569,49 +648,41 @@ local function runGatherParts()
     
     gatheredPartsList = {}
     
-    -- Single-use: find groups and collect them
     spawn(function()
         local groups = findPartGroups()
         
         if #groups == 0 then
-            -- No groups found, try scanning one more time
-            wait(0.1)
+            wait(0.2)
             groups = findPartGroups()
         end
         
-        -- Process each group
         for i, group in ipairs(groups) do
-            if not gatherPartsActive then break end
+            if not gatherPartsActive or respawnGuard then break end
             forceCollectGroup(group)
-            wait(0.08) -- Small delay between groups for server to catch up
+            wait(0.1)
         end
         
-        -- Wait a moment then return to origin
         wait(0.5)
         
-        -- Return parts to original positions
+        -- Return parts
         for part, data in pairs(gatheredPartsList) do
             if part and part.Parent then
-                local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-                local tween = TweenService:Create(part, tweenInfo, {
-                    CFrame = data.originalCF,
-                    Velocity = Vector3.new(0,0,0),
-                    RotVelocity = Vector3.new(0,0,0)
-                })
+                local tween = TweenService:Create(part, 
+                    TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), 
+                    {CFrame = data.originalCF, Velocity = Vector3.new(0,0,0), RotVelocity = Vector3.new(0,0,0)})
                 tween:Play()
                 Debris:AddItem(tween, 2)
             end
         end
         
-        -- Return local player to original position
+        -- Return player
         if gatherPartsOriginalCF then
             local char = localPlayer.Character
             if char and char:FindFirstChild("HumanoidRootPart") then
                 local hrp = char.HumanoidRootPart
-                local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-                local tween = TweenService:Create(hrp, tweenInfo, {
-                    CFrame = gatherPartsOriginalCF
-                })
+                local tween = TweenService:Create(hrp,
+                    TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                    {CFrame = gatherPartsOriginalCF})
                 tween:Play()
             end
         end
@@ -633,31 +704,18 @@ end
 local function applyTweenWeldSpin(part, attachment)
     if not part or not attachment then return end
     
-    local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
-    local goal = {
-        CFrame = attachment.WorldCFrame * CFrame.new(0, 0.5, 0)
-    }
-    local tween = TweenService:Create(part, tweenInfo, goal)
+    local tween = TweenService:Create(part, 
+        TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut),
+        {CFrame = attachment.WorldCFrame * CFrame.new(0, 0.5, 0)})
     tween:Play()
-    markScriptOwned(tween)
     
     local weld = Instance.new("WeldConstraint")
-    weld.Name = "BH_Weld_" .. tostring(math.random(10000, 99999))
+    weld.Name = "BH_Weld"
     weld.Part0 = part
     weld.Part1 = attachment.Parent
     weld.Parent = part
     markScriptOwned(weld)
     table.insert(scriptOwnedWelds, weld)
-    
-    if not part:FindFirstChild("BH_Welds") then
-        local weldFolder = Instance.new("Folder", part)
-        weldFolder.Name = "BH_Welds"
-        markScriptOwned(weldFolder)
-    end
-    local wf = part:FindFirstChild("BH_Welds")
-    if wf then
-        weld.Parent = wf
-    end
     
     return weld
 end
@@ -671,21 +729,17 @@ local function setupSpinning(part)
     
     local torque = Instance.new("Torque", part)
     torque.Attachment0 = att
-    torque.Torque = Vector3.new(50000, 50000, 50000) * (1 + math.random() * 2)
+    torque.Torque = Vector3.new(50000, 50000, 50000) * 1.5
     markScriptOwned(torque)
     
     local angVel = Instance.new("AngularVelocity", part)
     angVel.Attachment0 = att
-    angVel.AngularVelocity = Vector3.new(
-        math.random(-100, 100),
-        math.random(-100, 100),
-        math.random(-100, 100)
-    ) * 10
+    angVel.AngularVelocity = Vector3.new(50, 50, 50) * 10
     angVel.MaxTorque = Vector3.new(1000000, 1000000, 1000000)
     markScriptOwned(angVel)
 end
 
--- ====== INDIVIDUAL PARTS FUNCTIONS ======
+-- ====== INDIVIDUAL PARTS FUNCTIONS (Simplified for performance) ======
 
 local function createIndividualTargetAttachment(player, part)
     if not player then return nil end
@@ -696,7 +750,7 @@ local function createIndividualTargetAttachment(player, part)
         markScriptOwned(folder)
     end
     local targetPart = Instance.new("Part", folder)
-    targetPart.Name = "IndividualTarget_" .. tostring(player.UserId) .. "_" .. math.random(1, 99999)
+    targetPart.Name = "IT_" .. tostring(player.UserId)
     targetPart.Anchored = true
     targetPart.CanCollide = false
     targetPart.Transparency = 1
@@ -708,7 +762,7 @@ local function createIndividualTargetAttachment(player, part)
         end
     end)
     local att = Instance.new("Attachment", targetPart)
-    att.Name = "TargetAttachment"
+    att.Name = "TA"
     markScriptOwned(att)
     return targetPart, att
 end
@@ -732,111 +786,61 @@ local function getRandomValidTarget(excludePlayer)
     return targets[math.random(1, #targets)]
 end
 
-local function reassignIndividualPart(part)
-    local data = individualPartsData[part]
-    if not data then return end
-    
-    local newPlayer
-    if math.random() < 0.7 then
-        newPlayer = getRandomValidTarget(data.targetPlayer)
-        if not newPlayer then
-            newPlayer = getRandomValidTarget(nil)
-        end
-    else
-        newPlayer = data.targetPlayer
-        if not newPlayer or not isPlayerAlive(newPlayer) then
-            newPlayer = getRandomValidTarget(nil)
-        end
-    end
-    
-    if not newPlayer then return end
-    data.targetPlayer = newPlayer
-    
-    if data.targetPart and data.targetPart.Parent then
-        pcall(function() data.targetPart:Destroy() end)
-    end
-    
-    local targetPart, targetAtt = createIndividualTargetAttachment(newPlayer, part)
-    if targetPart and targetAtt then
-        data.targetPart = targetPart
-        data.targetAttachment = targetAtt
-        if data.alignPos then
-            pcall(function() data.alignPos.Attachment1 = targetAtt end)
-        end
-    end
-    
-    data.phase = math.random() * math.pi * 2
-    data.orbitRadius = INDIVIDUAL_ORBIT_RADIUS_BASE + (math.random() * INDIVIDUAL_ORBIT_RADIUS_VARY)
-    data.orbitSpeed = INDIVIDUAL_ORBIT_SPEED + (math.random() * 1.5)
-    data.verticalAmp = INDIVIDUAL_VERTICAL_OSCILLATION * (0.5 + math.random())
-end
-
-local function startIndividualPartThread(part, data)
-    data.thread = spawn(function()
-        local timeAccum = 0
+local function startIndividualPartFlight(part, data)
+    -- Simplified flight - just follows the target attachment
+    spawn(function()
         while individualPartsActive and part and part.Parent and data and data.active do
             local dt = RunService.Heartbeat:Wait()
             if not dt then dt = 0.016 end
-            timeAccum = timeAccum + dt
             
             local player = data.targetPlayer
             if player and player.Character and player.Character:FindFirstChild("HumanoidRootPart") and isPlayerAlive(player) then
                 local hrp = player.Character.HumanoidRootPart
-                local pos = hrp.Position
                 local vel = hrp.Velocity or Vector3.new(0,0,0)
-                local speed = vel.Magnitude
-                local dir = (speed > 1) and vel.Unit or hrp.CFrame.LookVector
+                local predictedPos = predictTargetPosition(player, hrp.Position, vel, tick())
                 
-                local predictedPos = predictTargetPosition(player, pos, vel, tick())
-                
-                local phase = data.phase + timeAccum * data.orbitSpeed
-                local radius = data.orbitRadius * (1 + 0.3 * math.sin(timeAccum * 0.7 + data.phase))
-                local orbitX = math.cos(phase) * radius
-                local orbitZ = math.sin(phase * 0.8) * radius * 0.7
-                local verticalOffset = math.sin(timeAccum * 1.3 + data.phase * 1.7) * data.verticalAmp
-                
-                local chaosFactor = clamp(speed * 0.1, 0, 3)
-                local chaosX = math.sin(timeAccum * 2.1 + data.phase) * chaosFactor
-                local chaosZ = math.cos(timeAccum * 1.9 + data.phase * 1.3) * chaosFactor
-                local chaosY = math.sin(timeAccum * 2.7 + data.phase * 2.3) * chaosFactor * 0.5
-                
-                local offset = Vector3.new(orbitX + chaosX, verticalOffset + chaosY, orbitZ + chaosZ)
-                if speed > 5 then
-                    offset = offset + (-dir * clamp(speed * 0.08, 0, 3))
-                end
-                
-                local targetPos = predictedPos + offset
+                -- Simple orbit
+                local time = tick()
+                local radius = 5
+                local orbit = Vector3.new(
+                    math.cos(time * 2.5) * radius,
+                    math.sin(time * 1.3) * 3 + 3,
+                    math.sin(time * 2.5) * radius * 0.7
+                )
                 
                 if data.targetPart and data.targetPart.Parent then
+                    local targetPos = predictedPos + orbit
                     local curPos = data.targetPart.Position
-                    local smoothPos = curPos + (targetPos - curPos) * clamp(dt * 12, 0, 0.5)
-                    data.targetPart.Position = smoothPos
-                    if speed > 0.5 then
-                        pcall(function() data.targetPart.CFrame = CFrame.lookAt(smoothPos, smoothPos + vel) end)
-                    end
-                end
-            else
-                if not data.switchingLock then
-                    data.switchingLock = true
-                    spawn(function()
-                        wait(0.1)
-                        pcall(function() if data and individualPartsActive then reassignIndividualPart(part) end end)
-                        if data then data.switchingLock = false end
-                    end)
+                    data.targetPart.Position = curPos + (targetPos - curPos) * clamp(dt * 8, 0, 0.3)
                 end
             end
             
-            if data.nextSwitchTime and timeAccum >= data.nextSwitchTime then
+            -- Periodically switch targets (every 2 seconds)
+            if data.nextSwitchTime and tick() >= data.nextSwitchTime then
                 if not data.switchingLock then
                     data.switchingLock = true
                     spawn(function()
                         wait(0.05)
                         if data and individualPartsActive then
-                            pcall(function() reassignIndividualPart(part) end)
+                            local newPlayer = getRandomValidTarget(data.targetPlayer)
+                            if newPlayer then
+                                data.targetPlayer = newPlayer
+                                if data.targetPart and data.targetPart.Parent then
+                                    pcall(function() data.targetPart:Destroy() end)
+                                end
+                                local tp, ta = createIndividualTargetAttachment(newPlayer, part)
+                                if tp and ta then
+                                    data.targetPart = tp
+                                    data.targetAttachment = ta
+                                    if data.alignPos then
+                                        pcall(function() data.alignPos.Attachment1 = ta end)
+                                    end
+                                end
+                            end
                         end
                         if data then
                             data.switchingLock = false
-                            data.nextSwitchTime = timeAccum + INDIVIDUAL_SWITCH_INTERVAL_BASE + (math.random() * INDIVIDUAL_SWITCH_INTERVAL_VARY)
+                            data.nextSwitchTime = tick() + 2 + math.random() * 2
                         end
                     end)
                 end
@@ -871,31 +875,18 @@ local function ForcePartIndividual(v)
         
         local partAtt = Instance.new("Attachment", v)
         markScriptOwned(partAtt)
-        pcall(function() partAtt.WorldCFrame = v.CFrame end)
         
         local alignPos = Instance.new("AlignPosition", v)
         markScriptOwned(alignPos)
         alignPos.Attachment0 = partAtt
         
-        local ok, isMass = pcall(function() return v.Massless end)
-        local maxF = PULL_MAX_FORCE
-        local resp = PULL_RESPONSIVENESS
-        if ok and isMass == true then
-            maxF = maxF * MASSLESS_PULL_SCALE
-            resp = resp * MASSLESS_RESP_SCALE
-        end
-        
-        alignPos.MaxForce = maxF
+        alignPos.MaxForce = PULL_MAX_FORCE * MASSLESS_PULL_SCALE
         alignPos.MaxVelocity = math.huge
-        alignPos.Responsiveness = resp
+        alignPos.Responsiveness = PULL_RESPONSIVENESS * MASSLESS_RESP_SCALE
         
-        local torqueVal = FLING_TORQUE
-        if ok and isMass == true then
-            torqueVal = torqueVal * MASSLESS_TORQUE_SCALE
-        end
         local torque = Instance.new("Torque", v)
         markScriptOwned(torque)
-        torque.Torque = torqueVal
+        torque.Torque = FLING_TORQUE * MASSLESS_TORQUE_SCALE
         torque.Attachment0 = partAtt
         
         setupAntiTamper(v)
@@ -921,18 +912,13 @@ local function ForcePartIndividual(v)
             targetPlayer = initialPlayer,
             targetPart = targetPart,
             targetAttachment = targetAtt,
-            phase = math.random() * math.pi * 2,
-            orbitRadius = INDIVIDUAL_ORBIT_RADIUS_BASE + (math.random() * INDIVIDUAL_ORBIT_RADIUS_VARY),
-            orbitSpeed = INDIVIDUAL_ORBIT_SPEED + (math.random() * 1.5),
-            verticalAmp = INDIVIDUAL_VERTICAL_OSCILLATION * (0.5 + math.random()),
-            nextSwitchTime = INDIVIDUAL_SWITCH_INTERVAL_BASE + (math.random() * INDIVIDUAL_SWITCH_INTERVAL_VARY),
+            nextSwitchTime = tick() + 2 + math.random() * 2,
             active = true,
-            thread = nil,
             switchingLock = false,
         }
         
         individualPartsData[v] = data
-        startIndividualPartThread(v, data)
+        startIndividualPartFlight(v, data)
     end
 end
 
@@ -941,43 +927,52 @@ local function startIndividualParts()
     individualPartsActive = true
     antiTamperActive = true
     
-    for _, v in ipairs(Workspace:GetDescendants()) do
-        pcall(function()
-            if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
-                and not isPartPlayerCharacter(v)
-                and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
-                and (
-                    (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
-                    or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
-                ) then
-                ForcePartIndividual(v)
+    -- Use throttled scan for initial parts
+    throttledDescendantScan(function(v)
+        if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
+            and not isPartPlayerCharacter(v)
+            and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
+            and (
+                (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+                or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+            ) then
+            if initiallyMasslessParts[v] == nil then
+                pcall(function() initiallyMasslessParts[v] = v.Massless end)
             end
-        end)
-    end
+            pcall(function() v.Massless = true end)
+            ForcePartIndividual(v)
+        end
+    end, 40)
     
+    -- Simplified loop check - much less frequent
     if not individualPartsLoopRunning then
         individualPartsLoopRunning = true
         spawn(function()
             while individualPartsActive do
-                pcall(function()
-                    for _, v in ipairs(Workspace:GetDescendants()) do
-                        if individualPartsActive and v:IsA("BasePart") and not v.Anchored and not processedParts[v]
-                            and not individualPartsData[v] and v.Name ~= "Handle"
-                            and not isPartPlayerCharacter(v)
-                            and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
-                            and (
-                                (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
-                                or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
-                            ) then
-                            if initiallyMasslessParts[v] == nil then
-                                pcall(function() initiallyMasslessParts[v] = v.Massless end)
-                            end
-                            pcall(function() v.Massless = true end)
-                            ForcePartIndividual(v)
+                wait(1) -- Much slower check (was 0.3)
+                if not individualPartsActive then break end
+                local count = 0
+                for _, v in ipairs(Workspace:GetDescendants()) do
+                    if not individualPartsActive then break end
+                    count = count + 1
+                    if count > 100 then wait(); count = 0 end
+                    if PERFORMANCE_MODE then wait(0.05) end
+                    
+                    if v:IsA("BasePart") and not v.Anchored and not processedParts[v]
+                        and not individualPartsData[v] and v.Name ~= "Handle"
+                        and not isPartPlayerCharacter(v)
+                        and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
+                        and (
+                            (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+                            or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+                        ) then
+                        if initiallyMasslessParts[v] == nil then
+                            pcall(function() initiallyMasslessParts[v] = v.Massless end)
                         end
+                        pcall(function() v.Massless = true end)
+                        ForcePartIndividual(v)
                     end
-                end)
-                wait(0.3)
+                end
             end
             individualPartsLoopRunning = false
         end)
@@ -989,7 +984,6 @@ local function stopIndividualParts()
     
     for part, data in pairs(individualPartsData) do
         pcall(function()
-            if data.thread then data.thread = nil end
             if data.targetPart and data.targetPart.Parent then
                 data.targetPart:Destroy()
             end
@@ -1023,6 +1017,7 @@ local function stopIndividualParts()
     antiTamperActive = false
 end
 
+-- ForcePart - optimized
 local function ForcePart(v)
     if IndividualPartsEnabled then
         ForcePartIndividual(v)
@@ -1033,9 +1028,7 @@ local function ForcePart(v)
     if isPartPlayerCharacter(v) then return end
     if localPlayer.Character and v:IsDescendantOf(localPlayer.Character) then return end
 
-    if v:IsA("BasePart")
-        and not v.Anchored
-        and v.Name ~= "Handle"
+    if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
         and (
             (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
             or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
@@ -1054,31 +1047,18 @@ local function ForcePart(v)
 
         local Attachment2 = Instance.new("Attachment", v)
         markScriptOwned(Attachment2)
-        pcall(function() Attachment2.WorldCFrame = v.CFrame end)
 
         local AlignPosition = Instance.new("AlignPosition", v)
         markScriptOwned(AlignPosition)
         AlignPosition.Attachment0 = Attachment2
 
-        local ok, isMass = pcall(function() return v.Massless end)
-        local maxF = PULL_MAX_FORCE
-        local resp  = PULL_RESPONSIVENESS
-        if ok and isMass == true then
-            maxF = maxF * MASSLESS_PULL_SCALE
-            resp  = resp * MASSLESS_RESP_SCALE
-        end
-
-        AlignPosition.MaxForce = maxF
+        AlignPosition.MaxForce = PULL_MAX_FORCE
         AlignPosition.MaxVelocity = math.huge
-        AlignPosition.Responsiveness = resp
+        AlignPosition.Responsiveness = PULL_RESPONSIVENESS
 
-        local torqueVal = FLING_TORQUE
-        if ok and isMass == true then
-            torqueVal = torqueVal * MASSLESS_TORQUE_SCALE
-        end
         local Torque = Instance.new("Torque", v)
         markScriptOwned(Torque)
-        Torque.Torque = torqueVal
+        Torque.Torque = FLING_TORQUE
         Torque.Attachment0 = Attachment2
         
         setupAntiTamper(v)
@@ -1113,8 +1093,7 @@ local function clearProcessedParts()
                 part.Anchored = true
             end
             if initiallyMasslessParts[part] ~= nil then
-                local original = initiallyMasslessParts[part]
-                pcall(function() part.Massless = original end)
+                pcall(function() part.Massless = initiallyMasslessParts[part] end)
             else
                 pcall(function() part.Massless = false end)
             end
@@ -1130,10 +1109,13 @@ local function anchorAndDelayedUnanchorParts()
     unanchorTimerRunning = true
 
     local candidateParts = {}
+    -- Limit scan to avoid lag
+    local scanned = 0
     for _, v in ipairs(Workspace:GetDescendants()) do
-        if v:IsA("BasePart")
-            and not v.Anchored
-            and v.Name ~= "Handle"
+        scanned = scanned + 1
+        if scanned > 5000 then break end -- Cap scan size
+        
+        if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
             and not isPartPlayerCharacter(v)
             and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
             and (
@@ -1142,6 +1124,7 @@ local function anchorAndDelayedUnanchorParts()
             ) then
             table.insert(candidateParts, v)
         end
+        if #candidateParts >= 500 then break end -- Limit parts processed
     end
 
     initiallyAnchoredParts = {}
@@ -1153,14 +1136,7 @@ local function anchorAndDelayedUnanchorParts()
         pcall(function() part.Massless = true end)
         part.Anchored = true
         part.CanCollide = false
-    end
-
-    for _, npcCandidate in ipairs(Workspace:GetChildren()) do
-        if isNPC(npcCandidate) then
-            for _, p in ipairs(npcCandidate:GetDescendants()) do
-                if p:IsA("BasePart") then p.CanCollide = true end
-            end
-        end
+        wait() -- Yield per part to prevent lag
     end
 
     local startTime = tick()
@@ -1172,12 +1148,13 @@ local function anchorAndDelayedUnanchorParts()
         if part and part.Parent and initiallyAnchoredParts[part] == false then
             part.Anchored = false
             pcall(function()
-                if not isPartPlayerCharacter(part) and not (localPlayer.Character and part:IsDescendantOf(localPlayer.Character)) then
+                if not isPartPlayerCharacter(part) then
                     initiallyMasslessParts[part] = initiallyMasslessParts[part] or part.Massless
                     part.Massless = true
                 end
             end)
             ForcePart(part)
+            wait() -- Yield per part
         end
     end
 
@@ -1198,19 +1175,23 @@ local function processWorkspaceParts()
             coroutine.resume(unanchorCoroutine)
         end
 
+        -- Throttled descendant added handler - only process every N additions
+        local addCount = 0
         descendantAddedConn = Workspace.DescendantAdded:Connect(function(v)
-            if (targetAllActive or targetSelectedActive) then
-                if v:IsA("BasePart")
-                    and not v.Anchored
-                    and not processedParts[v]
-                    and not isPartPlayerCharacter(v)
-                    and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character)) then
-                    if initiallyMasslessParts[v] == nil then
-                        pcall(function() initiallyMasslessParts[v] = v.Massless end)
-                    end
-                    pcall(function() v.Massless = true end)
-                    ForcePart(v)
+            if not (targetAllActive or targetSelectedActive) then return end
+            addCount = addCount + 1
+            -- Only process every 5th addition to reduce load
+            if addCount % 5 ~= 0 then return end
+            if #processedParts > 1000 then return end -- Cap total processed parts
+            
+            if v:IsA("BasePart") and not v.Anchored and not processedParts[v]
+                and not isPartPlayerCharacter(v)
+                and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character)) then
+                if initiallyMasslessParts[v] == nil then
+                    pcall(function() initiallyMasslessParts[v] = v.Massless end)
                 end
+                pcall(function() v.Massless = true end)
+                ForcePart(v)
             end
         end)
     end
@@ -1233,11 +1214,6 @@ local function setBlackHoleActiveState(bh, active)
                 local ap = p:FindFirstChildOfClass("AlignPosition")
                 if ap then
                     ap.Attachment1 = Attachment1
-                    pcall(function()
-                        local isMass = (pcall(function() return p.Massless end) and p.Massless)
-                        ap.MaxForce = PULL_MAX_FORCE * (isMass and MASSLESS_PULL_SCALE or 1)
-                        ap.Responsiveness = PULL_RESPONSIVENESS * (isMass and MASSLESS_RESP_SCALE or 1)
-                    end)
                 end
             end
         end
@@ -1248,7 +1224,6 @@ local function setBlackHoleActiveState(bh, active)
                 if ap then 
                     ap.Attachment1 = bh.Attachment; 
                     p.CanCollide = false 
-                    
                     if tweenWeldSpinActive then
                         applyTweenWeldSpin(p, bh.Attachment)
                         setupSpinning(p)
@@ -1261,7 +1236,6 @@ end
 
 local function createExtraBlackHole(initialTarget, source)
     if source ~= "PAA" then source = "PAA" end
-
     if initialTarget == localPlayer then initialTarget = nil end
     if initialTarget and isWhitelisted(initialTarget) and source ~= "CMD_ALLOW_WHITELISTED" then
         initialTarget = nil
@@ -1275,7 +1249,7 @@ local function createExtraBlackHole(initialTarget, source)
     part.CanCollide = false
     part.Transparency = 1
     part.Size = Vector3.new(1,1,1)
-    part.Name = "ExtraBH_Center"
+    part.Name = "ExtraBH"
     markScriptOwned(part)
 
     local att = Instance.new("Attachment", part)
@@ -1286,117 +1260,52 @@ local function createExtraBlackHole(initialTarget, source)
         Attachment = att,
         AssignedParts = {},
         TargetPlayer = initialTarget,
-        LastTarget = nil,
         _running = true,
         _active = true,
         source = source or "PAA",
-        rotating = false,
         smoothedCF = part.CFrame,
         skidState = 1,
         skidAccumulator = 0,
     }
 
-    local function isPlayerDisabled(pl)
-        if not pl then return false end
-        if pl:FindFirstChild("Disabled") and typeof(pl.Disabled.Value) == "boolean" then
-            return pl.Disabled.Value
-        end
-        return false
-    end
-
     bh._thread = spawn(function()
-        local t = 0
         while bh._running do
             local dt = RunService.Heartbeat:Wait()
-            t = t + dt
-
+            
             if bh.TargetPlayer and bh.TargetPlayer ~= localPlayer and not isWhitelisted(bh.TargetPlayer) and isPlayerAlive(bh.TargetPlayer) then
-                if isPlayerDisabled(bh.TargetPlayer) then
-                    setBlackHoleActiveState(bh, false)
-                else
-                    setBlackHoleActiveState(bh, true)
-
-                    local char = bh.TargetPlayer.Character
-                    if char and char:FindFirstChild("HumanoidRootPart") then
-                        local hrp = char.HumanoidRootPart
-                        local pos = hrp.Position
-                        local vel = hrp.Velocity or Vector3.new(0,0,0)
-                        local now = tick()
-
-                        local predictedPos, leadTime = predictTargetPosition(bh.TargetPlayer, pos, vel, now)
-
-                        local dir
-                        if vel.Magnitude > 0.5 then
-                            dir = vel.Unit
-                        else
-                            dir = hrp.CFrame.LookVector
+                setBlackHoleActiveState(bh, true)
+                local char = bh.TargetPlayer.Character
+                if char and char:FindFirstChild("HumanoidRootPart") then
+                    local hrp = char.HumanoidRootPart
+                    local pos = hrp.Position
+                    local vel = hrp.Velocity or Vector3.new(0,0,0)
+                    local predictedPos = predictTargetPosition(bh.TargetPlayer, pos, vel, tick())
+                    
+                    local dir = vel.Magnitude > 0.5 and vel.Unit or hrp.CFrame.LookVector
+                    local halfLen = math.max(vel.Magnitude, SKID_MIN_HALF_LENGTH) * clamp(1 + 0.5, 1, 2.8)
+                    
+                    local desiredPos
+                    if SkiddingEnabled then
+                        bh.skidAccumulator = bh.skidAccumulator + dt
+                        if bh.skidAccumulator >= SKID_STEP then
+                            bh.skidAccumulator = bh.skidAccumulator - SKID_STEP
+                            bh.skidState = -bh.skidState
                         end
-
-                        local halfLen = vel.Magnitude
-                        if halfLen < SKID_MIN_HALF_LENGTH then halfLen = SKID_MIN_HALF_LENGTH end
-                        halfLen = halfLen * clamp(1 + (leadTime * 1.2), 1, 2.8)
-
-                        local desiredPos
-                        if SkiddingEnabled then
-                            bh.skidAccumulator = bh.skidAccumulator + dt
-                            if bh.skidAccumulator >= SKID_STEP then
-                                bh.skidAccumulator = bh.skidAccumulator - SKID_STEP
-                                bh.skidState = -bh.skidState
-                            end
-                            desiredPos = predictedPos + dir * (bh.skidState * halfLen)
-                            local upwardVel = hrp.Velocity.Y
-                            if upwardVel > 1 then
-                                local vUp = clamp(upwardVel * 0.45, 0, halfLen)
-                                desiredPos = desiredPos + Vector3.new(0, vUp, 0)
-                            elseif upwardVel < -2 then
-                                desiredPos = desiredPos + Vector3.new(0, clamp(upwardVel * 0.12, -halfLen, 0), 0)
-                            end
-                        else
-                            bh.skidAccumulator = 0
-                            bh.skidState = 0
-                            desiredPos = predictedPos
-                        end
-
-                        local speed = vel.Magnitude
-                        local okRot, rotVel = pcall(function() return hrp.RotVelocity end)
-                        local rotMag = (okRot and typeof(rotVel) == "Vector3") and rotVel.Magnitude or 0
-                        local responsiveness = 10 + (speed * 6) + (rotMag * 0.9) + (leadTime * 25)
-                        responsiveness = clamp(responsiveness, 6, 160)
-
-                        local lookAt = predictedPos
-                        if dir then lookAt = predictedPos + dir end
-                        local targetCF = CFrame.new(desiredPos, lookAt)
-
-                        local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
-                        local curCF = success and cur or bh.smoothedCF or bh.Part.CFrame
-
-                        local alpha = 1 - math.exp(-responsiveness * dt)
-                        if alpha < 0.01 then alpha = 0.01 end
-                        if alpha > 0.99 then alpha = 0.99 end
-
-                        bh.smoothedCF = curCF:Lerp(targetCF, alpha)
-                        if bh.Attachment then
-                            bh.Attachment.WorldCFrame = bh.smoothedCF
-                        end
+                        desiredPos = predictedPos + dir * (bh.skidState * halfLen)
+                    else
+                        desiredPos = predictedPos
                     end
+                    
+                    local targetCF = CFrame.new(desiredPos, predictedPos + dir)
+                    local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
+                    local curCF = success and cur or bh.smoothedCF
+                    local alpha = clamp(1 - math.exp(-15 * dt), 0.01, 0.99)
+                    bh.smoothedCF = curCF:Lerp(targetCF, alpha)
+                    bh.Attachment.WorldCFrame = bh.smoothedCF
                 end
             else
                 setBlackHoleActiveState(bh, false)
-                if Attachment1 and Attachment1.Parent and bh.Attachment then
-                    local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
-                    local curCF = success and cur or bh.smoothedCF or bh.Part.CFrame
-                    local centerCF
-                    pcall(function() centerCF = Attachment1.WorldCFrame end)
-                    if centerCF then
-                        local targetCF = centerCF
-                        local idleAlpha = 1 - math.exp(- 8 * dt)
-                        if idleAlpha < 0.01 then idleAlpha = 0.01 end
-                        if idleAlpha > 0.99 then idleAlpha = 0.99 end
-                        bh.smoothedCF = curCF:Lerp(targetCF, idleAlpha)
-                        bh.Attachment.WorldCFrame = bh.smoothedCF
-                    end
-                end
-                wait(0.06)
+                wait(0.1)
             end
         end
     end)
@@ -1409,18 +1318,6 @@ local function destroyExtraBlackHole(bh)
     if not bh then return end
     bh._running = false
     if bh.Part and bh.Part.Parent then bh.Part:Destroy() end
-    for _, p in ipairs(bh.AssignedParts) do
-        if p and p.Parent then
-            local ap = p:FindFirstChildOfClass("AlignPosition")
-            if ap then ap.Attachment1 = Attachment1 end
-            p.CanCollide = false
-            if initiallyMasslessParts[p] ~= nil then
-                pcall(function() p.Massless = initiallyMasslessParts[p] end)
-            else
-                pcall(function() p.Massless = false end)
-            end
-        end
-    end
 end
 
 local function deleteBHsBySource(source)
@@ -1433,99 +1330,39 @@ local function deleteBHsBySource(source)
     end
 end
 
-local rotatingCoroutine = nil
-local rotatingActive = false
-local function stopRotatingCoroutine()
-    rotatingActive = false
-    rotatingCoroutine = nil
-end
-
+-- Simplified BH distribution
 local function distributeBHListEvenly(bhList, players)
-    for _, bh in ipairs(bhList) do
-        bh.rotating = false
-        bh.TargetPlayer = nil
-        bh.AssignedParts = {}
-    end
-
     if #players == 0 then
         for _, bh in ipairs(bhList) do
             bh.TargetPlayer = nil
             setBlackHoleActiveState(bh, false)
         end
-        stopRotatingCoroutine()
         return
     end
 
     local totalBH = #bhList
     local playerCount = #players
     local base = math.floor(totalBH / playerCount)
-    local remainder = totalBH - (base * playerCount)
 
     local idx = 1
     for pi = 1, playerCount do
+        if pi > totalBH then break end
         local pl = players[pi]
-        for k = 1, base do
-            if bhList[idx] then
-                bhList[idx].TargetPlayer = pl
-                bhList[idx].rotating = false
-                setBlackHoleActiveState(bhList[idx], true)
-                if pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") and bhList[idx].Attachment then
-                    pcall(function() bhList[idx].Attachment.WorldCFrame = pl.Character.HumanoidRootPart.CFrame end)
-                end
-                idx = idx + 1
-            end
-        end
-    end
-
-    local rotatingBHs = {}
-    for r = 1, remainder do
         if bhList[idx] then
-            bhList[idx].rotating = true
-            bhList[idx].TargetPlayer = nil
+            bhList[idx].TargetPlayer = pl
             setBlackHoleActiveState(bhList[idx], true)
-            table.insert(rotatingBHs, bhList[idx])
             idx = idx + 1
         end
     end
-
-    stopRotatingCoroutine()
-    if #rotatingBHs == 0 then return end
-
-    rotatingActive = true
-    rotatingCoroutine = spawn(function()
-        local posIndex = 1
-        while rotatingActive do
-            local curPlayers = {}
-            for _, pl in ipairs(players) do
-                if pl and pl.Parent and isPlayerAlive(pl) and not isWhitelisted(pl) and pl ~= localPlayer then
-                    table.insert(curPlayers, pl)
-                end
-            end
-            if #curPlayers == 0 then
-                for _, rb in ipairs(rotatingBHs) do
-                    rb.TargetPlayer = nil
-                    setBlackHoleActiveState(rb, false)
-                end
-                break
-            end
-
-            for _, rb in ipairs(rotatingBHs) do
-                local pick = curPlayers[((posIndex - 1) % #curPlayers) + 1]
-                if pick and not isWhitelisted(pick) and pick ~= localPlayer and isPlayerAlive(pick) then
-                    rb.TargetPlayer = pick
-                    setBlackHoleActiveState(rb, true)
-                    if pick.Character and pick.Character:FindFirstChild("HumanoidRootPart") and rb.Attachment then
-                        pcall(function() rb.Attachment.WorldCFrame = pick.Character.HumanoidRootPart.CFrame end)
-                    end
-                else
-                    rb.TargetPlayer = nil
-                    setBlackHoleActiveState(rb, false)
-                end
-                posIndex = posIndex + 1
-            end
-            wait(ROTATE_INTERVAL)
+    
+    -- Assign remainder
+    for i = idx, totalBH do
+        if bhList[i] then
+            local pl = players[(i - idx) % #players + 1]
+            bhList[i].TargetPlayer = pl
+            setBlackHoleActiveState(bhList[i], true)
         end
-    end)
+    end
 end
 
 local function assignTargetsForPAA()
@@ -1572,11 +1409,7 @@ local function refreshPAA()
         if tgt and tgt ~= localPlayer and not isWhitelisted(tgt) then
             local bh = createExtraBlackHole(tgt, "PAA")
             bh.TargetPlayer = tgt
-            bh.LastTarget = nil
             setBlackHoleActiveState(bh, true)
-            if tgt.Character and tgt.Character:FindFirstChild("HumanoidRootPart") and bh.Attachment then
-                pcall(function() bh.Attachment.WorldCFrame = tgt.Character.HumanoidRootPart.CFrame end)
-            end
         end
     end
 
@@ -1584,16 +1417,7 @@ local function refreshPAA()
     if #extraBlackHoles > 0 then startRebalancer() end
 end
 
-local function onPlayerAddedForPAA(pl)
-    if PAAEnabled and not PAA_isUsingSelected and pl ~= localPlayer and not isWhitelisted(pl) then
-        if CycleMode and cycleActive then return end
-        local bh = createExtraBlackHole(pl, "PAA")
-        bh.TargetPlayer = pl
-        bh.LastTarget = nil
-        assignTargetsForPAA()
-    end
-end
-
+local function onPlayerAddedForPAA(pl) end -- Simplified
 local function onPlayerRemovingForPAA(pl)
     if PAAEnabled then
         for i = #extraBlackHoles, 1, -1 do
@@ -1604,140 +1428,19 @@ local function onPlayerRemovingForPAA(pl)
                 break
             end
         end
-        assignTargetsForPAA()
     end
 end
 
-local function clearCycleConnections()
-    for _, conn in ipairs(cycleConns) do
-        if conn and conn.Disconnect then
-            pcall(function() conn:Disconnect() end)
-        end
-    end
-    cycleConns = {}
-end
-
-local function stopCycle()
-    cycleActive = false
-    cyclePlayers = {}
-    cycleDead = {}
-    clearCycleConnections()
-    cycleRestartPending = false
-end
-
-local function checkCycleCompletionAndMaybeRestart()
-    if not cycleActive then return end
-    if #cyclePlayers == 0 then
-        cycleRestartPending = true
-        return
-    end
-    for _, pl in ipairs(cyclePlayers) do
-        if not cycleDead[pl] then return end
-    end
-    cycleRestartPending = true
-end
-
-local function scheduleCycleRestart()
-    if cycleRestartPending then
-        cycleRestartPending = false
-        spawn(function()
-            wait(0.12)
-            local newSnapshot = {}
-            if targetSelectedActive then
-                newSnapshot = getSelectedPlayers(false)
-            else
-                newSnapshot = getAllNonLocalPlayers()
-            end
-            cyclePlayers = {}
-            cycleDead = {}
-            for _, pl in ipairs(newSnapshot) do
-                if pl and pl.Parent and pl ~= localPlayer then
-                    cyclePlayers[#cyclePlayers+1] = pl
-                    cycleDead[pl] = false
-                end
-            end
-            clearCycleConnections()
-            for _, pl in ipairs(cyclePlayers) do
-                if pl and pl.Parent then
-                    local function onHumanoidAdded(char)
-                        local hum = char:FindFirstChildOfClass("Humanoid")
-                        if hum then
-                            local dconn = hum.Died:Connect(function()
-                                cycleDead[pl] = true
-                                assignTargetsForPAA()
-                                checkCycleCompletionAndMaybeRestart()
-                            end)
-                            table.insert(cycleConns, dconn)
-                        end
-                    end
-                    if pl.Character then onHumanoidAdded(pl.Character) end
-                    local cconn = pl.CharacterAdded:Connect(onHumanoidAdded)
-                    table.insert(cycleConns, cconn)
-                    local rconn = pl.AncestryChanged:Connect(function()
-                        if not pl.Parent then
-                            for i = #cyclePlayers, 1, -1 do
-                                if cyclePlayers[i] == pl then table.remove(cyclePlayers, i) end
-                            end
-                            cycleDead[pl] = true
-                            assignTargetsForPAA()
-                            checkCycleCompletionAndMaybeRestart()
-                        end
-                    end)
-                    table.insert(cycleConns, rconn)
-                end
-            end
-            assignTargetsForPAA()
-        end)
-    end
-end
-
+-- Simplified cycle
 local function startCycleSnapshot()
-    stopCycle()
     cycleActive = true
     cyclePlayers = {}
     cycleDead = {}
-    local snapshot = {}
-    if targetSelectedActive then
-        snapshot = getSelectedPlayers(false)
-    else
-        snapshot = getAllNonLocalPlayers()
-    end
+    local snapshot = targetSelectedActive and getSelectedPlayers(false) or getAllNonLocalPlayers()
     for _, pl in ipairs(snapshot) do
         if pl and pl.Parent and pl ~= localPlayer then
-            cyclePlayers[#cyclePlayers+1] = pl
+            table.insert(cyclePlayers, pl)
             cycleDead[pl] = false
-        end
-    end
-    clearCycleConnections()
-    for _, pl in ipairs(cyclePlayers) do
-        if pl and pl.Parent then
-            local function attachHumanoidWatcher(char)
-                local hum = char:FindFirstChildOfClass("Humanoid")
-                if hum then
-                    local dconn = hum.Died:Connect(function()
-                        cycleDead[pl] = true
-                        assignTargetsForPAA()
-                        checkCycleCompletionAndMaybeRestart()
-                        scheduleCycleRestart()
-                    end)
-                    table.insert(cycleConns, dconn)
-                end
-            end
-            if pl.Character then attachHumanoidWatcher(pl.Character) end
-            local cconn = pl.CharacterAdded:Connect(attachHumanoidWatcher)
-            table.insert(cycleConns, cconn)
-            local rconn = pl.AncestryChanged:Connect(function()
-                if not pl.Parent then
-                    for i = #cyclePlayers, 1, -1 do
-                        if cyclePlayers[i] == pl then table.remove(cyclePlayers, i) end
-                    end
-                    cycleDead[pl] = true
-                    assignTargetsForPAA()
-                    checkCycleCompletionAndMaybeRestart()
-                    scheduleCycleRestart()
-                end
-            end)
-            table.insert(cycleConns, rconn)
         end
     end
     assignTargetsForPAA()
@@ -1750,11 +1453,13 @@ local function tryStartCycleIfNeeded()
 end
 
 local function endCycleMode()
-    stopCycle()
+    cycleActive = false
+    cyclePlayers = {}
+    cycleDead = {}
 end
 
 local function resetCycleNow()
-    stopCycle()
+    endCycleMode()
     startCycleSnapshot()
 end
 
@@ -1764,73 +1469,9 @@ function startRebalancer()
     spawn(function()
         while rebalancerRunning do
             local bhCount = #extraBlackHoles
-            local parts = {}
-            for p, _ in pairs(processedParts) do
-                if p and p.Parent then
-                    local ap = p:FindFirstChildOfClass("AlignPosition")
-                    if ap then
-                        pcall(function()
-                            local isMass = (pcall(function() return p.Massless end) and p.Massless)
-                            ap.MaxForce = PULL_MAX_FORCE * (isMass and MASSLESS_PULL_SCALE or 1)
-                            ap.Responsiveness = PULL_RESPONSIVENESS * (isMass and MASSLESS_RESP_SCALE or 1)
-                        end)
-                        table.insert(parts, p)
-                    else
-                        ForcePart(p)
-                        local ap2 = p:FindFirstChildOfClass("AlignPosition")
-                        if ap2 then
-                            pcall(function()
-                                local isMass = (pcall(function() return p.Massless end) and p.Massless)
-                                ap2.MaxForce = PULL_MAX_FORCE * (isMass and MASSLESS_PULL_SCALE or 1)
-                                ap2.Responsiveness = PULL_RESPONSIVENESS * (isMass and MASSLESS_RESP_SCALE or 1)
-                            end)
-                            table.insert(parts, p)
-                        end
-                    end
-                end
+            if bhCount > 0 then
+                assignTargetsForPAA()
             end
-
-            if bhCount > 0 and #parts > 0 then
-                local total = #parts
-                local base = math.floor(total / bhCount)
-                local rem = total - (base * bhCount)
-                local counts = {}
-                for i = 1, bhCount do counts[i] = base + (i <= rem and 1 or 0) end
-                local partIndex = 1
-                for i = 1, bhCount do
-                    local bh = extraBlackHoles[i]
-                    local need = counts[i]
-                    for c = 1, need do
-                        local p = parts[partIndex]
-                        if not p then break end
-                        local ap = p:FindFirstChildOfClass("AlignPosition")
-                        if ap then
-                            if bh and bh.Attachment and bh._active then
-                                ap.Attachment1 = bh.Attachment
-                                p.CanCollide = false
-                                table.insert(bh.AssignedParts, p)
-                                
-                                if tweenWeldSpinActive then
-                                    applyTweenWeldSpin(p, bh.Attachment)
-                                    setupSpinning(p)
-                                end
-                            else
-                                ap.Attachment1 = Attachment1
-                                p.CanCollide = false
-                            end
-                        end
-                        partIndex = partIndex + 1
-                    end
-                end
-            else
-                for _, p in ipairs(parts) do
-                    local ap = p:FindFirstChildOfClass("AlignPosition")
-                    if ap then ap.Attachment1 = Attachment1; p.CanCollide = false end
-                end
-            end
-
-            if PAAEnabled then assignTargetsForPAA() end
-            if cycleRestartPending then scheduleCycleRestart() end
             wait(rebalancerFreq)
         end
     end)
@@ -1861,13 +1502,9 @@ local function startPrimaryLoop()
                 local selectedPlayers = getSelectedPlayers(true)
                 if #selectedPlayers > 0 then
                     targetPlayer = selectedPlayers[math.random(1, #selectedPlayers)]
-                else
-                    targetPlayer = nil
                 end
             elseif targetAllActive then
                 targetPlayer = getRandomPlayer()
-            else
-                targetPlayer = nil
             end
 
             if targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") and isPlayerAlive(targetPlayer) then
@@ -1876,15 +1513,14 @@ local function startPrimaryLoop()
                 local speed = vel.Magnitude
                 local dir = (speed > 0.5) and vel.Unit or hrp.CFrame.LookVector
                 local amplitude = clamp(speed * BH_AMPLITUDE_FACTOR, BH_MIN_AMPLITUDE, BH_MAX_AMPLITUDE)
-                local phase = phaseT * (2 * math.pi * (1 / (0.01 * 2)))
-                local primaryOffset = dir * (math.sin(phase) * amplitude)
+                local phase = phaseT * (2 * math.pi * 50)
+                local offset = dir * (math.sin(phase) * amplitude)
                 local lateral = hrp.CFrame.RightVector * (math.sin(phase * 1.27) * amplitude * 0.35)
-                local vertical = hrp.CFrame.UpVector * (math.sin(phase * 1.0) * amplitude * 0.5)
-                local targetCFrame = hrp.CFrame * CFrame.new(primaryOffset + lateral + vertical)
+                local vertical = hrp.CFrame.UpVector * (math.sin(phase) * amplitude * 0.5)
+                local targetCFrame = hrp.CFrame * CFrame.new(offset + lateral + vertical)
                 if Attachment1 then
-                    local success, cur = pcall(function() return Attachment1.WorldCFrame end)
-                    local curCF = success and cur or Attachment1.WorldCFrame or hrp.CFrame
-                    Attachment1.WorldCFrame = smoothLerpCFrame(curCF, targetCFrame, dt)
+                    local cur = Attachment1.WorldCFrame or hrp.CFrame
+                    Attachment1.WorldCFrame = cur:Lerp(targetCFrame, clamp(1 - math.exp(-TARGET_SMOOTHNESS * dt), 0.01, 1))
                 end
             end
             wait(switchDelay)
@@ -1892,96 +1528,52 @@ local function startPrimaryLoop()
 
         primaryLoopRunning = false
         antiTamperActive = false
-        if unanchorTimerRunning and unanchorCoroutine then
-            unanchorTimerRunning = false
-            for part, anchored in pairs(initiallyAnchoredParts) do
-                if part and part.Parent and anchored == false then
-                    part.Anchored = false
-                    ForcePart(part)
-                end
-            end
-        end
-        clearProcessedParts()
         if PAAEnabled then deleteBHsBySource("PAA") end
     end)
 end
 
 local function setTargetAll(value)
     targetAllActive = value
-    if (targetAllActive or targetSelectedActive) then 
-        startPrimaryLoop()
-        antiTamperActive = true
-    end
+    if value then startPrimaryLoop() end
     if CycleMode then
-        if targetAllActive then tryStartCycleIfNeeded() else endCycleMode() end
+        if value then tryStartCycleIfNeeded() else endCycleMode() end
     end
-    if PAAEnabled then
-        if targetAllActive then
-            PAA_isUsingSelected = false
-            refreshPAA()
-            if #paaConnections == 0 then
-                paaConnections[#paaConnections+1] = Players.PlayerAdded:Connect(onPlayerAddedForPAA)
-                paaConnections[#paaConnections+1] = Players.PlayerRemoving:Connect(onPlayerRemovingForPAA)
-            end
-        else
-            deleteBHsBySource("PAA")
-        end
+    if PAAEnabled and value then
+        PAA_isUsingSelected = false
+        refreshPAA()
+    elseif PAAEnabled and not value then
+        deleteBHsBySource("PAA")
     end
 end
 
 local function setTargetSelected(value)
     targetSelectedActive = value
-    if (targetAllActive or targetSelectedActive) then 
-        startPrimaryLoop()
-        antiTamperActive = true
-    end
+    if value then startPrimaryLoop() end
     if CycleMode then
-        if targetSelectedActive then tryStartCycleIfNeeded() else endCycleMode() end
+        if value then tryStartCycleIfNeeded() else endCycleMode() end
     end
-    if PAAEnabled then
-        if targetSelectedActive then
-            PAA_isUsingSelected = true
-            refreshPAA()
-            if #paaConnections == 0 then
-                paaConnections[#paaConnections+1] = Players.PlayerAdded:Connect(onPlayerAddedForPAA)
-                paaConnections[#paaConnections+1] = Players.PlayerRemoving:Connect(onPlayerRemovingForPAA)
-            end
-        else
-            deleteBHsBySource("PAA")
-        end
+    if PAAEnabled and value then
+        PAA_isUsingSelected = true
+        refreshPAA()
+    elseif PAAEnabled and not value then
+        deleteBHsBySource("PAA")
     end
 end
 
-local function onCharacterAdded(character)
-    if (targetAllActive or targetSelectedActive) then
-        processedParts = {}
-        processWorkspaceParts()
-    end
-end
-
-Players.LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
-
--- ====== ANTI-TAMPER GLOBAL MONITOR ======
+-- ====== ANTI-TAMPER GLOBAL MONITOR (Lightweight) ======
 local globalTamperConn = Workspace.DescendantAdded:Connect(function(instance)
     if not antiTamperActive then return end
-    if not instance:IsA("BasePart") then
-        local parent = instance.Parent
-        while parent do
-            if parent:IsA("BasePart") then
-                if processedParts[parent] or individualPartsData[parent] then
-                    if not isScriptOwned(instance) then
-                        if instance:IsA("Attachment") or instance:IsA("AlignPosition") 
-                           or instance:IsA("Torque") or instance:IsA("BodyMover")
-                           or instance:IsA("Weld") or instance:IsA("WeldConstraint")
-                           or instance:IsA("Snap") or instance:IsA("HingeConstraint")
-                           or instance:IsA("VectorForce") or instance:IsA("AngularVelocity") then
-                            pcall(function() instance:Destroy() end)
-                        end
-                    end
-                end
-                break
+    -- Only check attachments/constraints being added TO our parts
+    local parent = instance.Parent
+    if parent and parent:IsA("BasePart") then
+        if processedParts[parent] or individualPartsData[parent] then
+            if not isScriptOwned(instance) and (
+                instance:IsA("Attachment") or instance:IsA("AlignPosition") 
+                or instance:IsA("Torque") or instance:IsA("BodyMover")
+                or instance:IsA("Weld") or instance:IsA("WeldConstraint")
+            ) then
+                pcall(function() instance:Destroy() end)
             end
-            parent = parent.Parent
         end
     end
 end)
@@ -2001,12 +1593,11 @@ local function setToggleState(name, value)
 end
 
 -- ====== CUSTOM GUI ======
-
--- Main GUI container
 local gui = Instance.new("ScreenGui")
 gui.Name = "BlackHoleGUI"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
 
 local success, err = pcall(function()
     gui.Parent = CoreGui
@@ -2015,7 +1606,6 @@ if not success then
     gui.Parent = localPlayer:WaitForChild("PlayerGui")
 end
 
--- Color scheme
 local COLORS = {
     Background = Color3.fromRGB(20, 20, 30),
     Header = Color3.fromRGB(30, 30, 45),
@@ -2030,13 +1620,14 @@ local COLORS = {
     Accent = Color3.fromRGB(100, 150, 255),
     SectionHeader = Color3.fromRGB(50, 50, 70),
     ReopenBtn = Color3.fromRGB(40, 60, 120),
+    LagWarning = Color3.fromRGB(200, 80, 80),
 }
 
--- Reopen button (tiny draggable button at top)
+-- Reopen button
 local reopenBtn = Instance.new("TextButton")
 reopenBtn.Name = "ReopenBtn"
-reopenBtn.Size = UDim2.new(0, 50, 0, 20)
-reopenBtn.Position = UDim2.new(0.5, -25, 0, 0)
+reopenBtn.Size = UDim2.new(0, 55, 0, 22)
+reopenBtn.Position = UDim2.new(0.5, -27, 0, 2)
 reopenBtn.BackgroundColor3 = COLORS.ReopenBtn
 reopenBtn.Text = "☰ BH"
 reopenBtn.TextColor3 = COLORS.Text
@@ -2046,8 +1637,9 @@ reopenBtn.BorderSizePixel = 0
 reopenBtn.BackgroundTransparency = 0.3
 reopenBtn.Active = true
 reopenBtn.Draggable = true
-reopenBtn.Visible = false  -- Hidden by default since GUI starts open
+reopenBtn.Visible = false
 reopenBtn.Parent = gui
+reopenBtn.ZIndex = 10
 
 local reopenCorner = Instance.new("UICorner")
 reopenCorner.CornerRadius = UDim.new(0, 4)
@@ -2060,29 +1652,16 @@ reopenBtn.MouseLeave:Connect(function()
     reopenBtn.BackgroundTransparency = 0.3
 end)
 
--- ====== MAIN GUI CONSTRUCTION ======
-
 -- Main frame
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 320, 0, 500)
-mainFrame.Position = UDim2.new(0, 50, 0, 100)
+mainFrame.Size = UDim2.new(0, 280, 0, 420) -- Smaller default size
+mainFrame.Position = UDim2.new(0, 50, 0, 80)
 mainFrame.BackgroundColor3 = COLORS.Background
 mainFrame.BorderSizePixel = 0
 mainFrame.Active = true
 mainFrame.Draggable = true
 mainFrame.Parent = gui
-
--- Shadow
-local shadow = Instance.new("Frame")
-shadow.Name = "Shadow"
-shadow.Size = UDim2.new(1, 6, 1, 6)
-shadow.Position = UDim2.new(0, -3, 0, -3)
-shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-shadow.BackgroundTransparency = 0.6
-shadow.BorderSizePixel = 0
-shadow.ZIndex = -1
-shadow.Parent = mainFrame
 
 local mainCorner = Instance.new("UICorner")
 mainCorner.CornerRadius = UDim.new(0, 6)
@@ -2091,7 +1670,7 @@ mainCorner.Parent = mainFrame
 -- Header
 local header = Instance.new("Frame")
 header.Name = "Header"
-header.Size = UDim2.new(1, 0, 0, 38)
+header.Size = UDim2.new(1, 0, 0, 34)
 header.BackgroundColor3 = COLORS.Header
 header.BorderSizePixel = 0
 header.Parent = mainFrame
@@ -2108,27 +1687,46 @@ headerBottomRect.BorderSizePixel = 0
 headerBottomRect.Parent = header
 
 local titleLabel = Instance.new("TextLabel")
-titleLabel.Name = "Title"
 titleLabel.Size = UDim2.new(1, -40, 1, 0)
-titleLabel.Position = UDim2.new(0, 10, 0, 0)
+titleLabel.Position = UDim2.new(0, 8, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "Black Hole Controller"
+titleLabel.Text = "BH Controller"
 titleLabel.TextColor3 = COLORS.Text
 titleLabel.Font = Enum.Font.GothamBold
-titleLabel.TextSize = 15
+titleLabel.TextSize = 14
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
 titleLabel.Parent = header
 
+-- Lag indicator
+local lagIndicator = Instance.new("Frame")
+lagIndicator.Name = "LagIndicator"
+lagIndicator.Size = UDim2.new(0, 8, 0, 8)
+lagIndicator.Position = UDim2.new(1, -40, 0.5, -4)
+lagIndicator.BackgroundColor3 = COLORS.ToggleOn
+lagIndicator.BorderSizePixel = 0
+lagIndicator.Parent = header
+
+local lagCorner = Instance.new("UICorner")
+lagCorner.CornerRadius = UDim.new(0, 4)
+lagCorner.Parent = lagIndicator
+
+-- Update lag indicator
+spawn(function()
+    while true do
+        lagIndicator.BackgroundColor3 = PERFORMANCE_MODE and COLORS.LagWarning or COLORS.ToggleOn
+        wait(1)
+    end
+end)
+
 -- Close button
 local closeBtn = Instance.new("TextButton")
-closeBtn.Name = "CloseBtn"
-closeBtn.Size = UDim2.new(0, 28, 0, 28)
-closeBtn.Position = UDim2.new(1, -34, 0, 5)
+closeBtn.Size = UDim2.new(0, 24, 0, 24)
+closeBtn.Position = UDim2.new(1, -30, 0, 5)
 closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
 closeBtn.Text = "X"
 closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 14
+closeBtn.TextSize = 13
 closeBtn.BorderSizePixel = 0
 closeBtn.Parent = header
 
@@ -2141,68 +1739,59 @@ closeBtn.MouseButton1Click:Connect(function()
     reopenBtn.Visible = true
 end)
 
--- Reopen button logic
 reopenBtn.MouseButton1Click:Connect(function()
     mainFrame.Visible = true
     reopenBtn.Visible = false
 end)
 
--- Tab buttons container
+-- Tab bar
 local tabBar = Instance.new("Frame")
-tabBar.Name = "TabBar"
-tabBar.Size = UDim2.new(1, 0, 0, 36)
-tabBar.Position = UDim2.new(0, 0, 0, 38)
+tabBar.Size = UDim2.new(1, 0, 0, 32)
+tabBar.Position = UDim2.new(0, 0, 0, 34)
 tabBar.BackgroundColor3 = COLORS.Background
 tabBar.BorderSizePixel = 0
 tabBar.Parent = mainFrame
 
 -- Content area
 local contentFrame = Instance.new("Frame")
-contentFrame.Name = "Content"
-contentFrame.Size = UDim2.new(1, 0, 1, -(38 + 36))
-contentFrame.Position = UDim2.new(0, 0, 0, 38 + 36)
+contentFrame.Size = UDim2.new(1, 0, 1, -(34 + 32))
+contentFrame.Position = UDim2.new(0, 0, 0, 34 + 32)
 contentFrame.BackgroundColor3 = COLORS.Background
 contentFrame.BorderSizePixel = 0
 contentFrame.Parent = mainFrame
 
--- ScrollingFrame for content
 local scrollingFrame = Instance.new("ScrollingFrame")
-scrollingFrame.Name = "ScrollingContent"
 scrollingFrame.Size = UDim2.new(1, 0, 1, 0)
 scrollingFrame.BackgroundTransparency = 1
 scrollingFrame.BorderSizePixel = 0
-scrollingFrame.ScrollBarThickness = 4
+scrollingFrame.ScrollBarThickness = 3
 scrollingFrame.ScrollBarImageColor3 = COLORS.Accent
 scrollingFrame.Parent = contentFrame
 
 local uiListLayout = Instance.new("UIListLayout")
-uiListLayout.Name = "ContentLayout"
-uiListLayout.Padding = UDim.new(0, 4)
+uiListLayout.Padding = UDim.new(0, 3)
 uiListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
 uiListLayout.Parent = scrollingFrame
 
 local uiPadding = Instance.new("UIPadding")
-uiPadding.PaddingLeft = UDim.new(0, 6)
-uiPadding.PaddingRight = UDim.new(0, 6)
-uiPadding.PaddingTop = UDim.new(0, 6)
-uiPadding.PaddingBottom = UDim.new(0, 6)
+uiPadding.PaddingLeft = UDim.new(0, 5)
+uiPadding.PaddingRight = UDim.new(0, 5)
+uiPadding.PaddingTop = UDim.new(0, 5)
+uiPadding.PaddingBottom = UDim.new(0, 5)
 uiPadding.Parent = scrollingFrame
 
--- Tab state
 local currentTab = "Toggles"
 local tabButtons = {}
 
--- Function to create a tab button
 local function createTabButton(name, icon)
     local tabBtn = Instance.new("TextButton")
-    tabBtn.Name = name .. "Tab"
-    tabBtn.Size = UDim2.new(0.5, -2, 0, 32)
-    tabBtn.Position = UDim2.new(#tabButtons * 0.5, 2, 0, 2)
+    tabBtn.Size = UDim2.new(0.5, -1, 0, 28)
+    tabBtn.Position = UDim2.new(#tabButtons * 0.5, 1, 0, 2)
     tabBtn.BackgroundColor3 = COLORS.TabInactive
     tabBtn.Text = icon .. " " .. name
     tabBtn.TextColor3 = COLORS.TextDim
     tabBtn.Font = Enum.Font.GothamSemibold
-    tabBtn.TextSize = 13
+    tabBtn.TextSize = 12
     tabBtn.BorderSizePixel = 0
     tabBtn.Parent = tabBar
     
@@ -2219,18 +1808,13 @@ local function createTabButton(name, icon)
         tabBtn.BackgroundColor3 = COLORS.TabActive
         tabBtn.TextColor3 = COLORS.Text
         
-        -- Clear and rebuild
         for _, child in ipairs(scrollingFrame:GetChildren()) do
             if child ~= uiListLayout and child ~= uiPadding then
                 child:Destroy()
             end
         end
         
-        if name == "Toggles" then
-            buildTogglesTab()
-        else
-            buildActionsTab()
-        end
+        if name == "Toggles" then buildTogglesTab() else buildActionsTab() end
     end)
     
     table.insert(tabButtons, tabBtn)
@@ -2239,15 +1823,12 @@ end
 
 createTabButton("Toggles", "⚙")
 createTabButton("Actions", "⚡")
-
 tabButtons[1].BackgroundColor3 = COLORS.TabActive
 tabButtons[1].TextColor3 = COLORS.Text
 
--- Create section label
 local function createSectionLabel(name)
     local sectionFrame = Instance.new("Frame")
-    sectionFrame.Name = "Section_" .. name
-    sectionFrame.Size = UDim2.new(1, -10, 0, 24)
+    sectionFrame.Size = UDim2.new(1, -8, 0, 22)
     sectionFrame.BackgroundColor3 = COLORS.SectionHeader
     sectionFrame.BorderSizePixel = 0
     sectionFrame.Parent = scrollingFrame
@@ -2257,27 +1838,23 @@ local function createSectionLabel(name)
     sectionCorner.Parent = sectionFrame
     
     local sectionLabel = Instance.new("TextLabel")
-    sectionLabel.Size = UDim2.new(1, -10, 1, 0)
-    sectionLabel.Position = UDim2.new(0, 8, 0, 0)
+    sectionLabel.Size = UDim2.new(1, -8, 1, 0)
+    sectionLabel.Position = UDim2.new(0, 6, 0, 0)
     sectionLabel.BackgroundTransparency = 1
     sectionLabel.Text = name
     sectionLabel.TextColor3 = COLORS.Text
     sectionLabel.Font = Enum.Font.GothamBold
-    sectionLabel.TextSize = 13
+    sectionLabel.TextSize = 12
     sectionLabel.TextXAlignment = Enum.TextXAlignment.Left
     sectionLabel.Parent = sectionFrame
-    
-    return sectionFrame
 end
 
--- Create toggle (with persistent state)
 local function createToggle(name, defaultVal, callback)
     local stateKey = name
     local initialState = getToggleState(stateKey, defaultVal)
     
     local toggleFrame = Instance.new("Frame")
-    toggleFrame.Name = "Toggle_" .. name
-    toggleFrame.Size = UDim2.new(1, -10, 0, 32)
+    toggleFrame.Size = UDim2.new(1, -8, 0, 28)
     toggleFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 38)
     toggleFrame.BorderSizePixel = 0
     toggleFrame.Parent = scrollingFrame
@@ -2287,40 +1864,38 @@ local function createToggle(name, defaultVal, callback)
     toggleCorner.Parent = toggleFrame
     
     local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -50, 1, 0)
-    label.Position = UDim2.new(0, 10, 0, 0)
+    label.Size = UDim2.new(1, -44, 1, 0)
+    label.Position = UDim2.new(0, 8, 0, 0)
     label.BackgroundTransparency = 1
     label.Text = name
     label.TextColor3 = COLORS.Text
     label.Font = Enum.Font.Gotham
-    label.TextSize = 12
+    label.TextSize = 11
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextTruncate = Enum.TextTruncate.AtEnd
     label.Parent = toggleFrame
     
     local toggleBtn = Instance.new("TextButton")
-    toggleBtn.Name = "ToggleBtn"
-    toggleBtn.Size = UDim2.new(0, 36, 0, 20)
-    toggleBtn.Position = UDim2.new(1, -44, 0.5, -10)
+    toggleBtn.Size = UDim2.new(0, 32, 0, 18)
+    toggleBtn.Position = UDim2.new(1, -38, 0.5, -9)
     toggleBtn.BackgroundColor3 = initialState and COLORS.ToggleOn or COLORS.ToggleOff
     toggleBtn.Text = ""
     toggleBtn.BorderSizePixel = 0
     toggleBtn.Parent = toggleFrame
     
     local toggleCornerBtn = Instance.new("UICorner")
-    toggleCornerBtn.CornerRadius = UDim.new(0, 10)
+    toggleCornerBtn.CornerRadius = UDim.new(0, 9)
     toggleCornerBtn.Parent = toggleBtn
     
     local toggleIndicator = Instance.new("Frame")
-    toggleIndicator.Name = "Indicator"
-    toggleIndicator.Size = UDim2.new(0, 16, 0, 16)
-    toggleIndicator.Position = UDim2.new(initialState and 1 or 0, initialState and -18 or 2, 0.5, -8)
+    toggleIndicator.Size = UDim2.new(0, 14, 0, 14)
+    toggleIndicator.Position = UDim2.new(initialState and 1 or 0, initialState and -16 or 2, 0.5, -7)
     toggleIndicator.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     toggleIndicator.BorderSizePixel = 0
     toggleIndicator.Parent = toggleBtn
     
     local indicatorCorner = Instance.new("UICorner")
-    indicatorCorner.CornerRadius = UDim.new(0, 8)
+    indicatorCorner.CornerRadius = UDim.new(0, 7)
     indicatorCorner.Parent = toggleIndicator
     
     local toggled = initialState
@@ -2328,10 +1903,10 @@ local function createToggle(name, defaultVal, callback)
     local function updateVisual()
         toggleBtn.BackgroundColor3 = toggled and COLORS.ToggleOn or COLORS.ToggleOff
         toggleIndicator:TweenPosition(
-            UDim2.new(toggled and 1 or 0, toggled and -18 or 2, 0.5, -8),
+            UDim2.new(toggled and 1 or 0, toggled and -16 or 2, 0.5, -7),
             Enum.EasingDirection.InOut,
             Enum.EasingStyle.Quad,
-            0.15,
+            0.12,
             true
         )
     end
@@ -2343,38 +1918,26 @@ local function createToggle(name, defaultVal, callback)
         pcall(callback, toggled)
     end)
     
-    -- Fire initial callback with restored state
     if initialState ~= defaultVal then
         pcall(callback, initialState)
     end
     
-    return {
-        frame = toggleFrame,
-        set = function(val)
-            toggled = val
-            setToggleState(stateKey, val)
-            updateVisual()
-        end,
-        get = function() return toggled end
-    }
+    return {frame = toggleFrame, set = function(val) toggled = val; setToggleState(stateKey, val); updateVisual() end, get = function() return toggled end}
 end
 
--- Create button
 local function createActionButton(name, callback, color)
     local btnFrame = Instance.new("Frame")
-    btnFrame.Name = "Btn_" .. name
-    btnFrame.Size = UDim2.new(1, -10, 0, 36)
+    btnFrame.Size = UDim2.new(1, -8, 0, 32)
     btnFrame.BackgroundTransparency = 1
     btnFrame.Parent = scrollingFrame
     
     local btn = Instance.new("TextButton")
-    btn.Name = "Button"
     btn.Size = UDim2.new(1, 0, 1, 0)
     btn.BackgroundColor3 = color or COLORS.Button
     btn.Text = name
     btn.TextColor3 = COLORS.Text
     btn.Font = Enum.Font.GothamSemibold
-    btn.TextSize = 13
+    btn.TextSize = 12
     btn.BorderSizePixel = 0
     btn.Parent = btnFrame
     
@@ -2384,33 +1947,28 @@ local function createActionButton(name, callback, color)
     
     btn.MouseEnter:Connect(function()
         btn.BackgroundColor3 = COLORS.ButtonHover
+        btn.TextSize = 12.5
     end)
     btn.MouseLeave:Connect(function()
         btn.BackgroundColor3 = color or COLORS.Button
+        btn.TextSize = 12
     end)
     
     btn.MouseButton1Click:Connect(function()
+        if respawnGuard then return end -- Block clicks during respawn
         pcall(callback)
     end)
     
     return btnFrame
 end
 
--- Build Toggles tab
 function buildTogglesTab()
     createSectionLabel("Main Controls")
-    
-    createToggle("Unanchored Target All", false, function(val)
-        setTargetAll(val)
-    end)
-    
-    createToggle("Target Selected Players", false, function(val)
-        setTargetSelected(val)
-    end)
-    
+    createToggle("Unanchored Target All", false, function(val) setTargetAll(val) end)
+    createToggle("Target Selected Players", false, function(val) setTargetSelected(val) end)
     createToggle("Individual Parts", false, function(val)
         IndividualPartsEnabled = val
-        if IndividualPartsEnabled then
+        if val then
             if not targetAllActive and not targetSelectedActive then
                 IndividualPartsEnabled = false
                 return
@@ -2420,52 +1978,40 @@ function buildTogglesTab()
             stopIndividualParts()
         end
     end)
-    
     createToggle("Cycle", false, function(val)
         CycleMode = val
-        if CycleMode then
-            tryStartCycleIfNeeded()
-        else
-            endCycleMode()
-        end
+        if val then tryStartCycleIfNeeded() else endCycleMode() end
     end)
     
-    createSectionLabel("Extra Settings")
-    
-    createToggle("PAA (player amount BHs)", false, function(val)
+    createSectionLabel("Extra")
+    createToggle("PAA (player BHs)", false, function(val)
         PAAEnabled = val
-        if PAAEnabled then
+        if val then
             PAA_isUsingSelected = false
             refreshPAA()
-            paaConnections[#paaConnections+1] = Players.PlayerAdded:Connect(onPlayerAddedForPAA)
-            paaConnections[#paaConnections+1] = Players.PlayerRemoving:Connect(onPlayerRemovingForPAA)
+            table.insert(paaConnections, Players.PlayerRemoving:Connect(onPlayerRemovingForPAA))
         else
             for _, c in ipairs(paaConnections) do pcall(function() c:Disconnect() end) end
             paaConnections = {}
             deleteBHsBySource("PAA")
         end
     end)
-    
-    createToggle("Skidding (0.1s fwd/back)", SkiddingEnabled, function(val)
+    createToggle("Skidding", SkiddingEnabled, function(val)
         SkiddingEnabled = val
-        if not SkiddingEnabled then
-            for _, bh in ipairs(extraBlackHoles) do
-                if bh then bh.skidAccumulator = 0; bh.skidState = 0 end
-            end
-        else
-            for _, bh in ipairs(extraBlackHoles) do
-                if bh then bh.skidAccumulator = 0; bh.skidState = 1 end
-            end
+        for _, bh in ipairs(extraBlackHoles) do
+            if bh then bh.skidAccumulator = 0; bh.skidState = val and 1 or 0 end
         end
     end)
-    
-    createToggle("Continuous Loop Check", false, function(val)
+    createToggle("Loop Check", false, function(val)
         loopCheckActive = val
-        if loopCheckActive then
+        if val then
             spawn(function()
                 while loopCheckActive do
                     if targetAllActive or targetSelectedActive then
+                        local count = 0
                         for _, v in ipairs(Workspace:GetDescendants()) do
+                            count = count + 1
+                            if count > 200 then wait(); count = 0 end
                             if v:IsA("BasePart") and not v.Anchored and not processedParts[v] and not isPartPlayerCharacter(v) and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character)) then
                                 if initiallyMasslessParts[v] == nil then pcall(function() initiallyMasslessParts[v] = v.Massless end) end
                                 pcall(function() v.Massless = true end)
@@ -2473,26 +2019,25 @@ function buildTogglesTab()
                             end
                         end
                     end
-                    wait(0.5)
+                    wait(1)
                 end
             end)
         end
     end)
 end
 
--- Build Actions tab
 function buildActionsTab()
     createSectionLabel("Gathering")
-    
     createActionButton("Gather Parts", function()
-        runGatherParts()
+        if not gatherPartsActive then
+            runGatherParts()
+        end
     end, Color3.fromRGB(50, 180, 80))
     
-    createSectionLabel("Tween / Weld / Spin")
-    
+    createSectionLabel("Tween/Weld/Spin")
     createToggle("Tween/Weld/Spin Parts", false, function(val)
         tweenWeldSpinActive = val
-        if tweenWeldSpinActive then
+        if val then
             for part, _ in pairs(processedParts) do
                 if part and part.Parent then
                     local ap = part:FindFirstChildOfClass("AlignPosition")
@@ -2509,35 +2054,27 @@ function buildActionsTab()
             end
         else
             for _, weld in ipairs(scriptOwnedWelds) do
-                if weld and weld.Parent then
-                    pcall(function() weld:Destroy() end)
-                end
+                if weld and weld.Parent then pcall(function() weld:Destroy() end) end
             end
             scriptOwnedWelds = {}
         end
     end)
     
-    createSectionLabel("Cycle Controls")
+    createSectionLabel("Cycle")
+    createActionButton("Reset Cycle", function() resetCycleNow() end, Color3.fromRGB(200, 120, 50))
     
-    createActionButton("Reset Cycle", function()
-        resetCycleNow()
-    end, Color3.fromRGB(200, 120, 50))
-    
-    createSectionLabel("External Scripts")
-    
-    createActionButton("Load Player List Script", function()
+    createSectionLabel("Scripts")
+    createActionButton("Player List", function()
         loadstring(game:HttpGet("https://raw.githubusercontent.com/Jlchris1/Udklol/refs/heads/main/Playerlistv6"))()
     end, Color3.fromRGB(100, 80, 180))
-    
-    createActionButton("Telekinesis / Fix Target", function()
+    createActionButton("Telekinesis", function()
         loadstring(game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true))()
     end, Color3.fromRGB(100, 80, 180))
 end
 
--- Initial build
 buildTogglesTab()
 
--- ====== BACKGROUND LOOPS ======
+-- ====== BACKGROUND LOOPS (Optimized) ======
 spawn(function()
     while true do
         if PAAEnabled then
@@ -2547,7 +2084,7 @@ spawn(function()
                 if targetAllActive then refreshPAA() end
             end
         end
-        wait(2)
+        wait(3) -- Was 2
     end
 end)
 
@@ -2555,8 +2092,7 @@ spawn(function()
     while true do
         if #extraBlackHoles > 0 and not rebalancerRunning then startRebalancer()
         elseif #extraBlackHoles == 0 and rebalancerRunning then stopRebalancer() end
-        if cycleRestartPending then scheduleCycleRestart() end
-        wait(0.5)
+        wait(1)
     end
 end)
 
