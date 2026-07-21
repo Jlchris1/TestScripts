@@ -27,18 +27,15 @@ local function clamp(val, a, b)
 end
 
 -- ====== ANTI-PROPERTY-ADJUSTMENT SYSTEM ======
--- Nullifies any property changes (attachments, welds, velocity, torque, cframe, etc.)
--- that aren't triggered by this script's BH system
 local bhScriptGuid = "ÆS_BH_SCRIPT_" .. tostring(math.random(100000, 999999))
-local bhOwnedInstances = {}  -- set of instances we created
-local bhOwnedInstanceGuids = {}  -- instance -> guid
+local bhOwnedInstances = {}
+local bhOwnedInstanceGuids = {}
 
 local function markAsBHOwned(instance)
     if not instance then return end
     local guid = bhScriptGuid .. "_" .. tostring(math.random(1000000, 9999999))
     bhOwnedInstances[instance] = true
     bhOwnedInstanceGuids[instance] = guid
-    -- Tag it so we can identify it later
     local att = Instance.new("StringValue", instance)
     att.Name = "ÆS_BH_Owned"
     att.Value = guid
@@ -50,7 +47,6 @@ local function isBHOwned(instance)
     return false
 end
 
--- Anti-tamper: monitor instances and nullify foreign changes
 local antiTamperConnections = {}
 local antiTamperActive = false
 
@@ -58,27 +54,23 @@ local function startAntiTamper()
     if antiTamperActive then return end
     antiTamperActive = true
     
-    -- Monitor for foreign attachments, welds, body movers being added to our parts
     antiTamperConnections[#antiTamperConnections + 1] = Workspace.DescendantAdded:Connect(function(descendant)
         if not antiTamperActive then return end
         if not descendant:IsA("BasePart") and not descendant:IsA("Constraint") 
            and not descendant:IsA("BodyMover") and not descendant:IsA("JointInstance")
            and not descendant:IsA("Attachment") then return end
         
-        -- Check if this descendant belongs to our BH system by looking at ancestry
         local parent = descendant.Parent
         while parent do
             if parent:IsA("BasePart") and isBHOwned(parent) then
-                return  -- Our own stuff, leave it
+                return
             end
             parent = parent.Parent
         end
         
-        -- If it's a part that has BH tags, check for foreign additions
         if descendant:IsA("BasePart") or descendant:IsA("Attachment") or descendant:IsA("Constraint") then
             local part = descendant:IsA("BasePart") and descendant or descendant:FindFirstAncestorOfClass("BasePart")
             if part and isBHOwned(part) then
-                -- Foreign modification detected! Nullify it
                 task.spawn(function()
                     pcall(function() descendant:Destroy() end)
                 end)
@@ -86,28 +78,22 @@ local function startAntiTamper()
         end
     end)
     
-    -- Monitor property changes on our parts
     antiTamperConnections[#antiTamperConnections + 1] = Workspace.DescendantPropertyChanged:Connect(function(descendant, property)
         if not antiTamperActive then return end
         if not descendant:IsA("BasePart") then return end
         if not isBHOwned(descendant) then return end
         
-        -- Only allow BH-owned changes
         if property == "CFrame" or property == "Position" or property == "Velocity" 
            or property == "RotVelocity" or property == "Anchored" or property == "Massless"
            or property == "CanCollide" or property == "Transparency" or property == "Size" then
-            -- These are fine, we change these
             return
         end
         
-        -- Revert any other property changes that aren't ours
-        -- This catches torque, angular velocity, etc.
         if property == "Torque" or property == "AngularVelocity" then
             pcall(function()
-                -- Let it pass if we set it, otherwise nullify
                 local stack = debug.traceback()
                 if not stack:find("ÆS_BH_Script") then
-                    local success, oldVal = pcall(function()
+                    pcall(function()
                         if property == "Torque" then return Vector3.new(0,0,0) end
                         if property == "AngularVelocity" then return Vector3.new(0,0,0) end
                     end)
@@ -142,24 +128,19 @@ local Attachment1 = nil
 
 local extraBlackHoles = {}
 
--- PAA state
 local PAAEnabled = false
 local PAA_isUsingSelected = false
 local paaConnections = {}
 
--- Rebalancer
 local rebalancerRunning = false
 local rebalancerFreq = 0.10
 
--- BH motion constants
 local BH_AMPLITUDE_FACTOR = 0.22
 local BH_MIN_AMPLITUDE = 0.6
 local BH_MAX_AMPLITUDE = 80
 local TARGET_SMOOTHNESS = 6.0
-
 local ROTATE_INTERVAL = 0.2
 
--- Cycle (was LifeCycleMode) state & helpers
 local CycleMode = false
 local cycleActive = false
 local cyclePlayers = {}
@@ -167,7 +148,6 @@ local cycleDead = {}
 local cycleConns = {}
 local cycleRestartPending = false
 
--- USER-REQUESTED VALUES (extreme)
 local BASE_FLING_AXIS = 1e6
 local BASE_PULL_FORCE = 1e8
 local BASE_PULL_RESP  = 1e6
@@ -185,14 +165,12 @@ local MASSLESS_TORQUE_SCALE = 1.0
 local MASSLESS_PULL_SCALE  = 1.0
 local MASSLESS_RESP_SCALE  = 1.2
 
--- SKIDDING toggle and params
 local SkiddingEnabled = true
 local SKID_STEP = 0.1
 local SKID_MIN_HALF_LENGTH = 0.5
 
--- ====== INDIVIDUAL PARTS MODE ======
 local IndividualPartsEnabled = false
-local individualPartsData = {}  -- [part] = { targetPlayer, attachment, alignPos, torque, thread, phase, targetAttachmentPart }
+local individualPartsData = {}
 local individualPartsActive = false
 local individualPartsLoopRunning = false
 local INDIVIDUAL_SWITCH_INTERVAL_BASE = 0.4
@@ -202,7 +180,6 @@ local INDIVIDUAL_ORBIT_RADIUS_BASE = 4
 local INDIVIDUAL_ORBIT_RADIUS_VARY = 3
 local INDIVIDUAL_VERTICAL_OSCILLATION = 3
 
--- Prediction helpers
 local playerVelBuffer = {}
 
 -- ====== GATHER PARTS SYSTEM ======
@@ -213,8 +190,8 @@ local gatherOriginalCFrame = nil
 local gatheredParts = {}
 
 local GATHER_INTERVAL = 0.01
-local GATHER_RADIUS = 500  -- Search radius
-local GATHER_ORBIT_SPEED = 20  -- Radians per second for spinning
+local GATHER_RADIUS = 500
+local GATHER_ORBIT_SPEED = 20
 
 local function isGatherablePart(part)
     if not part or not part:IsA("BasePart") then return false end
@@ -247,7 +224,6 @@ local function findFarthestPartFromLocal(exclude)
             if exclude and exclude[v] then return end
             
             local dist = getDistanceFromLocal(v.Position)
-            -- Check if this part is further from local than from any other player
             local isFartherFromLocal = true
             for _, pl in ipairs(Players:GetPlayers()) do
                 if pl ~= localPlayer and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
@@ -284,21 +260,19 @@ end
 
 local function weldPartsToAttachment(part, attachment, partAttachment)
     if not part or not attachment then return end
-    -- Create a weld to keep the part attached to the BH attachment target
     local weld = Instance.new("Weld")
-    weld.Part0 = attachment.Parent  -- The BH center part or target
+    weld.Part0 = attachment.Parent
     weld.Part1 = part
     weld.C0 = CFrame.new()
     weld.C1 = partAttachment and partAttachment.CFrame or part.CFrame:ToObjectSpace(attachment.WorldCFrame)
     weld.Parent = part
     markAsBHOwned(weld)
     
-    -- Rapidly spin the weld connection
     spawn(function()
         local startTime = tick()
         while gatherPartsActive and weld and weld.Parent do
             local elapsed = tick() - startTime
-            local spinAngle = elapsed * GATHER_ORBIT_SPEED * 10  -- Rapid spin
+            local spinAngle = elapsed * GATHER_ORBIT_SPEED * 10
             weld.C0 = CFrame.Angles(spinAngle, spinAngle * 1.3, spinAngle * 0.7)
             RunService.Heartbeat:Wait()
         end
@@ -311,26 +285,22 @@ local function startGatherParts()
     if gatherPartsActive then return end
     gatherPartsActive = true
     
-    -- Save original position
     local char = localPlayer.Character
     if char and char:FindFirstChild("HumanoidRootPart") then
         gatherOriginalPosition = char.HumanoidRootPart.Position
         gatherOriginalCFrame = char.HumanoidRootPart.CFrame
     end
     
-    -- Start anti-tamper
     startAntiTamper()
     
     gatheredParts = {}
     
-    -- Create a folder for gathered parts
     local gatherFolder = Workspace:FindFirstChild("ÆS_Gather_Folder")
     if not gatherFolder then
         gatherFolder = Instance.new("Folder", Workspace)
         gatherFolder.Name = "ÆS_Gather_Folder"
     end
     
-    -- Create a central gather point attachment
     local gatherCenter = Instance.new("Part", gatherFolder)
     gatherCenter.Name = "Gather_Center"
     gatherCenter.Anchored = true
@@ -343,28 +313,22 @@ local function startGatherParts()
     local gatherAtt = Instance.new("Attachment", gatherCenter)
     markAsBHOwned(gatherAtt)
     
-    -- Start the gathering loop
     gatherPartsRunning = true
     
-    -- Part 1: Rapidly TP to farthest parts and gather them
     spawn(function()
         while gatherPartsActive and gatherPartsRunning do
-            -- Find the part farthest from local player that's also farther from local than any other player
             local targetPart = findFarthestPartFromLocal(gatheredParts)
             
             if targetPart then
-                -- TP local player to the part
                 local char = localPlayer.Character
                 if char and char:FindFirstChild("HumanoidRootPart") then
                     char.HumanoidRootPart.CFrame = targetPart.CFrame * CFrame.new(0, 0, 3)
                     wait(0.01)
                 end
                 
-                -- Gather the part
                 if isGatherablePart(targetPart) and not gatheredParts[targetPart] then
                     gatheredParts[targetPart] = true
                     
-                    -- Record initial state
                     if initiallyAnchoredParts[targetPart] == nil then
                         initiallyAnchoredParts[targetPart] = targetPart.Anchored
                     end
@@ -372,19 +336,16 @@ local function startGatherParts()
                         initiallyMasslessParts[targetPart] = targetPart.Massless
                     end
                     
-                    -- Strip foreign forces
                     stripBodyForces(targetPart)
                     targetPart.Anchored = false
                     targetPart.CanCollide = false
                     targetPart.Massless = true
                     markAsBHOwned(targetPart)
                     
-                    -- Create attachment on part
                     local partAtt = Instance.new("Attachment", targetPart)
                     partAtt.WorldCFrame = targetPart.CFrame
                     markAsBHOwned(partAtt)
                     
-                    -- AlignPosition to gather center
                     local alignPos = Instance.new("AlignPosition", targetPart)
                     alignPos.Attachment0 = partAtt
                     alignPos.Attachment1 = gatherAtt
@@ -393,17 +354,14 @@ local function startGatherParts()
                     alignPos.Responsiveness = 50
                     markAsBHOwned(alignPos)
                     
-                    -- Torque for spinning
                     local torque = Instance.new("Torque", targetPart)
                     torque.Torque = Vector3.new(1e8, 1e8, 1e8)
                     torque.Attachment0 = partAtt
                     markAsBHOwned(torque)
                     
-                    -- Weld part to attachment for rigid connection while spinning
                     local weld = weldPartsToAttachment(targetPart, gatherAtt, partAtt)
                     gatheredParts[targetPart] = {part = targetPart, alignPos = alignPos, torque = torque, weld = weld}
                     
-                    -- Tween part to center
                     tweenPartToPos(targetPart, gatherCenter.Position + Vector3.new(
                         math.random(-5, 5),
                         math.random(0, 10),
@@ -411,7 +369,6 @@ local function startGatherParts()
                     ), 0.1)
                 end
             else
-                -- No more parts to gather, wait a bit
                 wait(0.05)
             end
             
@@ -419,17 +376,14 @@ local function startGatherParts()
         end
     end)
     
-    -- Part 2: Rapidly spin all gathered parts and attachments
     spawn(function()
         while gatherPartsActive and gatherPartsRunning do
-            -- Spin the gather center to make everything orbit
             if gatherCenter then
                 local currentCF = gatherCenter.CFrame
                 local spinSpeed = GATHER_ORBIT_SPEED * 5
                 gatherCenter.CFrame = currentCF * CFrame.Angles(0, spinSpeed * 0.016, 0)
             end
             
-            -- Update torque on all gathered parts for continuous spin
             for part, data in pairs(gatheredParts) do
                 if data and data.torque and data.torque.Parent then
                     local spinVary = Vector3.new(
@@ -445,15 +399,12 @@ local function startGatherParts()
         end
     end)
     
-    -- Part 3: After gathering, return to original position
     spawn(function()
-        wait(1.5)  -- Gather for 1.5 seconds
+        wait(1.5)
         if not gatherPartsActive then return end
         
-        -- Return local player to original position
         local char = localPlayer.Character
         if char and char:FindFirstChild("HumanoidRootPart") and gatherOriginalCFrame then
-            -- Tween back
             local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
             local goal = {CFrame = gatherOriginalCFrame}
             local tween = TweenService:Create(char.HumanoidRootPart, tweenInfo, goal)
@@ -461,10 +412,8 @@ local function startGatherParts()
             tween.Completed:Wait()
         end
         
-        -- Signal that gathering phase is done but keep parts spinning
         wait(0.5)
         
-        -- Stop gathering but keep parts attached
         gatherPartsRunning = false
         gatherPartsActive = false
     end)
@@ -474,13 +423,11 @@ local function stopGatherParts()
     gatherPartsActive = false
     gatherPartsRunning = false
     
-    -- Return player to original position if still out
     local char = localPlayer.Character
     if char and char:FindFirstChild("HumanoidRootPart") and gatherOriginalCFrame then
         char.HumanoidRootPart.CFrame = gatherOriginalCFrame
     end
     
-    -- Clean up gathered parts
     for part, data in pairs(gatheredParts) do
         pcall(function()
             if data and data.alignPos then data.alignPos:Destroy() end
@@ -495,7 +442,6 @@ local function stopGatherParts()
         end)
     end
     
-    -- Remove gather folder
     local gatherFolder = Workspace:FindFirstChild("ÆS_Gather_Folder")
     if gatherFolder then
         gatherFolder:Destroy()
@@ -802,7 +748,6 @@ local function reassignIndividualPart(part)
     data.verticalAmp = INDIVIDUAL_VERTICAL_OSCILLATION * (0.5 + math.random())
 end
 
--- Per-part flight thread
 local function startIndividualPartThread(part, data)
     data.thread = spawn(function()
         local timeAccum = 0
@@ -821,14 +766,12 @@ local function startIndividualPartThread(part, data)
                 
                 local predictedPos = predictTargetPosition(player, pos, vel, tick())
                 
-                -- Orbital motion
                 local phase = data.phase + timeAccum * data.orbitSpeed
                 local radius = data.orbitRadius * (1 + 0.3 * math.sin(timeAccum * 0.7 + data.phase))
                 local orbitX = math.cos(phase) * radius
                 local orbitZ = math.sin(phase * 0.8) * radius * 0.7
                 local verticalOffset = math.sin(timeAccum * 1.3 + data.phase * 1.7) * data.verticalAmp
                 
-                -- Chaos based on player speed
                 local chaosFactor = clamp(speed * 0.1, 0, 3)
                 local chaosX = math.sin(timeAccum * 2.1 + data.phase) * chaosFactor
                 local chaosZ = math.cos(timeAccum * 1.9 + data.phase * 1.3) * chaosFactor
@@ -860,7 +803,6 @@ local function startIndividualPartThread(part, data)
                 end
             end
             
-            -- Periodic target switching
             if data.nextSwitchTime and timeAccum >= data.nextSwitchTime then
                 if not data.switchingLock then
                     data.switchingLock = true
@@ -881,7 +823,6 @@ local function startIndividualPartThread(part, data)
     end)
 end
 
--- ForcePart for Individual Parts mode
 local function ForcePartIndividual(v)
     if not v or not v:IsA("BasePart") then return end
     if isPartPlayerCharacter(v) then return end
@@ -970,7 +911,6 @@ local function ForcePartIndividual(v)
     end
 end
 
--- Start Individual Parts mode
 local function startIndividualParts()
     if individualPartsActive then return end
     individualPartsActive = true
@@ -1018,7 +958,6 @@ local function startIndividualParts()
     end
 end
 
--- Stop Individual Parts mode
 local function stopIndividualParts()
     individualPartsActive = false
     
@@ -1057,7 +996,6 @@ local function stopIndividualParts()
     processedParts = {}
 end
 
--- ForcePart (redirects to Individual version when toggle is on)
 local function ForcePart(v)
     if IndividualPartsEnabled then
         ForcePartIndividual(v)
@@ -1250,7 +1188,6 @@ local function getRandomPlayer()
     return players[math.random(1, #players)]
 end
 
--- set BH active/inactive
 local function setBlackHoleActiveState(bh, active)
     if not bh then return end
     if bh._active == active then return end
@@ -1280,7 +1217,6 @@ local function setBlackHoleActiveState(bh, active)
     end
 end
 
--- create extra BH helper (restrict to PAA usage)
 local function createExtraBlackHole(initialTarget, source)
     if source ~= "PAA" then source = "PAA" end
 
@@ -1454,7 +1390,6 @@ local function deleteBHsBySource(source)
     end
 end
 
--- rotating/distribution code
 local rotatingCoroutine = nil
 local rotatingActive = false
 local function stopRotatingCoroutine()
@@ -1550,7 +1485,6 @@ local function distributeBHListEvenly(bhList, players)
     end)
 end
 
--- PAA assignment wrappers
 local function assignTargetsForPAA()
     local paaBHs = getBHsBySource("PAA")
     if #paaBHs == 0 then return end
@@ -1631,7 +1565,6 @@ local function onPlayerRemovingForPAA(pl)
     end
 end
 
--- Cycle / rebalancer and other management functions
 local function clearCycleConnections()
     for _, conn in ipairs(cycleConns) do
         if conn and conn.Disconnect then
@@ -1976,10 +1909,9 @@ Players.LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
 local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/miroeramaa/TurtleLib/main/TurtleUiLib.lua"))()
 local window = library:Window("Fix it you panis negor🗣🔥")
 
+-- Main toggles (original)
 window:Toggle("Unanchored Target All", false, function(Value) setTargetAll(Value) end)
 window:Toggle("Target Selected Players", false, function(Value) setTargetSelected(Value) end)
-
--- Individual Parts toggle
 window:Toggle("Individual Parts", false, function(Value)
     IndividualPartsEnabled = Value
     if IndividualPartsEnabled then
@@ -1993,7 +1925,7 @@ window:Toggle("Individual Parts", false, function(Value)
     end
 end)
 
--- Cycle toggle
+-- Cycle controls
 window:Toggle("Cycle", false, function(Value)
     CycleMode = Value
     if CycleMode then
@@ -2007,6 +1939,7 @@ window:Button("Reset Cycle", function()
     resetCycleNow()
 end)
 
+-- External script buttons
 window:Button("Load Player List Script", function()
     loadstring(game:HttpGet("https://raw.githubusercontent.com/Jlchris1/Udklol/refs/heads/main/Playerlistv6"))()
 end)
@@ -2015,7 +1948,7 @@ window:Button("telekinesis/fix target", function()
     loadstring(game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true))()
 end)
 
--- ====== GATHER PARTS BUTTON ======
+-- ====== NEW: GATHER PARTS BUTTON ======
 window:Button("Gather Parts", function()
     if gatherPartsActive then
         stopGatherParts()
@@ -2024,8 +1957,8 @@ window:Button("Gather Parts", function()
     end
 end)
 
--- Anti-tamper status indicator
-window:Toggle("Anti-Property-Adjustment (Auto)", true, function(Value)
+-- Anti-tamper toggle
+window:Toggle("Anti-Property-Adjustment", true, function(Value)
     if Value then
         startAntiTamper()
     else
@@ -2036,6 +1969,7 @@ end)
 -- Auto-start anti-tamper
 startAntiTamper()
 
+-- Continuous Loop Check (original)
 local loopCheckActive = false
 window:Toggle("Continuous Loop Check", false, function(Value)
     loopCheckActive = Value
@@ -2057,7 +1991,7 @@ window:Toggle("Continuous Loop Check", false, function(Value)
     end
 end)
 
--- PAA toggle
+-- PAA toggle (original)
 window:Toggle("PAA/unPAA (player amount BHs)", false, function(Value)
     PAAEnabled = Value
     if PAAEnabled then
@@ -2072,7 +2006,7 @@ window:Toggle("PAA/unPAA (player amount BHs)", false, function(Value)
     end
 end)
 
--- Skidding toggle
+-- Skidding toggle (original)
 window:Toggle("Skidding (0.1s forward/back)", SkiddingEnabled, function(Value)
     SkiddingEnabled = Value
     if not SkiddingEnabled then
