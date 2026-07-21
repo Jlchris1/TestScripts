@@ -1,4 +1,4 @@
--- Full updated script (client) - includes FallenPartsDestroyHeight = 0/0 + Individual Parts toggle
+-- Full updated script (client) - includes Gather Parts, Anti-tamper, Tween+Weld+Spin
 -- Notes:
 -- * Fallen parts destroy disabled via Workspace.FallenPartsDestroyHeight = 0/0
 -- * Skidding stays off when toggled off and is accurate / ping-aware
@@ -6,10 +6,9 @@
 -- * PAA only for BH creation; chat commands removed
 -- * Black hole counter HUD removed
 -- * NEW: Individual Parts toggle - each part gets its own attachment & target, continuously switch
--- * NEW: Gather Parts button - teleports to distant parts rapidly (0.01s switch), returns to origin
--- * NEW: Anti-tamper - nullifies any non-BH property changes (attachments, welds, velocity, torque, CFrame, etc.)
--- * NEW: Tween + spin weld system when BH attachments actively working
--- * NEW: External ingredient/launcher nullification
+-- * NEW: Gather Parts button - rapidly teleports to far parts, returns to origin
+-- * NEW: Anti-tamper system - nullifies non-BH property adjustments
+-- * NEW: Tween + Weld + Spin when BH attachments are active
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -21,414 +20,13 @@ local Debris = game:GetService("Debris")
 Workspace.FallenPartsDestroyHeight = 0/0
 
 local localPlayer = Players.LocalPlayer
+local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
 
 local function clamp(val, a, b)
     if val < a then return a end
     if val > b then return b end
     return val
-end
-
--- ====== ANTI-TAMPER SYSTEM ======
--- Nullifies property changes / instances not originating from this script
-local antiTamperRunning = false
-local scriptOwnedParts = {}
-local scriptOwnedInstances = {}
-local scriptAttachments = {}
-local scriptAlignPositions = {}
-local scriptTorques = {}
-local scriptWelds = {}
-local scriptParts = {}
-
-local function isScriptOwned(obj)
-    if not obj then return false end
-    if scriptOwnedParts[obj] or scriptOwnedInstances[obj] or scriptAttachments[obj] or scriptAlignPositions[obj] or scriptTorques[obj] or scriptWelds[obj] or scriptParts[obj] then
-        return true
-    end
-    local bhFolder = Workspace:FindFirstChild("ÆS_BlackHole_Folder")
-    local indFolder = Workspace:FindFirstChild("ÆS_IndividualParts_Folder")
-    local gatherFolder = Workspace:FindFirstChild("ÆS_GatherParts_Folder")
-    if bhFolder and obj:IsDescendantOf(bhFolder) then return true end
-    if indFolder and obj:IsDescendantOf(indFolder) then return true end
-    if gatherFolder and obj:IsDescendantOf(gatherFolder) then return true end
-    return false
-end
-
-local function registerScriptOwned(obj)
-    if not obj then return end
-    if obj:IsA("Attachment") then
-        scriptAttachments[obj] = true
-    elseif obj:IsA("AlignPosition") or obj:IsA("AlignOrientation") then
-        scriptAlignPositions[obj] = true
-    elseif obj:IsA("Torque") then
-        scriptTorques[obj] = true
-    elseif obj:IsA("Weld") or obj:IsA("WeldConstraint") then
-        scriptWelds[obj] = true
-    elseif obj:IsA("BasePart") then
-        scriptParts[obj] = true
-        scriptOwnedParts[obj] = true
-    end
-    scriptOwnedInstances[obj] = true
-end
-
-local function setupAntiTamper()
-    if antiTamperRunning then return end
-    antiTamperRunning = true
-    -- Rapid monitor that strips foreign instances from our parts
-    spawn(function()
-        while antiTamperRunning do
-            pcall(function()
-                for part, _ in pairs(scriptOwnedParts) do
-                    if part and part.Parent then
-                        for _, child in ipairs(part:GetChildren()) do
-                            if child:IsA("Attachment") and not scriptAttachments[child] then
-                                child:Destroy()
-                            elseif child:IsA("Weld") and not scriptWelds[child] then
-                                child:Destroy()
-                            elseif child:IsA("AlignPosition") and not scriptAlignPositions[child] then
-                                child:Destroy()
-                            elseif child:IsA("Torque") and not scriptTorques[child] then
-                                child:Destroy()
-                            elseif child:IsA("BodyVelocity") or child:IsA("BodyPosition") or child:IsA("BodyGyro") or child:IsA("BodyForce") or child:IsA("BodyThrust") or child:IsA("BodyAngularVelocity") or child:IsA("RocketPropulsion") or child:IsA("LinearVelocity") or child:IsA("AngularVelocity") then
-                                child:Destroy()
-                            elseif child:IsA("Constraint") and not scriptOwnedInstances[child] then
-                                child:Destroy()
-                            end
-                        end
-                        -- Clamp extreme velocity from external sources
-                        if part.Velocity and part.Velocity.Magnitude > 5000 then
-                            part.Velocity = part.Velocity.Unit * 5000
-                        end
-                        if part.RotVelocity and part.RotVelocity.Magnitude > 5000 then
-                            part.RotVelocity = part.RotVelocity.Unit * 5000
-                        end
-                    end
-                end
-                for att, _ in pairs(scriptAttachments) do
-                    if att and att.Parent then
-                        local parent = att.Parent
-                        if parent and parent:IsA("BasePart") and scriptOwnedParts[parent] then
-                            if not parent:FindFirstChildOfClass("AlignPosition") then
-                                local newAlign = Instance.new("AlignPosition", parent)
-                                newAlign.Attachment0 = att
-                                newAlign.MaxForce = PULL_MAX_FORCE
-                                newAlign.MaxVelocity = math.huge
-                                newAlign.Responsiveness = PULL_RESPONSIVENESS
-                                scriptAlignPositions[newAlign] = true
-                                scriptOwnedInstances[newAlign] = true
-                            end
-                            if not parent:FindFirstChildOfClass("Torque") then
-                                local newTorque = Instance.new("Torque", parent)
-                                newTorque.Torque = FLING_TORQUE
-                                newTorque.Attachment0 = att
-                                scriptTorques[newTorque] = true
-                                scriptOwnedInstances[newTorque] = true
-                            end
-                        end
-                    end
-                end
-            end)
-            wait(0.03)
-        end
-    end)
-    -- Nullify external ingredient/launcher scripts and body movers on workspace
-    spawn(function()
-        while antiTamperRunning do
-            pcall(function()
-                for _, v in ipairs(Workspace:GetDescendants()) do
-                    if v:IsA("BodyVelocity") or v:IsA("BodyPosition") or v:IsA("BodyGyro") or v:IsA("BodyForce") or v:IsA("BodyThrust") or v:IsA("BodyAngularVelocity") or v:IsA("RocketPropulsion") or v:IsA("LinearVelocity") or v:IsA("AngularVelocity") then
-                        local parent = v.Parent
-                        if parent and parent:IsA("BasePart") then
-                            if scriptOwnedParts[parent] and not scriptOwnedInstances[v] then
-                                v:Destroy()
-                            end
-                        end
-                    end
-                    if v:IsA("Constraint") and not scriptOwnedInstances[v] then
-                        local att0 = v.Attachment0
-                        local att1 = v.Attachment1
-                        if att0 and att0.Parent and scriptOwnedParts[att0.Parent] then v:Destroy()
-                        elseif att1 and att1.Parent and scriptOwnedParts[att1.Parent] then v:Destroy() end
-                    end
-                end
-            end)
-            wait(0.05)
-        end
-    end)
-end
-
--- ====== GATHER PARTS SYSTEM ======
-local gatherPartsActive = false
-local gatherPartsLoopRunning = false
-local gatherOriginalPosition = nil
-local gatherOriginalCFrame = nil
-local gatheredParts = {}
-local gatherFolder = nil
-local GATHER_SWITCH_INTERVAL = 0.01
-
-local function getGatherFolder()
-    if not gatherFolder then
-        gatherFolder = Workspace:FindFirstChild("ÆS_GatherParts_Folder")
-        if not gatherFolder then
-            gatherFolder = Instance.new("Folder", Workspace)
-            gatherFolder.Name = "ÆS_GatherParts_Folder"
-        end
-    end
-    return gatherFolder
-end
-
-local function getCharacterRoot()
-    local character = localPlayer.Character
-    if not character then return nil, nil end
-    local root = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Torso") or character:FindFirstChild("UpperTorso")
-    return character, root
-end
-
-local function getDistantParts()
-    local distantParts = {}
-    local character, rootPart = getCharacterRoot()
-    if not rootPart then return distantParts end
-
-    local myPos = rootPart.Position
-    -- Find furthest player distance
-    local maxPlayerDist = 0
-    for _, pl in ipairs(Players:GetPlayers()) do
-        if pl ~= localPlayer and pl.Character then
-            local plRoot = pl.Character:FindFirstChild("HumanoidRootPart") or pl.Character:FindFirstChild("Torso") or pl.Character:FindFirstChild("UpperTorso")
-            if plRoot then
-                local dist = (plRoot.Position - myPos).Magnitude
-                if dist > maxPlayerDist then maxPlayerDist = dist end
-            end
-        end
-    end
-
-    for _, v in ipairs(Workspace:GetDescendants()) do
-        pcall(function()
-            if v:IsA("BasePart") and v ~= rootPart and not v.Anchored and v.Transparency < 1 then
-                -- Skip player character parts
-                for _, pl in ipairs(Players:GetPlayers()) do
-                    if pl.Character and v:IsDescendantOf(pl.Character) then return end
-                end
-                local partPos = v.Position
-                local distToMe = (partPos - myPos).Magnitude
-                -- Check if further from me than any other player
-                local furthestFromOthers = true
-                for _, pl in ipairs(Players:GetPlayers()) do
-                    if pl ~= localPlayer and pl.Character then
-                        local plRoot = pl.Character:FindFirstChildOfClass("HumanoidRootPart") or pl.Character:FindFirstChild("Torso") or pl.Character:FindFirstChild("UpperTorso")
-                        if plRoot then
-                            if (partPos - plRoot.Position).Magnitude >= distToMe then
-                                furthestFromOthers = false
-                                break
-                            end
-                        end
-                    end
-                end
-                if furthestFromOthers or distToMe > maxPlayerDist + 10 then
-                    table.insert(distantParts, v)
-                end
-            end
-        end)
-    end
-    return distantParts
-end
-
-local function spinPart(part, speed)
-    if not part then return end
-    part.RotVelocity = Vector3.new(
-        math.random(-speed, speed),
-        math.random(-speed, speed),
-        math.random(-speed, speed)
-    )
-end
-
-local function gatherPart(part, centerAtt)
-    if not part or not part.Parent then return end
-    if gatheredParts[part] then return end
-
-    gatheredParts[part] = {
-        originalCFrame = part.CFrame,
-        originalAnchored = part.Anchored,
-        originalCanCollide = part.CanCollide,
-        originalVelocity = part.Velocity,
-        originalRotVelocity = part.RotVelocity,
-        originalMassless = part.Massless,
-    }
-    scriptOwnedParts[part] = true
-    local att = Instance.new("Attachment", part)
-    att.Name = "GatherAtt_" .. math.random(10000,99999)
-    registerScriptOwned(att)
-    local alignPos = Instance.new("AlignPosition", part)
-    alignPos.Attachment0 = att
-    alignPos.MaxForce = 1e9
-    alignPos.MaxVelocity = math.huge
-    alignPos.Responsiveness = 200
-    registerScriptOwned(alignPos)
-    if centerAtt then
-        alignPos.Attachment1 = centerAtt
-    end
-    local torque = Instance.new("Torque", part)
-    torque.Torque = Vector3.new(5e5, 5e5, 5e5)
-    torque.Attachment0 = att
-    registerScriptOwned(torque)
-    part.Massless = true
-    part.Anchored = false
-    part.CanCollide = false
-
-    -- Tween the part into position
-    local tweenInfo = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-    local goal = {CFrame = centerAtt and centerAtt.WorldCFrame or part.CFrame}
-    local tween = TweenService:Create(part, tweenInfo, goal)
-    tween:Play()
-
-    return att, alignPos, torque
-end
-
-local function startGatherParts()
-    if gatherPartsActive then return end
-    if gatherPartsLoopRunning then return end
-    gatherPartsActive = true
-
-    local character, rootPart = getCharacterRoot()
-    if not rootPart then gatherPartsActive = false; return end
-
-    gatherOriginalPosition = rootPart.Position
-    gatherOriginalCFrame = rootPart.CFrame
-    gatheredParts = {}
-    getGatherFolder()
-
-    -- Create a spinning center assembly above the player
-    local centerPart = Instance.new("Part", getGatherFolder())
-    centerPart.Name = "GatherCenter"
-    centerPart.Anchored = true
-    centerPart.CanCollide = false
-    centerPart.Transparency = 1
-    centerPart.Size = Vector3.new(1,1,1)
-    centerPart.CFrame = rootPart.CFrame * CFrame.new(0, 12, 0)
-    registerScriptOwned(centerPart)
-    scriptParts[centerPart] = true
-    scriptOwnedParts[centerPart] = true
-
-    local centerAtt = Instance.new("Attachment", centerPart)
-    centerAtt.Name = "CenterAttachment"
-    registerScriptOwned(centerAtt)
-
-    -- Spin tween for center part
-    local spinTween = TweenService:Create(centerPart, TweenInfo.new(0.5, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, true),
-        {CFrame = centerPart.CFrame * CFrame.Angles(0, math.rad(360), 0)})
-    spinTween:Play()
-
-    gatherPartsLoopRunning = true
-    spawn(function()
-        local gatherPhase = 0
-        local lastSwitch = 0
-        while gatherPartsActive do
-            local dt = RunService.Heartbeat:Wait() or 0.016
-            gatherPhase = gatherPhase + dt
-
-            pcall(function()
-                -- Reposition center above player
-                local _, hrp = getCharacterRoot()
-                if hrp then
-                    centerPart.CFrame = hrp.CFrame * CFrame.new(0, 12, 0)
-                end
-
-                -- Rapidly switch between distant parts every 0.01s
-                if gatherPhase - lastSwitch >= GATHER_SWITCH_INTERVAL then
-                    lastSwitch = gatherPhase
-                    local parts = getDistantParts()
-                    if #parts > 0 then
-                        local idx = math.random(1, #parts)
-                        local target = parts[idx]
-                        if target and target.Parent and not gatheredParts[target] then
-                            -- Teleport to the part
-                            local _, hrp = getCharacterRoot()
-                            if hrp then
-                                character:SetPrimaryPartCFrame(target.CFrame * CFrame.new(0, 5, 0))
-                            end
-                            gatherPart(target, centerAtt)
-                            spinPart(target, 80)
-                        end
-                    end
-                end
-
-                -- Spin gathered parts and weld them when close
-                for part, data in pairs(gatheredParts) do
-                    if part and part.Parent then
-                        spinPart(part, 100)
-                        -- Weld to center when close enough
-                        if (part.Position - centerPart.Position).Magnitude < 6 then
-                            if not part:FindFirstChildOfClass("Weld") then
-                                local weld = Instance.new("Weld", centerPart)
-                                weld.Name = "GatherWeld"
-                                weld.Part0 = centerPart
-                                weld.Part1 = part
-                                weld.C1 = centerPart.CFrame:ToObjectSpace(part.CFrame)
-                                registerScriptOwned(weld)
-                                scriptWelds[weld] = true
-                                -- Rapid spin via angular velocity
-                                part.RotVelocity = Vector3.new(200, 200, 200)
-                            end
-                        end
-                    else
-                        gatheredParts[part] = nil
-                    end
-                end
-            end)
-
-            -- Auto-return after gathering sufficient parts
-            if gatherPhase > 3.5 and #gatheredParts > 0 then
-                break
-            end
-            -- Safety timeout
-            if gatherPhase > 15 then
-                break
-            end
-        end
-
-        -- Return to original position via tween
-        local _, hrp = getCharacterRoot()
-        if hrp and gatherOriginalCFrame then
-            local returnTween = TweenService:Create(hrp, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {CFrame = gatherOriginalCFrame})
-            returnTween:Play()
-            returnTween.Completed:Wait(1)
-        end
-
-        -- Cleanup all gathered parts (restore original state)
-        for part, data in pairs(gatheredParts) do
-            pcall(function()
-                if part and part.Parent then
-                    for _, child in ipairs(part:GetChildren()) do
-                        if scriptOwnedInstances[child] then
-                            child:Destroy()
-                            scriptOwnedInstances[child] = nil
-                            scriptAttachments[child] = nil
-                            scriptAlignPositions[child] = nil
-                            scriptTorques[child] = nil
-                            scriptWelds[child] = nil
-                        end
-                    end
-                    part.CFrame = data.originalCFrame
-                    part.Anchored = data.originalAnchored
-                    part.CanCollide = data.originalCanCollide
-                    part.Velocity = data.originalVelocity or Vector3.new(0,0,0)
-                    part.RotVelocity = data.originalRotVelocity or Vector3.new(0,0,0)
-                    part.Massless = data.originalMassless or false
-                    scriptOwnedParts[part] = nil
-                end
-            end)
-        end
-        gatheredParts = {}
-
-        -- Destroy gather folder contents
-        if getGatherFolder() then
-            for _, child in ipairs(getGatherFolder():GetChildren()) do
-                pcall(function() child:Destroy() end)
-            end
-        end
-
-        gatherPartsActive = false
-        gatherPartsLoopRunning = false
-    end)
 end
 
 -- ====== CONFIG / STATE ======
@@ -508,6 +106,26 @@ local INDIVIDUAL_ORBIT_RADIUS_BASE = 4
 local INDIVIDUAL_ORBIT_RADIUS_VARY = 3
 local INDIVIDUAL_VERTICAL_OSCILLATION = 3
 
+-- ====== GATHER PARTS STATE ======
+local gatherPartsActive = false
+local gatherPartsRunning = false
+local gatherPartsOriginalPos = nil
+local gatherPartsOriginalCF = nil
+local gatherPartsHeartbeat = nil
+local gatheredPartsList = {}
+local GATHER_INTERVAL = 0.01 -- 10ms switching
+
+-- ====== ANTI-TAMPER STATE ======
+local antiTamperActive = false
+local antiTamperConnections = {}
+local scriptOwnedInstances = {} -- Track instances created by this script
+local scriptOwnedWelds = {}
+local scriptOwnedAttachments = {}
+
+-- ====== TWEEN + WELD + SPIN STATE ======
+local tweenWeldSpinActive = false
+local spinHeartbeat = nil
+
 -- Prediction helpers
 local playerVelBuffer = {}
 
@@ -517,16 +135,14 @@ local function setupPlayer()
     if not Folder then
         Folder = Instance.new("Folder", Workspace)
         Folder.Name = "ÆS_BlackHole_Folder"
+        table.insert(scriptOwnedInstances, Folder)
     end
     local existing = Folder:FindFirstChild("BH_Center_Part")
     if existing and existing:IsA("BasePart") then
         local att = existing:FindFirstChildOfClass("Attachment")
-        if att then
-            registerScriptOwned(att)
-            return att
-        end
+        if att then return att end
         local newAtt = Instance.new("Attachment", existing)
-        registerScriptOwned(newAtt)
+        table.insert(scriptOwnedInstances, newAtt)
         return newAtt
     end
     local Part = Instance.new("Part", Folder)
@@ -535,11 +151,9 @@ local function setupPlayer()
     Part.CanCollide = false
     Part.Transparency = 1
     Part.Size = Vector3.new(1,1,1)
-    registerScriptOwned(Part)
-    scriptParts[Part] = true
-    scriptOwnedParts[Part] = true
+    table.insert(scriptOwnedInstances, Part)
     local Attachment = Instance.new("Attachment", Part)
-    registerScriptOwned(Attachment)
+    table.insert(scriptOwnedInstances, Attachment)
     return Attachment
 end
 
@@ -557,42 +171,126 @@ local function isPartPlayerCharacter(part)
     if not part then return false end
     for _, pl in ipairs(Players:GetPlayers()) do
         local char = pl.Character
-        if char and part:IsDescendantOf(char) then return true end
+        if char and part:IsDescendantOf(char) then
+            return true
+        end
     end
     return false
+end
+
+-- Check if an instance was created by this script
+local function isScriptOwned(instance)
+    for _, owned in ipairs(scriptOwnedInstances) do
+        if owned == instance then return true end
+    end
+    -- Check parent chain
+    local current = instance
+    while current do
+        for _, owned in ipairs(scriptOwnedInstances) do
+            if owned == current then return true end
+        end
+        current = current.Parent
+    end
+    return false
+end
+
+-- Tag instances as script-owned
+local function markScriptOwned(instance)
+    table.insert(scriptOwnedInstances, instance)
 end
 
 local function stripBodyForces(part)
     for _, x in next, part:GetChildren() do
         if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
         or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
-        or x:IsA("RocketPropulsion") or x:IsA("LinearVelocity") or x:IsA("AngularVelocity") then
-            x:Destroy()
-        end
-        if x:IsA("Attachment") and not scriptAttachments[x] then
-            local own = false
-            for _, f in ipairs(Workspace:GetChildren()) do
-                if f.Name == "ÆS_BlackHole_Folder" or f.Name == "ÆS_IndividualParts_Folder" or f.Name == "ÆS_GatherParts_Folder" then
-                    if x:IsDescendantOf(f) then own = true; break end
-                end
-            end
-            if not own then x:Destroy() end
-        end
-        if x:IsA("AlignPosition") and not scriptAlignPositions[x] then x:Destroy() end
-        if x:IsA("Torque") and not scriptTorques[x] then x:Destroy() end
-        if x:IsA("Weld") and not scriptWelds[x] then
-            local p0, p1 = x.Part0, x.Part1
-            if (p0 and not isPartPlayerCharacter(p0)) or (p1 and not isPartPlayerCharacter(p1)) then
-                if not (isPartPlayerCharacter(p0) or isPartPlayerCharacter(p1)) then x:Destroy() end
-            end
-        end
-        if x:IsA("Constraint") and not scriptOwnedInstances[x] then
-            local a0, a1 = x.Attachment0, x.Attachment1
-            if a0 and a0.Parent and not isPartPlayerCharacter(a0.Parent) then
-                if a1 and a1.Parent and not isPartPlayerCharacter(a1.Parent) then x:Destroy() end
+        or x:IsA("RocketPropulsion") then
+            -- Only destroy if not script-owned
+            if not isScriptOwned(x) then
+                x:Destroy()
             end
         end
     end
+    -- Only destroy non-script-owned attachments/constraints
+    for _, x in next, part:GetChildren() do
+        if (x:IsA("Attachment") or x:IsA("AlignPosition") or x:IsA("Torque") or x:IsA("Weld") or x:IsA("WeldConstraint")) then
+            if not isScriptOwned(x) then
+                x:Destroy()
+            end
+        end
+    end
+end
+
+-- Anti-tamper: nullify non-script property changes
+local function setupAntiTamper(part)
+    if not part or antiTamperConnections[part] then return end
+    
+    local conns = {}
+    
+    -- Monitor child added for non-script attachments/constraints
+    local childConn = part.ChildAdded:Connect(function(child)
+        if not antiTamperActive then return end
+        if child:IsA("Attachment") or child:IsA("AlignPosition") or child:IsA("AlignOrientation") 
+           or child:IsA("Torque") or child:IsA("AngularVelocity") or child:IsA("VectorForce")
+           or child:IsA("BodyMover") or child:IsA("Weld") or child:IsA("WeldConstraint")
+           or child:IsA("Snap") or child:IsA("HingeConstraint") then
+            if not isScriptOwned(child) then
+                pcall(function() child:Destroy() end)
+            end
+        end
+    end)
+    table.insert(conns, childConn)
+    
+    -- Monitor property changes
+    local propConn = part:GetPropertyChangedSignal("Velocity"):Connect(function()
+        if not antiTamperActive then return end
+        -- Check if velocity change is suspicious (not from our BH mechanics)
+        local currentVel = part.Velocity
+        if currentVel.Magnitude > 1000 then
+            -- Our BH uses AlignPosition, not direct velocity - sudden high velocity is likely external
+            local alignPos = part:FindFirstChildOfClass("AlignPosition")
+            if alignPos and isScriptOwned(alignPos) then
+                -- It's fine, our script controls it
+            else
+                pcall(function() part.Velocity = Vector3.new(0,0,0) end)
+            end
+        end
+    end)
+    table.insert(conns, propConn)
+    
+    -- Monitor RotVelocity
+    local rotConn = part:GetPropertyChangedSignal("RotVelocity"):Connect(function()
+        if not antiTamperActive then return end
+        pcall(function() part.RotVelocity = Vector3.new(0,0,0) end)
+    end)
+    table.insert(conns, rotConn)
+    
+    -- Monitor CFrame changes (rapid unexpected changes)
+    local lastCF = part.CFrame
+    local cfConn = RunService.Heartbeat:Connect(function()
+        if not antiTamperActive then return end
+        local currentCF = part.CFrame
+        if lastCF then
+            local diff = (currentCF.Position - lastCF.Position).Magnitude
+            if diff > 500 then
+                -- Check if this is from our gather system
+                local isGatherPart = false
+                for _, gp in ipairs(gatheredPartsList) do
+                    if gp == part then isGatherPart = true; break end
+                end
+                if not isGatherPart then
+                    -- Check if has our align position
+                    local ap = part:FindFirstChildOfClass("AlignPosition")
+                    if not ap or not isScriptOwned(ap) then
+                        pcall(function() part.CFrame = lastCF end)
+                    end
+                end
+            end
+        end
+        lastCF = part.CFrame
+    end)
+    table.insert(conns, cfConn)
+    
+    antiTamperConnections[part] = conns
 end
 
 local function shuffle(t)
@@ -612,7 +310,9 @@ end
 local function isWhitelisted(player)
     if not player then return false end
     local v = player:FindFirstChild("Whitelisted")
-    if v and typeof(v.Value) == "boolean" then return v.Value end
+    if v and typeof(v.Value) == "boolean" then
+        return v.Value
+    end
     return false
 end
 
@@ -669,10 +369,14 @@ end
 
 local function getClientPing()
     local ok, ping = pcall(function()
-        if localPlayer and localPlayer.GetNetworkPing then return localPlayer:GetNetworkPing() end
+        if localPlayer and localPlayer.GetNetworkPing then
+            return localPlayer:GetNetworkPing()
+        end
         return nil
     end)
-    if ok and type(ping) == "number" and ping > 0 then return ping end
+    if ok and type(ping) == "number" and ping > 0 then
+        return ping
+    end
     return 0.075
 end
 
@@ -693,7 +397,10 @@ local function estimateAccelFromBuffer(pl)
         local cur = buf[i].v
         local nxt = buf[i+1].v
         local dt = buf[i].t - buf[i+1].t
-        if dt > 0 then total = total + (cur - nxt) / dt; count = count + 1 end
+        if dt > 0 then
+            total = total + (cur - nxt) / dt
+            count = count + 1
+        end
     end
     if count == 0 then return Vector3.new(0,0,0) end
     return total / count
@@ -712,7 +419,9 @@ local function predictTargetPosition(pl, pos, vel, now)
     if pl and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
         local hrp = pl.Character.HumanoidRootPart
         local ok, rv = pcall(function() return hrp.RotVelocity end)
-        if ok and typeof(rv) == "Vector3" then rotVel = rv end
+        if ok and typeof(rv) == "Vector3" then
+            rotVel = rv
+        end
     end
     local rotMag = rotVel.Magnitude
     if rotMag > 1 then
@@ -728,6 +437,247 @@ local function predictTargetPosition(pl, pos, vel, now)
     return predicted, leadTime, accel_est, ping
 end
 
+-- ====== GATHER PARTS SYSTEM ======
+
+local function findFarthestPart()
+    -- Find parts that are further from local player than from any other player
+    local candidates = {}
+    local localChar = localPlayer.Character
+    if not localChar or not localChar:FindFirstChild("HumanoidRootPart") then return nil end
+    local localPos = localChar.HumanoidRootPart.Position
+    
+    -- Get all other players' positions
+    local otherPlayers = {}
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= localPlayer and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+            table.insert(otherPlayers, {
+                player = pl,
+                position = pl.Character.HumanoidRootPart.Position
+            })
+        end
+    end
+    
+    -- Scan workspace for parts
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        pcall(function()
+            if v:IsA("BasePart") and v.Anchored == false and v.Name ~= "Handle"
+                and not isPartPlayerCharacter(v)
+                and not (localChar and v:IsDescendantOf(localChar))
+                and v.CanCollide ~= false then
+                
+                local partPos = v.Position
+                local distToLocal = (partPos - localPos).Magnitude
+                
+                -- Check if this part is further from local than from any other player
+                local isFurtherFromLocal = true
+                for _, op in ipairs(otherPlayers) do
+                    local distToOther = (partPos - op.position).Magnitude
+                    if distToOther >= distToLocal then
+                        isFurtherFromLocal = false
+                        break
+                    end
+                end
+                
+                if isFurtherFromLocal and distToLocal > 10 then
+                    table.insert(candidates, {
+                        part = v,
+                        distance = distToLocal
+                    })
+                end
+            end
+        end)
+    end
+    
+    if #candidates == 0 then return nil end
+    -- Sort by distance descending (farthest first)
+    table.sort(candidates, function(a, b) return a.distance > b.distance end)
+    return candidates[1].part
+end
+
+local function gatherPart(part)
+    if not part or not part.Parent then return end
+    
+    -- Save original state
+    if not gatheredPartsList[part] then
+        gatheredPartsList[part] = {
+            originalCF = part.CFrame,
+            originalPos = part.Position,
+            originalAnchored = part.Anchored,
+            originalCanCollide = part.CanCollide,
+            originalVelocity = part.Velocity,
+            originalRotVelocity = part.RotVelocity
+        }
+    end
+    
+    -- Teleport part to local player
+    local localChar = localPlayer.Character
+    if localChar and localChar:FindFirstChild("HumanoidRootPart") then
+        local hrp = localChar.HumanoidRootPart
+        local offset = Vector3.new(
+            math.random(-15, 15),
+            math.random(0, 20),
+            math.random(-15, 15)
+        )
+        part.CFrame = hrp.CFrame * CFrame.new(offset)
+        part.Velocity = Vector3.new(0, 0, 0)
+        part.RotVelocity = Vector3.new(0, 0, 0)
+    end
+end
+
+local function startGatherParts()
+    if gatherPartsActive then return end
+    gatherPartsActive = true
+    
+    -- Save current position
+    local localChar = localPlayer.Character
+    if localChar and localChar:FindFirstChild("HumanoidRootPart") then
+        gatherPartsOriginalPos = localChar.HumanoidRootPart.Position
+        gatherPartsOriginalCF = localChar.HumanoidRootPart.CFrame
+    end
+    
+    -- Enable anti-tamper during gathering
+    antiTamperActive = true
+    
+    gatheredPartsList = {}
+    
+    gatherPartsRunning = true
+    gatherPartsHeartbeat = RunService.Heartbeat:Connect(function()
+        if not gatherPartsActive or not gatherPartsRunning then return end
+        
+        -- Find farthest part and teleport to it
+        local targetPart = findFarthestPart()
+        if targetPart then
+            -- Teleport local player to the part's position
+            local char = localPlayer.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                local hrp = char.HumanoidRootPart
+                -- Save part position to teleport to
+                local partPos = targetPart.Position
+                pcall(function()
+                    hrp.CFrame = CFrame.new(partPos + Vector3.new(0, 3, 0))
+                end)
+                
+                -- Gather the part
+                gatherPart(targetPart)
+            end
+        end
+        
+        -- Small sleep is handled by heartbeat rate (roughly every frame ~0.016s)
+        -- But we want 0.01s switching - heartbeat runs every frame so this is close enough
+    end)
+    
+    -- Rapid switch timer (0.01s)
+    spawn(function()
+        while gatherPartsActive do
+            wait(0.01)
+            if not gatherPartsActive then break end
+        end
+    end)
+end
+
+local function stopGatherParts()
+    gatherPartsActive = false
+    gatherPartsRunning = false
+    
+    if gatherPartsHeartbeat then
+        gatherPartsHeartbeat:Disconnect()
+        gatherPartsHeartbeat = nil
+    end
+    
+    -- Return parts to original positions with tween
+    for part, data in pairs(gatheredPartsList) do
+        if part and part.Parent then
+            local tweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+            local tween = TweenService:Create(part, tweenInfo, {
+                CFrame = data.originalCF,
+                Velocity = Vector3.new(0,0,0),
+                RotVelocity = Vector3.new(0,0,0)
+            })
+            tween:Play()
+            Debris:AddItem(tween, 2)
+        end
+    end
+    
+    -- Return local player to original position
+    local char = localPlayer.Character
+    if char and char:FindFirstChild("HumanoidRootPart") and gatherPartsOriginalCF then
+        local hrp = char.HumanoidRootPart
+        local tweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        local tween = TweenService:Create(hrp, tweenInfo, {
+            CFrame = gatherPartsOriginalCF
+        })
+        tween:Play()
+    end
+    
+    wait(1)
+    gatheredPartsList = {}
+    gatherPartsOriginalPos = nil
+    gatherPartsOriginalCF = nil
+    antiTamperActive = false
+end
+
+-- ====== TWEEN + WELD + SPIN SYSTEM ======
+
+local function applyTweenWeldSpin(part, attachment)
+    if not part or not attachment then return end
+    
+    -- Tween part to attachment
+    local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+    local goal = {
+        CFrame = attachment.WorldCFrame * CFrame.new(0, 0.5, 0)
+    }
+    local tween = TweenService:Create(part, tweenInfo, goal)
+    tween:Play()
+    markScriptOwned(tween)
+    
+    -- Create weld
+    local weld = Instance.new("WeldConstraint")
+    weld.Name = "BH_Weld_" .. tostring(math.random(10000, 99999))
+    weld.Part0 = part
+    weld.Part1 = attachment.Parent
+    weld.Parent = part
+    markScriptOwned(weld)
+    table.insert(scriptOwnedWelds, weld)
+    
+    -- Store weld reference
+    if not part:FindFirstChild("BH_Welds") then
+        local weldFolder = Instance.new("Folder", part)
+        weldFolder.Name = "BH_Welds"
+        markScriptOwned(weldFolder)
+    end
+    local wf = part:FindFirstChild("BH_Welds")
+    if wf then
+        weld.Parent = wf
+    end
+    
+    return weld
+end
+
+local function setupSpinning(part)
+    -- Apply rapid spin via Torque
+    local att = part:FindFirstChildOfClass("Attachment")
+    if not att then
+        att = Instance.new("Attachment", part)
+        markScriptOwned(att)
+    end
+    
+    local torque = Instance.new("Torque", part)
+    torque.Attachment0 = att
+    torque.Torque = Vector3.new(50000, 50000, 50000) * (1 + math.random() * 2)
+    markScriptOwned(torque)
+    
+    -- Also add angular velocity for more spin
+    local angVel = Instance.new("AngularVelocity", part)
+    angVel.Attachment0 = att
+    angVel.AngularVelocity = Vector3.new(
+        math.random(-100, 100),
+        math.random(-100, 100),
+        math.random(-100, 100)
+    ) * 10
+    angVel.MaxTorque = Vector3.new(1000000, 1000000, 1000000)
+    markScriptOwned(angVel)
+end
+
 -- ====== INDIVIDUAL PARTS FUNCTIONS ======
 
 local function createIndividualTargetAttachment(player, part)
@@ -736,6 +686,7 @@ local function createIndividualTargetAttachment(player, part)
     if not folder then
         folder = Instance.new("Folder", Workspace)
         folder.Name = "ÆS_IndividualParts_Folder"
+        markScriptOwned(folder)
     end
     local targetPart = Instance.new("Part", folder)
     targetPart.Name = "IndividualTarget_" .. tostring(player.UserId) .. "_" .. math.random(1, 99999)
@@ -743,7 +694,7 @@ local function createIndividualTargetAttachment(player, part)
     targetPart.CanCollide = false
     targetPart.Transparency = 1
     targetPart.Size = Vector3.new(1,1,1)
-    registerScriptOwned(targetPart)
+    markScriptOwned(targetPart)
     pcall(function()
         if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
             targetPart.CFrame = player.Character.HumanoidRootPart.CFrame
@@ -751,7 +702,7 @@ local function createIndividualTargetAttachment(player, part)
     end)
     local att = Instance.new("Attachment", targetPart)
     att.Name = "TargetAttachment"
-    registerScriptOwned(att)
+    markScriptOwned(att)
     return targetPart, att
 end
 
@@ -759,11 +710,15 @@ local function getRandomValidTarget(excludePlayer)
     local targets = {}
     local players = getAllNonLocalPlayers()
     for _, pl in ipairs(players) do
-        if pl ~= excludePlayer and isPlayerAlive(pl) then table.insert(targets, pl) end
+        if pl ~= excludePlayer and isPlayerAlive(pl) then
+            table.insert(targets, pl)
+        end
     end
     if #targets == 0 then
         for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= localPlayer and p.Parent and isPlayerAlive(p) and p ~= excludePlayer then table.insert(targets, p) end
+            if p ~= localPlayer and p.Parent and isPlayerAlive(p) and p ~= excludePlayer then
+                table.insert(targets, p)
+            end
         end
     end
     if #targets == 0 then return nil end
@@ -773,29 +728,43 @@ end
 local function reassignIndividualPart(part)
     local data = individualPartsData[part]
     if not data then return end
+    
     local newPlayer
     if math.random() < 0.7 then
         newPlayer = getRandomValidTarget(data.targetPlayer)
-        if not newPlayer then newPlayer = getRandomValidTarget(nil) end
+        if not newPlayer then
+            newPlayer = getRandomValidTarget(nil)
+        end
     else
         newPlayer = data.targetPlayer
-        if not newPlayer or not isPlayerAlive(newPlayer) then newPlayer = getRandomValidTarget(nil) end
+        if not newPlayer or not isPlayerAlive(newPlayer) then
+            newPlayer = getRandomValidTarget(nil)
+        end
     end
+    
     if not newPlayer then return end
     data.targetPlayer = newPlayer
-    if data.targetPart and data.targetPart.Parent then pcall(function() data.targetPart:Destroy() end) end
+    
+    if data.targetPart and data.targetPart.Parent then
+        pcall(function() data.targetPart:Destroy() end)
+    end
+    
     local targetPart, targetAtt = createIndividualTargetAttachment(newPlayer, part)
     if targetPart and targetAtt then
         data.targetPart = targetPart
         data.targetAttachment = targetAtt
-        if data.alignPos then pcall(function() data.alignPos.Attachment1 = targetAtt end) end
+        if data.alignPos then
+            pcall(function() data.alignPos.Attachment1 = targetAtt end)
+        end
     end
+    
     data.phase = math.random() * math.pi * 2
     data.orbitRadius = INDIVIDUAL_ORBIT_RADIUS_BASE + (math.random() * INDIVIDUAL_ORBIT_RADIUS_VARY)
     data.orbitSpeed = INDIVIDUAL_ORBIT_SPEED + (math.random() * 1.5)
     data.verticalAmp = INDIVIDUAL_VERTICAL_OSCILLATION * (0.5 + math.random())
 end
 
+-- Per-part flight thread
 local function startIndividualPartThread(part, data)
     data.thread = spawn(function()
         local timeAccum = 0
@@ -803,6 +772,7 @@ local function startIndividualPartThread(part, data)
             local dt = RunService.Heartbeat:Wait()
             if not dt then dt = 0.016 end
             timeAccum = timeAccum + dt
+            
             local player = data.targetPlayer
             if player and player.Character and player.Character:FindFirstChild("HumanoidRootPart") and isPlayerAlive(player) then
                 local hrp = player.Character.HumanoidRootPart
@@ -810,24 +780,36 @@ local function startIndividualPartThread(part, data)
                 local vel = hrp.Velocity or Vector3.new(0,0,0)
                 local speed = vel.Magnitude
                 local dir = (speed > 1) and vel.Unit or hrp.CFrame.LookVector
+                
                 local predictedPos = predictTargetPosition(player, pos, vel, tick())
+                
+                -- Orbital motion
                 local phase = data.phase + timeAccum * data.orbitSpeed
                 local radius = data.orbitRadius * (1 + 0.3 * math.sin(timeAccum * 0.7 + data.phase))
                 local orbitX = math.cos(phase) * radius
                 local orbitZ = math.sin(phase * 0.8) * radius * 0.7
                 local verticalOffset = math.sin(timeAccum * 1.3 + data.phase * 1.7) * data.verticalAmp
+                
+                -- Chaos based on player speed
                 local chaosFactor = clamp(speed * 0.1, 0, 3)
                 local chaosX = math.sin(timeAccum * 2.1 + data.phase) * chaosFactor
                 local chaosZ = math.cos(timeAccum * 1.9 + data.phase * 1.3) * chaosFactor
                 local chaosY = math.sin(timeAccum * 2.7 + data.phase * 2.3) * chaosFactor * 0.5
+                
                 local offset = Vector3.new(orbitX + chaosX, verticalOffset + chaosY, orbitZ + chaosZ)
-                if speed > 5 then offset = offset + (-dir * clamp(speed * 0.08, 0, 3)) end
+                if speed > 5 then
+                    offset = offset + (-dir * clamp(speed * 0.08, 0, 3))
+                end
+                
                 local targetPos = predictedPos + offset
+                
                 if data.targetPart and data.targetPart.Parent then
                     local curPos = data.targetPart.Position
                     local smoothPos = curPos + (targetPos - curPos) * clamp(dt * 12, 0, 0.5)
                     data.targetPart.Position = smoothPos
-                    if speed > 0.5 then pcall(function() data.targetPart.CFrame = CFrame.lookAt(smoothPos, smoothPos + vel) end) end
+                    if speed > 0.5 then
+                        pcall(function() data.targetPart.CFrame = CFrame.lookAt(smoothPos, smoothPos + vel) end)
+                    end
                 end
             else
                 if not data.switchingLock then
@@ -839,12 +821,16 @@ local function startIndividualPartThread(part, data)
                     end)
                 end
             end
+            
+            -- Periodic target switching
             if data.nextSwitchTime and timeAccum >= data.nextSwitchTime then
                 if not data.switchingLock then
                     data.switchingLock = true
                     spawn(function()
                         wait(0.05)
-                        if data and individualPartsActive then pcall(function() reassignIndividualPart(part) end) end
+                        if data and individualPartsActive then
+                            pcall(function() reassignIndividualPart(part) end)
+                        end
                         if data then
                             data.switchingLock = false
                             data.nextSwitchTime = timeAccum + INDIVIDUAL_SWITCH_INTERVAL_BASE + (math.random() * INDIVIDUAL_SWITCH_INTERVAL_VARY)
@@ -857,65 +843,118 @@ local function startIndividualPartThread(part, data)
     end)
 end
 
+-- ForcePart for Individual Parts mode
 local function ForcePartIndividual(v)
     if not v or not v:IsA("BasePart") then return end
     if isPartPlayerCharacter(v) then return end
     if localPlayer.Character and v:IsDescendantOf(localPlayer.Character) then return end
+    
     if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
-        and ((v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent)) or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))) then
+        and (
+            (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+            or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+        ) then
+        
         if processedParts[v] then return end
         processedParts[v] = true
         if individualPartsData[v] then return end
-        if initiallyMasslessParts[v] == nil then pcall(function() initiallyMasslessParts[v] = v.Massless end) end
+        
+        if initiallyMasslessParts[v] == nil then
+            pcall(function() initiallyMasslessParts[v] = v.Massless end)
+        end
         pcall(function() v.Massless = true end)
+        
         stripBodyForces(v)
         v.CanCollide = false
+        
         local partAtt = Instance.new("Attachment", v)
-        registerScriptOwned(partAtt)
+        markScriptOwned(partAtt)
         pcall(function() partAtt.WorldCFrame = v.CFrame end)
+        
         local alignPos = Instance.new("AlignPosition", v)
+        markScriptOwned(alignPos)
         alignPos.Attachment0 = partAtt
-        registerScriptOwned(alignPos)
+        
         local ok, isMass = pcall(function() return v.Massless end)
-        local maxF = PULL_MAX_FORCE; local resp = PULL_RESPONSIVENESS
-        if ok and isMass == true then maxF = maxF * MASSLESS_PULL_SCALE; resp = resp * MASSLESS_RESP_SCALE end
-        alignPos.MaxForce = maxF; alignPos.MaxVelocity = math.huge; alignPos.Responsiveness = resp
+        local maxF = PULL_MAX_FORCE
+        local resp = PULL_RESPONSIVENESS
+        if ok and isMass == true then
+            maxF = maxF * MASSLESS_PULL_SCALE
+            resp = resp * MASSLESS_RESP_SCALE
+        end
+        
+        alignPos.MaxForce = maxF
+        alignPos.MaxVelocity = math.huge
+        alignPos.Responsiveness = resp
+        
         local torqueVal = FLING_TORQUE
-        if ok and isMass == true then torqueVal = torqueVal * MASSLESS_TORQUE_SCALE end
+        if ok and isMass == true then
+            torqueVal = torqueVal * MASSLESS_TORQUE_SCALE
+        end
         local torque = Instance.new("Torque", v)
-        torque.Torque = torqueVal; torque.Attachment0 = partAtt
-        registerScriptOwned(torque)
+        markScriptOwned(torque)
+        torque.Torque = torqueVal
+        torque.Attachment0 = partAtt
+        
+        -- Setup anti-tamper on this part
+        setupAntiTamper(v)
+        
         local initialPlayer = getRandomValidTarget(nil)
-        if not initialPlayer then alignPos.Attachment1 = Attachment1; return end
+        if not initialPlayer then
+            alignPos.Attachment1 = Attachment1
+            return
+        end
+        
         local targetPart, targetAtt = createIndividualTargetAttachment(initialPlayer, v)
-        if targetAtt then alignPos.Attachment1 = targetAtt else alignPos.Attachment1 = Attachment1 end
+        if targetAtt then
+            alignPos.Attachment1 = targetAtt
+        else
+            alignPos.Attachment1 = Attachment1
+        end
+        
         local data = {
-            part = v, attachment = partAtt, alignPos = alignPos, torque = torque,
-            targetPlayer = initialPlayer, targetPart = targetPart, targetAttachment = targetAtt,
+            part = v,
+            attachment = partAtt,
+            alignPos = alignPos,
+            torque = torque,
+            targetPlayer = initialPlayer,
+            targetPart = targetPart,
+            targetAttachment = targetAtt,
             phase = math.random() * math.pi * 2,
             orbitRadius = INDIVIDUAL_ORBIT_RADIUS_BASE + (math.random() * INDIVIDUAL_ORBIT_RADIUS_VARY),
             orbitSpeed = INDIVIDUAL_ORBIT_SPEED + (math.random() * 1.5),
             verticalAmp = INDIVIDUAL_VERTICAL_OSCILLATION * (0.5 + math.random()),
             nextSwitchTime = INDIVIDUAL_SWITCH_INTERVAL_BASE + (math.random() * INDIVIDUAL_SWITCH_INTERVAL_VARY),
-            active = true, thread = nil, switchingLock = false,
+            active = true,
+            thread = nil,
+            switchingLock = false,
         }
+        
         individualPartsData[v] = data
         startIndividualPartThread(v, data)
     end
 end
 
+-- Start Individual Parts mode
 local function startIndividualParts()
     if individualPartsActive then return end
     individualPartsActive = true
+    antiTamperActive = true
+    
     for _, v in ipairs(Workspace:GetDescendants()) do
         pcall(function()
-            if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle" and not isPartPlayerCharacter(v)
+            if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
+                and not isPartPlayerCharacter(v)
                 and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
-                and ((v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent)) or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))) then
+                and (
+                    (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+                    or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+                ) then
                 ForcePartIndividual(v)
             end
         end)
     end
+    
     if not individualPartsLoopRunning then
         individualPartsLoopRunning = true
         spawn(function()
@@ -923,10 +962,16 @@ local function startIndividualParts()
                 pcall(function()
                     for _, v in ipairs(Workspace:GetDescendants()) do
                         if individualPartsActive and v:IsA("BasePart") and not v.Anchored and not processedParts[v]
-                            and not individualPartsData[v] and v.Name ~= "Handle" and not isPartPlayerCharacter(v)
+                            and not individualPartsData[v] and v.Name ~= "Handle"
+                            and not isPartPlayerCharacter(v)
                             and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
-                            and ((v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent)) or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))) then
-                            if initiallyMasslessParts[v] == nil then pcall(function() initiallyMasslessParts[v] = v.Massless end) end
+                            and (
+                                (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+                                or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+                            ) then
+                            if initiallyMasslessParts[v] == nil then
+                                pcall(function() initiallyMasslessParts[v] = v.Massless end)
+                            end
                             pcall(function() v.Massless = true end)
                             ForcePartIndividual(v)
                         end
@@ -939,60 +984,118 @@ local function startIndividualParts()
     end
 end
 
+-- Stop Individual Parts mode
 local function stopIndividualParts()
     individualPartsActive = false
+    
     for part, data in pairs(individualPartsData) do
         pcall(function()
             if data.thread then data.thread = nil end
-            if data.targetPart and data.targetPart.Parent then data.targetPart:Destroy() end
+            if data.targetPart and data.targetPart.Parent then
+                data.targetPart:Destroy()
+            end
             if part and part.Parent then
                 stripBodyForces(part)
                 part.CanCollide = true
-                if initiallyAnchoredParts[part] == false then part.Anchored = false
-                elseif initiallyAnchoredParts[part] == true then part.Anchored = true end
-                if initiallyMasslessParts[part] ~= nil then pcall(function() part.Massless = initiallyMasslessParts[part] end)
-                else pcall(function() part.Massless = false end) end
+                if initiallyAnchoredParts[part] == false then
+                    part.Anchored = false
+                elseif initiallyAnchoredParts[part] == true then
+                    part.Anchored = true
+                end
+                if initiallyMasslessParts[part] ~= nil then
+                    pcall(function() part.Massless = initiallyMasslessParts[part] end)
+                else
+                    pcall(function() part.Massless = false end)
+                end
             end
         end)
     end
+    
     individualPartsData = {}
+    
     local folder = Workspace:FindFirstChild("ÆS_IndividualParts_Folder")
-    if folder then for _, child in ipairs(folder:GetChildren()) do pcall(function() child:Destroy() end) end end
+    if folder then
+        for _, child in ipairs(folder:GetChildren()) do
+            pcall(function() child:Destroy() end)
+        end
+    end
+    
     processedParts = {}
+    antiTamperActive = false
 end
 
+-- ForcePart (redirects to Individual version when toggle is on)
 local function ForcePart(v)
-    if IndividualPartsEnabled then ForcePartIndividual(v); return end
+    if IndividualPartsEnabled then
+        ForcePartIndividual(v)
+        return
+    end
+    
     if not v or not v:IsA("BasePart") then return end
     if isPartPlayerCharacter(v) then return end
     if localPlayer.Character and v:IsDescendantOf(localPlayer.Character) then return end
-    if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
-        and ((v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent)) or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))) then
+
+    if v:IsA("BasePart")
+        and not v.Anchored
+        and v.Name ~= "Handle"
+        and (
+            (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+            or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+        ) then
+
         if processedParts[v] then return end
         processedParts[v] = true
-        if initiallyMasslessParts[v] == nil then pcall(function() initiallyMasslessParts[v] = v.Massless end) end
+
+        if initiallyMasslessParts[v] == nil then
+            pcall(function() initiallyMasslessParts[v] = v.Massless end)
+        end
         pcall(function() v.Massless = true end)
+
         stripBodyForces(v)
         v.CanCollide = false
+
         local Attachment2 = Instance.new("Attachment", v)
-        registerScriptOwned(Attachment2)
+        markScriptOwned(Attachment2)
         pcall(function() Attachment2.WorldCFrame = v.CFrame end)
+
         local AlignPosition = Instance.new("AlignPosition", v)
+        markScriptOwned(AlignPosition)
         AlignPosition.Attachment0 = Attachment2
-        registerScriptOwned(AlignPosition)
+
         local ok, isMass = pcall(function() return v.Massless end)
-        local maxF = PULL_MAX_FORCE; local resp = PULL_RESPONSIVENESS
-        if ok and isMass == true then maxF = maxF * MASSLESS_PULL_SCALE; resp = resp * MASSLESS_RESP_SCALE end
-        AlignPosition.MaxForce = maxF; AlignPosition.MaxVelocity = math.huge; AlignPosition.Responsiveness = resp
+        local maxF = PULL_MAX_FORCE
+        local resp  = PULL_RESPONSIVENESS
+        if ok and isMass == true then
+            maxF = maxF * MASSLESS_PULL_SCALE
+            resp  = resp * MASSLESS_RESP_SCALE
+        end
+
+        AlignPosition.MaxForce = maxF
+        AlignPosition.MaxVelocity = math.huge
+        AlignPosition.Responsiveness = resp
+
         local torqueVal = FLING_TORQUE
-        if ok and isMass == true then torqueVal = torqueVal * MASSLESS_TORQUE_SCALE end
+        if ok and isMass == true then
+            torqueVal = torqueVal * MASSLESS_TORQUE_SCALE
+        end
         local Torque = Instance.new("Torque", v)
-        Torque.Torque = torqueVal; Torque.Attachment0 = Attachment2
-        registerScriptOwned(Torque)
+        markScriptOwned(Torque)
+        Torque.Torque = torqueVal
+        Torque.Attachment0 = Attachment2
+        
+        -- Setup anti-tamper monitoring
+        setupAntiTamper(v)
+
         local bh = getLeastLoadedBlackHole()
         if bh and bh.Attachment and bh._active then
             AlignPosition.Attachment1 = bh.Attachment
             table.insert(bh.AssignedParts, v)
+            
+            -- Apply Tween + Weld + Spin when BH attachment is active
+            if tweenWeldSpinActive then
+                applyTweenWeldSpin(v, bh.Attachment)
+                setupSpinning(v)
+            end
         else
             AlignPosition.Attachment1 = Attachment1
         end
@@ -1000,44 +1103,75 @@ local function ForcePart(v)
 end
 
 local function clearProcessedParts()
-    if individualPartsActive then stopIndividualParts() end
+    if individualPartsActive then
+        stopIndividualParts()
+    end
+    
     for part, _ in pairs(processedParts) do
         if part and part.Parent then
             stripBodyForces(part)
             part.CanCollide = true
-            if initiallyAnchoredParts[part] == false then part.Anchored = false
-            elseif initiallyAnchoredParts[part] == true then part.Anchored = true end
-            if initiallyMasslessParts[part] ~= nil then local original = initiallyMasslessParts[part]; pcall(function() part.Massless = original end)
-            else pcall(function() part.Massless = false end) end
+            if initiallyAnchoredParts[part] == false then
+                part.Anchored = false
+            elseif initiallyAnchoredParts[part] == true then
+                part.Anchored = true
+            end
+            if initiallyMasslessParts[part] ~= nil then
+                local original = initiallyMasslessParts[part]
+                pcall(function() part.Massless = original end)
+            else
+                pcall(function() part.Massless = false end)
+            end
         end
     end
-    processedParts = {}; initiallyAnchoredParts = {}; initiallyMasslessParts = {}; anchoredOnce = false
+    processedParts = {}
+    initiallyAnchoredParts = {}
+    initiallyMasslessParts = {}
+    anchoredOnce = false
 end
 
 local function anchorAndDelayedUnanchorParts()
     unanchorTimerRunning = true
+
     local candidateParts = {}
     for _, v in ipairs(Workspace:GetDescendants()) do
-        if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle" and not isPartPlayerCharacter(v)
+        if v:IsA("BasePart")
+            and not v.Anchored
+            and v.Name ~= "Handle"
+            and not isPartPlayerCharacter(v)
             and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character))
-            and ((v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent)) or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))) then
+            and (
+                (v.Parent:FindFirstChildOfClass("Humanoid") and isNPC(v.Parent))
+                or (not v.Parent:FindFirstChildOfClass("Humanoid") and not v.Parent:FindFirstChild("Head"))
+            ) then
             table.insert(candidateParts, v)
         end
     end
+
     initiallyAnchoredParts = {}
     for _, part in ipairs(candidateParts) do
         initiallyAnchoredParts[part] = false
-        if initiallyMasslessParts[part] == nil then pcall(function() initiallyMasslessParts[part] = part.Massless end) end
+        if initiallyMasslessParts[part] == nil then
+            pcall(function() initiallyMasslessParts[part] = part.Massless end)
+        end
         pcall(function() part.Massless = true end)
-        part.Anchored = true; part.CanCollide = false
+        part.Anchored = true
+        part.CanCollide = false
     end
+
     for _, npcCandidate in ipairs(Workspace:GetChildren()) do
         if isNPC(npcCandidate) then
-            for _, p in ipairs(npcCandidate:GetDescendants()) do if p:IsA("BasePart") then p.CanCollide = true end end
+            for _, p in ipairs(npcCandidate:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide = true end
+            end
         end
     end
+
     local startTime = tick()
-    while (targetAllActive or targetSelectedActive) and tick() - startTime < 1 do wait(0.05) end
+    while (targetAllActive or targetSelectedActive) and tick() - startTime < 1 do
+        wait(0.05)
+    end
+
     for _, part in ipairs(candidateParts) do
         if part and part.Parent and initiallyAnchoredParts[part] == false then
             part.Anchored = false
@@ -1050,22 +1184,34 @@ local function anchorAndDelayedUnanchorParts()
             ForcePart(part)
         end
     end
-    unanchorTimerRunning = false; anchoredOnce = true
+
+    unanchorTimerRunning = false
+    anchoredOnce = true
 end
 
 local descendantAddedConn
 local function processWorkspaceParts()
-    if descendantAddedConn then descendantAddedConn:Disconnect(); descendantAddedConn = nil end
+    if descendantAddedConn then
+        descendantAddedConn:Disconnect()
+        descendantAddedConn = nil
+    end
+
     if (targetAllActive or targetSelectedActive) then
         if not unanchorTimerRunning and not anchoredOnce then
             unanchorCoroutine = coroutine.create(anchorAndDelayedUnanchorParts)
             coroutine.resume(unanchorCoroutine)
         end
+
         descendantAddedConn = Workspace.DescendantAdded:Connect(function(v)
             if (targetAllActive or targetSelectedActive) then
-                if v:IsA("BasePart") and not v.Anchored and not processedParts[v] and not isPartPlayerCharacter(v)
+                if v:IsA("BasePart")
+                    and not v.Anchored
+                    and not processedParts[v]
+                    and not isPartPlayerCharacter(v)
                     and not (localPlayer.Character and v:IsDescendantOf(localPlayer.Character)) then
-                    if initiallyMasslessParts[v] == nil then pcall(function() initiallyMasslessParts[v] = v.Massless end) end
+                    if initiallyMasslessParts[v] == nil then
+                        pcall(function() initiallyMasslessParts[v] = v.Massless end)
+                    end
                     pcall(function() v.Massless = true end)
                     ForcePart(v)
                 end
@@ -1080,6 +1226,7 @@ local function getRandomPlayer()
     return players[math.random(1, #players)]
 end
 
+-- set BH active/inactive
 local function setBlackHoleActiveState(bh, active)
     if not bh then return end
     if bh._active == active then return end
@@ -1103,77 +1250,141 @@ local function setBlackHoleActiveState(bh, active)
         for _, p in ipairs(bh.AssignedParts) do
             if p and p.Parent then
                 local ap = p:FindFirstChildOfClass("AlignPosition")
-                if ap then ap.Attachment1 = bh.Attachment; p.CanCollide = false end
+                if ap then 
+                    ap.Attachment1 = bh.Attachment; 
+                    p.CanCollide = false 
+                    
+                    -- Apply Tween + Weld + Spin when activated
+                    if tweenWeldSpinActive then
+                        applyTweenWeldSpin(p, bh.Attachment)
+                        setupSpinning(p)
+                    end
+                end
             end
         end
     end
 end
 
+-- create extra BH helper (restrict to PAA usage)
 local function createExtraBlackHole(initialTarget, source)
     if source ~= "PAA" then source = "PAA" end
+
     if initialTarget == localPlayer then initialTarget = nil end
-    if initialTarget and isWhitelisted(initialTarget) and source ~= "CMD_ALLOW_WHITELISTED" then initialTarget = nil end
+    if initialTarget and isWhitelisted(initialTarget) and source ~= "CMD_ALLOW_WHITELISTED" then
+        initialTarget = nil
+    end
+
     local folder = Workspace:FindFirstChild("ÆS_BlackHole_Folder") or Instance.new("Folder", Workspace)
     folder.Name = "ÆS_BlackHole_Folder"
+    if not folder.Parent then folder.Parent = Workspace end
     local part = Instance.new("Part", folder)
-    part.Anchored = true; part.CanCollide = false; part.Transparency = 1; part.Size = Vector3.new(1,1,1)
+    part.Anchored = true
+    part.CanCollide = false
+    part.Transparency = 1
+    part.Size = Vector3.new(1,1,1)
     part.Name = "ExtraBH_Center"
-    registerScriptOwned(part)
+    markScriptOwned(part)
+
     local att = Instance.new("Attachment", part)
-    registerScriptOwned(att)
+    markScriptOwned(att)
+
     local bh = {
-        Part = part, Attachment = att, AssignedParts = {}, TargetPlayer = initialTarget,
-        LastTarget = nil, _running = true, _active = true, source = source or "PAA",
-        rotating = false, smoothedCF = part.CFrame, skidState = 1, skidAccumulator = 0,
+        Part = part,
+        Attachment = att,
+        AssignedParts = {},
+        TargetPlayer = initialTarget,
+        LastTarget = nil,
+        _running = true,
+        _active = true,
+        source = source or "PAA",
+        rotating = false,
+        smoothedCF = part.CFrame,
+        skidState = 1,
+        skidAccumulator = 0,
     }
+
     local function isPlayerDisabled(pl)
         if not pl then return false end
-        if pl:FindFirstChild("Disabled") and typeof(pl.Disabled.Value) == "boolean" then return pl.Disabled.Value end
+        if pl:FindFirstChild("Disabled") and typeof(pl.Disabled.Value) == "boolean" then
+            return pl.Disabled.Value
+        end
         return false
     end
+
     bh._thread = spawn(function()
         local t = 0
         while bh._running do
             local dt = RunService.Heartbeat:Wait()
             t = t + dt
+
             if bh.TargetPlayer and bh.TargetPlayer ~= localPlayer and not isWhitelisted(bh.TargetPlayer) and isPlayerAlive(bh.TargetPlayer) then
                 if isPlayerDisabled(bh.TargetPlayer) then
                     setBlackHoleActiveState(bh, false)
                 else
                     setBlackHoleActiveState(bh, true)
+
                     local char = bh.TargetPlayer.Character
                     if char and char:FindFirstChild("HumanoidRootPart") then
                         local hrp = char.HumanoidRootPart
-                        local pos = hrp.Position; local vel = hrp.Velocity or Vector3.new(0,0,0); local now = tick()
+                        local pos = hrp.Position
+                        local vel = hrp.Velocity or Vector3.new(0,0,0)
+                        local now = tick()
+
                         local predictedPos, leadTime = predictTargetPosition(bh.TargetPlayer, pos, vel, now)
-                        local dir = (vel.Magnitude > 0.5) and vel.Unit or hrp.CFrame.LookVector
+
+                        local dir
+                        if vel.Magnitude > 0.5 then
+                            dir = vel.Unit
+                        else
+                            dir = hrp.CFrame.LookVector
+                        end
+
                         local halfLen = vel.Magnitude
                         if halfLen < SKID_MIN_HALF_LENGTH then halfLen = SKID_MIN_HALF_LENGTH end
                         halfLen = halfLen * clamp(1 + (leadTime * 1.2), 1, 2.8)
+
                         local desiredPos
                         if SkiddingEnabled then
                             bh.skidAccumulator = bh.skidAccumulator + dt
-                            if bh.skidAccumulator >= SKID_STEP then bh.skidAccumulator = bh.skidAccumulator - SKID_STEP; bh.skidState = -bh.skidState end
+                            if bh.skidAccumulator >= SKID_STEP then
+                                bh.skidAccumulator = bh.skidAccumulator - SKID_STEP
+                                bh.skidState = -bh.skidState
+                            end
                             desiredPos = predictedPos + dir * (bh.skidState * halfLen)
                             local upwardVel = hrp.Velocity.Y
-                            if upwardVel > 1 then desiredPos = desiredPos + Vector3.new(0, clamp(upwardVel * 0.45, 0, halfLen), 0)
-                            elseif upwardVel < -2 then desiredPos = desiredPos + Vector3.new(0, clamp(upwardVel * 0.12, -halfLen, 0), 0) end
+                            if upwardVel > 1 then
+                                local vUp = clamp(upwardVel * 0.45, 0, halfLen)
+                                desiredPos = desiredPos + Vector3.new(0, vUp, 0)
+                            elseif upwardVel < -2 then
+                                desiredPos = desiredPos + Vector3.new(0, clamp(upwardVel * 0.12, -halfLen, 0), 0)
+                            end
                         else
-                            bh.skidAccumulator = 0; bh.skidState = 0; desiredPos = predictedPos
+                            bh.skidAccumulator = 0
+                            bh.skidState = 0
+                            desiredPos = predictedPos
                         end
+
                         local speed = vel.Magnitude
                         local okRot, rotVel = pcall(function() return hrp.RotVelocity end)
                         local rotMag = (okRot and typeof(rotVel) == "Vector3") and rotVel.Magnitude or 0
                         local responsiveness = 10 + (speed * 6) + (rotMag * 0.9) + (leadTime * 25)
                         responsiveness = clamp(responsiveness, 6, 160)
-                        local lookAt = predictedPos; if dir then lookAt = predictedPos + dir end
+
+                        local lookAt = predictedPos
+                        if dir then lookAt = predictedPos + dir end
                         local targetCF = CFrame.new(desiredPos, lookAt)
+
                         local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
                         local curCF = success and cur or bh.smoothedCF or bh.Part.CFrame
+
                         local alpha = 1 - math.exp(-responsiveness * dt)
-                        if alpha < 0.01 then alpha = 0.01 end; if alpha > 0.99 then alpha = 0.99 end
+                        if alpha < 0.01 then alpha = 0.01 end
+                        if alpha > 0.99 then alpha = 0.99 end
+
                         bh.smoothedCF = curCF:Lerp(targetCF, alpha)
-                        if bh.Attachment then bh.Attachment.WorldCFrame = bh.smoothedCF end
+                        if bh.Attachment then
+                            bh.Attachment.WorldCFrame = bh.smoothedCF
+                        end
                     end
                 end
             else
@@ -1181,11 +1392,13 @@ local function createExtraBlackHole(initialTarget, source)
                 if Attachment1 and Attachment1.Parent and bh.Attachment then
                     local success, cur = pcall(function() return bh.Attachment.WorldCFrame end)
                     local curCF = success and cur or bh.smoothedCF or bh.Part.CFrame
-                    local centerCF; pcall(function() centerCF = Attachment1.WorldCFrame end)
+                    local centerCF
+                    pcall(function() centerCF = Attachment1.WorldCFrame end)
                     if centerCF then
                         local targetCF = centerCF
-                        local idleAlpha = 1 - math.exp(-8 * dt)
-                        if idleAlpha < 0.01 then idleAlpha = 0.01 end; if idleAlpha > 0.99 then idleAlpha = 0.99 end
+                        local idleAlpha = 1 - math.exp(- 8 * dt)
+                        if idleAlpha < 0.01 then idleAlpha = 0.01 end
+                        if idleAlpha > 0.99 then idleAlpha = 0.99 end
                         bh.smoothedCF = curCF:Lerp(targetCF, idleAlpha)
                         bh.Attachment.WorldCFrame = bh.smoothedCF
                     end
@@ -1194,6 +1407,7 @@ local function createExtraBlackHole(initialTarget, source)
             end
         end
     end)
+
     table.insert(extraBlackHoles, bh)
     return bh
 end
@@ -1207,8 +1421,11 @@ local function destroyExtraBlackHole(bh)
             local ap = p:FindFirstChildOfClass("AlignPosition")
             if ap then ap.Attachment1 = Attachment1 end
             p.CanCollide = false
-            if initiallyMasslessParts[p] ~= nil then pcall(function() p.Massless = initiallyMasslessParts[p] end)
-            else pcall(function() p.Massless = false end) end
+            if initiallyMasslessParts[p] ~= nil then
+                pcall(function() p.Massless = initiallyMasslessParts[p] end)
+            else
+                pcall(function() p.Massless = false end)
+            end
         end
     end
 end
@@ -1216,26 +1433,50 @@ end
 local function deleteBHsBySource(source)
     for i = #extraBlackHoles, 1, -1 do
         local bh = extraBlackHoles[i]
-        if bh and bh.source == source then destroyExtraBlackHole(bh); table.remove(extraBlackHoles, i) end
+        if bh and bh.source == source then
+            destroyExtraBlackHole(bh)
+            table.remove(extraBlackHoles, i)
+        end
     end
 end
 
-local rotatingCoroutine = nil; local rotatingActive = false
-local function stopRotatingCoroutine() rotatingActive = false; rotatingCoroutine = nil end
+-- rotating/distribution code
+local rotatingCoroutine = nil
+local rotatingActive = false
+local function stopRotatingCoroutine()
+    rotatingActive = false
+    rotatingCoroutine = nil
+end
 
 local function distributeBHListEvenly(bhList, players)
-    for _, bh in ipairs(bhList) do bh.rotating = false; bh.TargetPlayer = nil; bh.AssignedParts = {} end
-    if #players == 0 then
-        for _, bh in ipairs(bhList) do bh.TargetPlayer = nil; setBlackHoleActiveState(bh, false) end
-        stopRotatingCoroutine(); return
+    for _, bh in ipairs(bhList) do
+        bh.rotating = false
+        bh.TargetPlayer = nil
+        bh.AssignedParts = {}
     end
-    local totalBH = #bhList; local playerCount = #players; local base = math.floor(totalBH / playerCount); local remainder = totalBH - (base * playerCount)
+
+    if #players == 0 then
+        for _, bh in ipairs(bhList) do
+            bh.TargetPlayer = nil
+            setBlackHoleActiveState(bh, false)
+        end
+        stopRotatingCoroutine()
+        return
+    end
+
+    local totalBH = #bhList
+    local playerCount = #players
+    local base = math.floor(totalBH / playerCount)
+    local remainder = totalBH - (base * playerCount)
+
     local idx = 1
     for pi = 1, playerCount do
         local pl = players[pi]
         for k = 1, base do
             if bhList[idx] then
-                bhList[idx].TargetPlayer = pl; bhList[idx].rotating = false; setBlackHoleActiveState(bhList[idx], true)
+                bhList[idx].TargetPlayer = pl
+                bhList[idx].rotating = false
+                setBlackHoleActiveState(bhList[idx], true)
                 if pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") and bhList[idx].Attachment then
                     pcall(function() bhList[idx].Attachment.WorldCFrame = pl.Character.HumanoidRootPart.CFrame end)
                 end
@@ -1243,32 +1484,51 @@ local function distributeBHListEvenly(bhList, players)
             end
         end
     end
+
     local rotatingBHs = {}
     for r = 1, remainder do
-        if bhList[idx] then bhList[idx].rotating = true; bhList[idx].TargetPlayer = nil; setBlackHoleActiveState(bhList[idx], true); table.insert(rotatingBHs, bhList[idx]); idx = idx + 1 end
+        if bhList[idx] then
+            bhList[idx].rotating = true
+            bhList[idx].TargetPlayer = nil
+            setBlackHoleActiveState(bhList[idx], true)
+            table.insert(rotatingBHs, bhList[idx])
+            idx = idx + 1
+        end
     end
+
     stopRotatingCoroutine()
     if #rotatingBHs == 0 then return end
+
     rotatingActive = true
     rotatingCoroutine = spawn(function()
         local posIndex = 1
         while rotatingActive do
             local curPlayers = {}
             for _, pl in ipairs(players) do
-                if pl and pl.Parent and isPlayerAlive(pl) and not isWhitelisted(pl) and pl ~= localPlayer then table.insert(curPlayers, pl) end
+                if pl and pl.Parent and isPlayerAlive(pl) and not isWhitelisted(pl) and pl ~= localPlayer then
+                    table.insert(curPlayers, pl)
+                end
             end
             if #curPlayers == 0 then
-                for _, rb in ipairs(rotatingBHs) do rb.TargetPlayer = nil; setBlackHoleActiveState(rb, false) end
+                for _, rb in ipairs(rotatingBHs) do
+                    rb.TargetPlayer = nil
+                    setBlackHoleActiveState(rb, false)
+                end
                 break
             end
+
             for _, rb in ipairs(rotatingBHs) do
                 local pick = curPlayers[((posIndex - 1) % #curPlayers) + 1]
                 if pick and not isWhitelisted(pick) and pick ~= localPlayer and isPlayerAlive(pick) then
-                    rb.TargetPlayer = pick; setBlackHoleActiveState(rb, true)
+                    rb.TargetPlayer = pick
+                    setBlackHoleActiveState(rb, true)
                     if pick.Character and pick.Character:FindFirstChild("HumanoidRootPart") and rb.Attachment then
                         pcall(function() rb.Attachment.WorldCFrame = pick.Character.HumanoidRootPart.CFrame end)
                     end
-                else rb.TargetPlayer = nil; setBlackHoleActiveState(rb, false) end
+                else
+                    rb.TargetPlayer = nil
+                    setBlackHoleActiveState(rb, false)
+                end
                 posIndex = posIndex + 1
             end
             wait(ROTATE_INTERVAL)
@@ -1276,31 +1536,59 @@ local function distributeBHListEvenly(bhList, players)
     end)
 end
 
+-- PAA assignment wrappers
 local function assignTargetsForPAA()
-    local paaBHs = getBHsBySource("PAA"); if #paaBHs == 0 then return end
+    local paaBHs = getBHsBySource("PAA")
+    if #paaBHs == 0 then return end
+
     local players = {}
     if CycleMode and cycleActive then
-        for _, pl in ipairs(cyclePlayers) do if pl and pl.Parent and not cycleDead[pl] and isPlayerAlive(pl) then table.insert(players, pl) end end
+        for _, pl in ipairs(cyclePlayers) do
+            if pl and pl.Parent and not cycleDead[pl] and isPlayerAlive(pl) then
+                table.insert(players, pl)
+            end
+        end
     else
-        if PAA_isUsingSelected then players = getSelectedPlayers(true) else players = getAllNonLocalPlayers() end
+        if PAA_isUsingSelected then
+            players = getSelectedPlayers(true)
+        else
+            players = getAllNonLocalPlayers()
+        end
     end
-    shuffle(paaBHs); distributeBHListEvenly(paaBHs, players)
+
+    shuffle(paaBHs)
+    distributeBHListEvenly(paaBHs, players)
 end
 
 local function refreshPAA()
     deleteBHsBySource("PAA")
     local targets = {}
     if CycleMode and cycleActive then
-        for _, pl in ipairs(cyclePlayers) do if pl and pl.Parent and not cycleDead[pl] and isPlayerAlive(pl) then table.insert(targets, pl) end end
+        for _, pl in ipairs(cyclePlayers) do
+            if pl and pl.Parent and not cycleDead[pl] and isPlayerAlive(pl) then
+                table.insert(targets, pl)
+            end
+        end
     else
-        if PAA_isUsingSelected then targets = getSelectedPlayers(true) else targets = getAllNonLocalPlayers() end
-    end
-    for _, tgt in ipairs(targets) do
-        if tgt and tgt ~= localPlayer and not isWhitelisted(tgt) then
-            local bh = createExtraBlackHole(tgt, "PAA"); bh.TargetPlayer = tgt; bh.LastTarget = nil; setBlackHoleActiveState(bh, true)
-            if tgt.Character and tgt.Character:FindFirstChild("HumanoidRootPart") and bh.Attachment then pcall(function() bh.Attachment.WorldCFrame = tgt.Character.HumanoidRootPart.CFrame end) end
+        if PAA_isUsingSelected then
+            targets = getSelectedPlayers(true)
+        else
+            targets = getAllNonLocalPlayers()
         end
     end
+
+    for _, tgt in ipairs(targets) do
+        if tgt and tgt ~= localPlayer and not isWhitelisted(tgt) then
+            local bh = createExtraBlackHole(tgt, "PAA")
+            bh.TargetPlayer = tgt
+            bh.LastTarget = nil
+            setBlackHoleActiveState(bh, true)
+            if tgt.Character and tgt.Character:FindFirstChild("HumanoidRootPart") and bh.Attachment then
+                pcall(function() bh.Attachment.WorldCFrame = tgt.Character.HumanoidRootPart.CFrame end)
+            end
+        end
+    end
+
     assignTargetsForPAA()
     if #extraBlackHoles > 0 then startRebalancer() end
 end
@@ -1308,7 +1596,10 @@ end
 local function onPlayerAddedForPAA(pl)
     if PAAEnabled and not PAA_isUsingSelected and pl ~= localPlayer and not isWhitelisted(pl) then
         if CycleMode and cycleActive then return end
-        local bh = createExtraBlackHole(pl, "PAA"); bh.TargetPlayer = pl; bh.LastTarget = nil; assignTargetsForPAA()
+        local bh = createExtraBlackHole(pl, "PAA")
+        bh.TargetPlayer = pl
+        bh.LastTarget = nil
+        assignTargetsForPAA()
     end
 end
 
@@ -1316,23 +1607,43 @@ local function onPlayerRemovingForPAA(pl)
     if PAAEnabled then
         for i = #extraBlackHoles, 1, -1 do
             local bh = extraBlackHoles[i]
-            if bh and bh.source == "PAA" and bh.TargetPlayer == pl then destroyExtraBlackHole(bh); table.remove(extraBlackHoles, i); break end
+            if bh and bh.source == "PAA" and bh.TargetPlayer == pl then
+                destroyExtraBlackHole(bh)
+                table.remove(extraBlackHoles, i)
+                break
+            end
         end
         assignTargetsForPAA()
     end
 end
 
+-- Cycle / rebalancer and other management functions
 local function clearCycleConnections()
-    for _, conn in ipairs(cycleConns) do if conn and conn.Disconnect then pcall(function() conn:Disconnect() end) end end
+    for _, conn in ipairs(cycleConns) do
+        if conn and conn.Disconnect then
+            pcall(function() conn:Disconnect() end)
+        end
+    end
     cycleConns = {}
 end
 
-local function stopCycle() cycleActive = false; cyclePlayers = {}; cycleDead = {}; clearCycleConnections(); cycleRestartPending = false end
+local function stopCycle()
+    cycleActive = false
+    cyclePlayers = {}
+    cycleDead = {}
+    clearCycleConnections()
+    cycleRestartPending = false
+end
 
 local function checkCycleCompletionAndMaybeRestart()
     if not cycleActive then return end
-    if #cyclePlayers == 0 then cycleRestartPending = true; return end
-    for _, pl in ipairs(cyclePlayers) do if not cycleDead[pl] then return end end
+    if #cyclePlayers == 0 then
+        cycleRestartPending = true
+        return
+    end
+    for _, pl in ipairs(cyclePlayers) do
+        if not cycleDead[pl] then return end
+    end
     cycleRestartPending = true
 end
 
@@ -1342,27 +1653,47 @@ local function scheduleCycleRestart()
         spawn(function()
             wait(0.12)
             local newSnapshot = {}
-            if targetSelectedActive then newSnapshot = getSelectedPlayers(false) else newSnapshot = getAllNonLocalPlayers() end
-            cyclePlayers = {}; cycleDead = {}
-            for _, pl in ipairs(newSnapshot) do if pl and pl.Parent and pl ~= localPlayer then cyclePlayers[#cyclePlayers+1] = pl; cycleDead[pl] = false end end
+            if targetSelectedActive then
+                newSnapshot = getSelectedPlayers(false)
+            else
+                newSnapshot = getAllNonLocalPlayers()
+            end
+            cyclePlayers = {}
+            cycleDead = {}
+            for _, pl in ipairs(newSnapshot) do
+                if pl and pl.Parent and pl ~= localPlayer then
+                    cyclePlayers[#cyclePlayers+1] = pl
+                    cycleDead[pl] = false
+                end
+            end
             clearCycleConnections()
             for _, pl in ipairs(cyclePlayers) do
                 if pl and pl.Parent then
                     local function onHumanoidAdded(char)
                         local hum = char:FindFirstChildOfClass("Humanoid")
                         if hum then
-                            local dconn = hum.Died:Connect(function() cycleDead[pl] = true; assignTargetsForPAA(); checkCycleCompletionAndMaybeRestart() end)
+                            local dconn = hum.Died:Connect(function()
+                                cycleDead[pl] = true
+                                assignTargetsForPAA()
+                                checkCycleCompletionAndMaybeRestart()
+                            end)
                             table.insert(cycleConns, dconn)
                         end
                     end
                     if pl.Character then onHumanoidAdded(pl.Character) end
-                    local cconn = pl.CharacterAdded:Connect(onHumanoidAdded); table.insert(cycleConns, cconn)
+                    local cconn = pl.CharacterAdded:Connect(onHumanoidAdded)
+                    table.insert(cycleConns, cconn)
                     local rconn = pl.AncestryChanged:Connect(function()
                         if not pl.Parent then
-                            for i = #cyclePlayers, 1, -1 do if cyclePlayers[i] == pl then table.remove(cyclePlayers, i) end end
-                            cycleDead[pl] = true; assignTargetsForPAA(); checkCycleCompletionAndMaybeRestart()
+                            for i = #cyclePlayers, 1, -1 do
+                                if cyclePlayers[i] == pl then table.remove(cyclePlayers, i) end
+                            end
+                            cycleDead[pl] = true
+                            assignTargetsForPAA()
+                            checkCycleCompletionAndMaybeRestart()
                         end
-                    end); table.insert(cycleConns, rconn)
+                    end)
+                    table.insert(cycleConns, rconn)
                 end
             end
             assignTargetsForPAA()
@@ -1371,41 +1702,79 @@ local function scheduleCycleRestart()
 end
 
 local function startCycleSnapshot()
-    stopCycle(); cycleActive = true; cyclePlayers = {}; cycleDead = {}
-    local snapshot = {}; if targetSelectedActive then snapshot = getSelectedPlayers(false) else snapshot = getAllNonLocalPlayers() end
-    for _, pl in ipairs(snapshot) do if pl and pl.Parent and pl ~= localPlayer then cyclePlayers[#cyclePlayers+1] = pl; cycleDead[pl] = false end end
+    stopCycle()
+    cycleActive = true
+    cyclePlayers = {}
+    cycleDead = {}
+    local snapshot = {}
+    if targetSelectedActive then
+        snapshot = getSelectedPlayers(false)
+    else
+        snapshot = getAllNonLocalPlayers()
+    end
+    for _, pl in ipairs(snapshot) do
+        if pl and pl.Parent and pl ~= localPlayer then
+            cyclePlayers[#cyclePlayers+1] = pl
+            cycleDead[pl] = false
+        end
+    end
     clearCycleConnections()
     for _, pl in ipairs(cyclePlayers) do
         if pl and pl.Parent then
             local function attachHumanoidWatcher(char)
                 local hum = char:FindFirstChildOfClass("Humanoid")
                 if hum then
-                    local dconn = hum.Died:Connect(function() cycleDead[pl] = true; assignTargetsForPAA(); checkCycleCompletionAndMaybeRestart(); scheduleCycleRestart() end)
+                    local dconn = hum.Died:Connect(function()
+                        cycleDead[pl] = true
+                        assignTargetsForPAA()
+                        checkCycleCompletionAndMaybeRestart()
+                        scheduleCycleRestart()
+                    end)
                     table.insert(cycleConns, dconn)
                 end
             end
             if pl.Character then attachHumanoidWatcher(pl.Character) end
-            local cconn = pl.CharacterAdded:Connect(attachHumanoidWatcher); table.insert(cycleConns, cconn)
+            local cconn = pl.CharacterAdded:Connect(attachHumanoidWatcher)
+            table.insert(cycleConns, cconn)
             local rconn = pl.AncestryChanged:Connect(function()
                 if not pl.Parent then
-                    for i = #cyclePlayers, 1, -1 do if cyclePlayers[i] == pl then table.remove(cyclePlayers, i) end end
-                    cycleDead[pl] = true; assignTargetsForPAA(); checkCycleCompletionAndMaybeRestart(); scheduleCycleRestart()
+                    for i = #cyclePlayers, 1, -1 do
+                        if cyclePlayers[i] == pl then table.remove(cyclePlayers, i) end
+                    end
+                    cycleDead[pl] = true
+                    assignTargetsForPAA()
+                    checkCycleCompletionAndMaybeRestart()
+                    scheduleCycleRestart()
                 end
-            end); table.insert(cycleConns, rconn)
+            end)
+            table.insert(cycleConns, rconn)
         end
     end
     assignTargetsForPAA()
 end
 
-local function tryStartCycleIfNeeded() if CycleMode and not cycleActive and (targetAllActive or targetSelectedActive) then startCycleSnapshot() end end
-local function endCycleMode() stopCycle() end
-local function resetCycleNow() stopCycle(); startCycleSnapshot() end
+local function tryStartCycleIfNeeded()
+    if CycleMode and not cycleActive and (targetAllActive or targetSelectedActive) then
+        startCycleSnapshot()
+    end
+end
+
+local function endCycleMode()
+    stopCycle()
+end
+
+local function resetCycleNow()
+    stopCycle()
+    startCycleSnapshot()
+end
 
 function startRebalancer()
-    if rebalancerRunning then return end; rebalancerRunning = true
+    if rebalancerRunning then return end
+    rebalancerRunning = true
     spawn(function()
         while rebalancerRunning do
-            local bhCount = #extraBlackHoles; local parts = {}
+            local bhCount = #extraBlackHoles
+            local parts = {}
             for p, _ in pairs(processedParts) do
                 if p and p.Parent then
                     local ap = p:FindFirstChildOfClass("AlignPosition")
@@ -1430,25 +1799,47 @@ function startRebalancer()
                     end
                 end
             end
+
             if bhCount > 0 and #parts > 0 then
-                local total = #parts; local base = math.floor(total / bhCount); local rem = total - (base * bhCount)
-                local counts = {}; for i = 1, bhCount do counts[i] = base + (i <= rem and 1 or 0) end
+                local total = #parts
+                local base = math.floor(total / bhCount)
+                local rem = total - (base * bhCount)
+                local counts = {}
+                for i = 1, bhCount do counts[i] = base + (i <= rem and 1 or 0) end
                 local partIndex = 1
                 for i = 1, bhCount do
-                    local bh = extraBlackHoles[i]; local need = counts[i]
+                    local bh = extraBlackHoles[i]
+                    local need = counts[i]
                     for c = 1, need do
-                        local p = parts[partIndex]; if not p then break end
+                        local p = parts[partIndex]
+                        if not p then break end
                         local ap = p:FindFirstChildOfClass("AlignPosition")
                         if ap then
-                            if bh and bh.Attachment and bh._active then ap.Attachment1 = bh.Attachment; p.CanCollide = false; table.insert(bh.AssignedParts, p)
-                            else ap.Attachment1 = Attachment1; p.CanCollide = false end
+                            if bh and bh.Attachment and bh._active then
+                                ap.Attachment1 = bh.Attachment
+                                p.CanCollide = false
+                                table.insert(bh.AssignedParts, p)
+                                
+                                -- Apply Tween + Weld + Spin when attached to BH
+                                if tweenWeldSpinActive then
+                                    applyTweenWeldSpin(p, bh.Attachment)
+                                    setupSpinning(p)
+                                end
+                            else
+                                ap.Attachment1 = Attachment1
+                                p.CanCollide = false
+                            end
                         end
                         partIndex = partIndex + 1
                     end
                 end
             else
-                for _, p in ipairs(parts) do local ap = p:FindFirstChildOfClass("AlignPosition"); if ap then ap.Attachment1 = Attachment1; p.CanCollide = false end end
+                for _, p in ipairs(parts) do
+                    local ap = p:FindFirstChildOfClass("AlignPosition")
+                    if ap then ap.Attachment1 = Attachment1; p.CanCollide = false end
+                end
             end
+
             if PAAEnabled then assignTargetsForPAA() end
             if cycleRestartPending then scheduleCycleRestart() end
             wait(rebalancerFreq)
@@ -1458,24 +1849,47 @@ end
 
 function stopRebalancer() rebalancerRunning = false end
 
+-- Primary loop
 local function startPrimaryLoop()
-    if primaryLoopRunning then return end; primaryLoopRunning = true
+    if primaryLoopRunning then return end
+    primaryLoopRunning = true
     if not Attachment1 or not Attachment1.Parent then Attachment1 = setupPlayer() end
-    anchoredOnce = false; processWorkspaceParts()
+    anchoredOnce = false
+    processWorkspaceParts()
+    
+    -- Enable anti-tamper when BH loop is active
+    antiTamperActive = true
+
     spawn(function()
-        local phaseT = 0; local lastHeartbeat = tick()
+        local phaseT = 0
+        local lastHeartbeat = tick()
         while targetAllActive or targetSelectedActive do
-            local now = tick(); local dt = now - lastHeartbeat; lastHeartbeat = now; phaseT = phaseT + dt
+            local now = tick()
+            local dt = now - lastHeartbeat
+            lastHeartbeat = now
+            phaseT = phaseT + dt
+
             local targetPlayer
             if targetSelectedActive then
                 local selectedPlayers = getSelectedPlayers(true)
-                if #selectedPlayers > 0 then targetPlayer = selectedPlayers[math.random(1, #selectedPlayers)] else targetPlayer = nil end
-            elseif targetAllActive then targetPlayer = getRandomPlayer() else targetPlayer = nil end
+                if #selectedPlayers > 0 then
+                    targetPlayer = selectedPlayers[math.random(1, #selectedPlayers)]
+                else
+                    targetPlayer = nil
+                end
+            elseif targetAllActive then
+                targetPlayer = getRandomPlayer()
+            else
+                targetPlayer = nil
+            end
+
             if targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") and isPlayerAlive(targetPlayer) then
-                local hrp = targetPlayer.Character.HumanoidRootPart; local vel = hrp.Velocity or Vector3.new(0,0,0)
-                local speed = vel.Magnitude; local dir = (speed > 0.5) and vel.Unit or hrp.CFrame.LookVector
+                local hrp = targetPlayer.Character.HumanoidRootPart
+                local vel = hrp.Velocity or Vector3.new(0,0,0)
+                local speed = vel.Magnitude
+                local dir = (speed > 0.5) and vel.Unit or hrp.CFrame.LookVector
                 local amplitude = clamp(speed * BH_AMPLITUDE_FACTOR, BH_MIN_AMPLITUDE, BH_MAX_AMPLITUDE)
-                local phase = phaseT * (2 * math.pi * (1 / 0.02))
+                local phase = phaseT * (2 * math.pi * (1 / (0.01 * 2)))
                 local primaryOffset = dir * (math.sin(phase) * amplitude)
                 local lateral = hrp.CFrame.RightVector * (math.sin(phase * 1.27) * amplitude * 0.35)
                 local vertical = hrp.CFrame.UpVector * (math.sin(phase * 1.0) * amplitude * 0.5)
@@ -1488,11 +1902,16 @@ local function startPrimaryLoop()
             end
             wait(switchDelay)
         end
+
         primaryLoopRunning = false
+        antiTamperActive = false
         if unanchorTimerRunning and unanchorCoroutine then
             unanchorTimerRunning = false
             for part, anchored in pairs(initiallyAnchoredParts) do
-                if part and part.Parent and anchored == false then part.Anchored = false; ForcePart(part) end
+                if part and part.Parent and anchored == false then
+                    part.Anchored = false
+                    ForcePart(part)
+                end
             end
         end
         clearProcessedParts()
@@ -1502,39 +1921,87 @@ end
 
 local function setTargetAll(value)
     targetAllActive = value
-    if (targetAllActive or targetSelectedActive) then startPrimaryLoop() end
-    if CycleMode then if targetAllActive then tryStartCycleIfNeeded() else endCycleMode() end
+    if (targetAllActive or targetSelectedActive) then 
+        startPrimaryLoop()
+        antiTamperActive = true
+    end
+    if CycleMode then
+        if targetAllActive then tryStartCycleIfNeeded() else endCycleMode() end
+    end
     if PAAEnabled then
         if targetAllActive then
-            PAA_isUsingSelected = false; refreshPAA()
+            PAA_isUsingSelected = false
+            refreshPAA()
             if #paaConnections == 0 then
                 paaConnections[#paaConnections+1] = Players.PlayerAdded:Connect(onPlayerAddedForPAA)
                 paaConnections[#paaConnections+1] = Players.PlayerRemoving:Connect(onPlayerRemovingForPAA)
             end
-        else deleteBHsBySource("PAA") end
+        else
+            deleteBHsBySource("PAA")
+        end
     end
 end
 
 local function setTargetSelected(value)
     targetSelectedActive = value
-    if (targetAllActive or targetSelectedActive) then startPrimaryLoop() end
-    if CycleMode then if targetSelectedActive then tryStartCycleIfNeeded() else endCycleMode() end
+    if (targetAllActive or targetSelectedActive) then 
+        startPrimaryLoop()
+        antiTamperActive = true
+    end
+    if CycleMode then
+        if targetSelectedActive then tryStartCycleIfNeeded() else endCycleMode() end
+    end
     if PAAEnabled then
         if targetSelectedActive then
-            PAA_isUsingSelected = true; refreshPAA()
+            PAA_isUsingSelected = true
+            refreshPAA()
             if #paaConnections == 0 then
                 paaConnections[#paaConnections+1] = Players.PlayerAdded:Connect(onPlayerAddedForPAA)
                 paaConnections[#paaConnections+1] = Players.PlayerRemoving:Connect(onPlayerRemovingForPAA)
             end
-        else deleteBHsBySource("PAA") end
+        else
+            deleteBHsBySource("PAA")
+        end
     end
 end
 
 local function onCharacterAdded(character)
-    if (targetAllActive or targetSelectedActive) then processedParts = {}; processWorkspaceParts() end
+    if (targetAllActive or targetSelectedActive) then
+        processedParts = {}
+        processWorkspaceParts()
+    end
 end
 
 Players.LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+
+-- ====== ANTI-TAMPER GLOBAL MONITOR ======
+-- Monitor workspace for any non-script attachments/welds/forces being added to our parts
+local globalTamperConn = Workspace.DescendantAdded:Connect(function(instance)
+    if not antiTamperActive then return end
+    if not instance:IsA("BasePart") then
+        -- Check if this is being added TO a part we control
+        local parent = instance.Parent
+        while parent do
+            if parent:IsA("BasePart") then
+                -- Check if we process this part
+                if processedParts[parent] or individualPartsData[parent] then
+                    -- Check if it's not our instance
+                    if not isScriptOwned(instance) then
+                        if instance:IsA("Attachment") or instance:IsA("AlignPosition") 
+                           or instance:IsA("Torque") or instance:IsA("BodyMover")
+                           or instance:IsA("Weld") or instance:IsA("WeldConstraint")
+                           or instance:IsA("Snap") or instance:IsA("HingeConstraint")
+                           or instance:IsA("VectorForce") or instance:IsA("AngularVelocity") then
+                            pcall(function() instance:Destroy() end)
+                        end
+                    end
+                end
+                break
+            end
+            parent = parent.Parent
+        end
+    end
+end)
 
 -- ====== GUI ======
 local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/miroeramaa/TurtleLib/main/TurtleUiLib.lua"))()
@@ -1543,25 +2010,32 @@ local window = library:Window("Fix it you panis negor🗣🔥")
 window:Toggle("Unanchored Target All", false, function(Value) setTargetAll(Value) end)
 window:Toggle("Target Selected Players", false, function(Value) setTargetSelected(Value) end)
 
+-- Individual Parts toggle
 window:Toggle("Individual Parts", false, function(Value)
     IndividualPartsEnabled = Value
     if IndividualPartsEnabled then
-        if not targetAllActive and not targetSelectedActive then IndividualPartsEnabled = false; return end
+        if not targetAllActive and not targetSelectedActive then
+            IndividualPartsEnabled = false
+            return
+        end
         startIndividualParts()
-    else stopIndividualParts() end
+    else
+        stopIndividualParts()
+    end
 end)
 
+-- Cycle toggle
 window:Toggle("Cycle", false, function(Value)
     CycleMode = Value
-    if CycleMode then tryStartCycleIfNeeded() else endCycleMode() end
+    if CycleMode then
+        tryStartCycleIfNeeded()
+    else
+        endCycleMode()
+    end
 end)
 
-window:Button("Reset Cycle", function() resetCycleNow() end)
-
--- ====== GATHER PARTS BUTTON ======
-window:Button("Gather Parts", function()
-    if gatherPartsActive then return end
-    startGatherParts()
+window:Button("Reset Cycle", function()
+    resetCycleNow()
 end)
 
 window:Button("Load Player List Script", function()
@@ -1570,6 +2044,56 @@ end)
 
 window:Button("telekinesis/fix target", function()
     loadstring(game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true))()
+end)
+
+-- ====== GATHER PARTS BUTTON ======
+window:Button("Gather Parts", function()
+    if gatherPartsActive then
+        stopGatherParts()
+    else
+        -- Enable anti-tamper
+        antiTamperActive = true
+        startGatherParts()
+        
+        -- Auto-stop after 3 seconds to prevent infinite gathering
+        spawn(function()
+            wait(3)
+            if gatherPartsActive then
+                stopGatherParts()
+            end
+        end)
+    end
+end)
+
+-- ====== TWEEN + WELD + SPIN TOGGLE ======
+window:Toggle("Tween/Weld/Spin Parts", false, function(Value)
+    tweenWeldSpinActive = Value
+    if tweenWeldSpinActive then
+        -- Apply to all currently processed parts attached to BH
+        for part, _ in pairs(processedParts) do
+            if part and part.Parent then
+                local ap = part:FindFirstChildOfClass("AlignPosition")
+                if ap and ap.Attachment1 and ap.Attachment1 ~= Attachment1 then
+                    -- Find which BH this is attached to
+                    for _, bh in ipairs(extraBlackHoles) do
+                        if bh.Attachment == ap.Attachment1 and bh._active then
+                            applyTweenWeldSpin(part, bh.Attachment)
+                            setupSpinning(part)
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    else
+        -- Remove script-owned welds
+        for _, weld in ipairs(scriptOwnedWelds) do
+            if weld and weld.Parent then
+                pcall(function() weld:Destroy() end)
+            end
+        end
+        scriptOwnedWelds = {}
+    end
 end)
 
 local loopCheckActive = false
@@ -1593,35 +2117,43 @@ window:Toggle("Continuous Loop Check", false, function(Value)
     end
 end)
 
+-- PAA toggle
 window:Toggle("PAA/unPAA (player amount BHs)", false, function(Value)
     PAAEnabled = Value
     if PAAEnabled then
-        PAA_isUsingSelected = false; refreshPAA()
+        PAA_isUsingSelected = false
+        refreshPAA()
         paaConnections[#paaConnections+1] = Players.PlayerAdded:Connect(onPlayerAddedForPAA)
         paaConnections[#paaConnections+1] = Players.PlayerRemoving:Connect(onPlayerRemovingForPAA)
     else
         for _, c in ipairs(paaConnections) do pcall(function() c:Disconnect() end) end
-        paaConnections = {}; deleteBHsBySource("PAA")
+        paaConnections = {}
+        deleteBHsBySource("PAA")
     end
 end)
 
+-- Skidding toggle
 window:Toggle("Skidding (0.1s forward/back)", SkiddingEnabled, function(Value)
     SkiddingEnabled = Value
     if not SkiddingEnabled then
-        for _, bh in ipairs(extraBlackHoles) do if bh then bh.skidAccumulator = 0; bh.skidState = 0 end end
+        for _, bh in ipairs(extraBlackHoles) do
+            if bh then bh.skidAccumulator = 0; bh.skidState = 0 end
+        end
     else
-        for _, bh in ipairs(extraBlackHoles) do if bh then bh.skidAccumulator = 0; bh.skidState = 1 end end
+        for _, bh in ipairs(extraBlackHoles) do
+            if bh then bh.skidAccumulator = 0; bh.skidState = 1 end
+        end
     end
 end)
-
--- Initialize anti-tamper / ingredient nullifier / external force nullifier
-setupAntiTamper()
 
 spawn(function()
     while true do
         if PAAEnabled then
-            if PAA_isUsingSelected then if targetSelectedActive then refreshPAA() end
-            else if targetAllActive then refreshPAA() end end
+            if PAA_isUsingSelected then
+                if targetSelectedActive then refreshPAA() end
+            else
+                if targetAllActive then refreshPAA() end
+            end
         end
         wait(2)
     end
