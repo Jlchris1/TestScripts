@@ -9,6 +9,7 @@
 -- * NEW: Gather Parts button - rapidly teleports to far parts, returns to origin
 -- * NEW: Anti-tamper system - nullifies non-BH property adjustments
 -- * NEW: Tween + Weld + Spin when BH attachments are active
+-- * FIXED: Two-tab layout for mobile compatibility
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -125,6 +126,10 @@ local scriptOwnedAttachments = {}
 -- ====== TWEEN + WELD + SPIN STATE ======
 local tweenWeldSpinActive = false
 local spinHeartbeat = nil
+
+-- ====== GATHER BUTTON TEXT TRACKING ======
+local gatherButtonText = "Gather Parts"
+local isGathering = false
 
 -- Prediction helpers
 local playerVelBuffer = {}
@@ -274,7 +279,7 @@ local function setupAntiTamper(part)
             if diff > 500 then
                 -- Check if this is from our gather system
                 local isGatherPart = false
-                for _, gp in ipairs(gatheredPartsList) do
+                for _, gp in pairs(gatheredPartsList) do
                     if gp == part then isGatherPart = true; break end
                 end
                 if not isGatherPart then
@@ -527,6 +532,7 @@ end
 local function startGatherParts()
     if gatherPartsActive then return end
     gatherPartsActive = true
+    isGathering = true
     
     -- Save current position
     local localChar = localPlayer.Character
@@ -573,11 +579,19 @@ local function startGatherParts()
             if not gatherPartsActive then break end
         end
     end)
+    
+    -- Update button text reference if available
+    pcall(function()
+        if _G.gatherBtnRef and _G.gatherBtnRef.SetText then
+            _G.gatherBtnRef:SetText("Stop Gathering")
+        end
+    end)
 end
 
 local function stopGatherParts()
     gatherPartsActive = false
     gatherPartsRunning = false
+    isGathering = false
     
     if gatherPartsHeartbeat then
         gatherPartsHeartbeat:Disconnect()
@@ -614,6 +628,30 @@ local function stopGatherParts()
     gatherPartsOriginalPos = nil
     gatherPartsOriginalCF = nil
     antiTamperActive = false
+    
+    -- Update button text
+    pcall(function()
+        if _G.gatherBtnRef and _G.gatherBtnRef.SetText then
+            _G.gatherBtnRef:SetText("Gather Parts")
+        end
+    end)
+end
+
+local function toggleGatherParts()
+    if isGathering then
+        stopGatherParts()
+    else
+        antiTamperActive = true
+        startGatherParts()
+        
+        -- Auto-stop after 3 seconds
+        spawn(function()
+            wait(3)
+            if gatherPartsActive then
+                stopGatherParts()
+            end
+        end)
+    end
 end
 
 -- ====== TWEEN + WELD + SPIN SYSTEM ======
@@ -2003,15 +2041,40 @@ local globalTamperConn = Workspace.DescendantAdded:Connect(function(instance)
     end
 end)
 
--- ====== GUI ======
+-- ====== GUI - TWO TAB LAYOUT ======
 local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/miroeramaa/TurtleLib/main/TurtleUiLib.lua"))()
 local window = library:Window("Fix it you panis negor🗣🔥")
 
-window:Toggle("Unanchored Target All", false, function(Value) setTargetAll(Value) end)
-window:Toggle("Target Selected Players", false, function(Value) setTargetSelected(Value) end)
+-- ===== TAB 1: CONTROLS (Buttons only - top section) =====
+local controlsTab = window:Tab("Controls")
+
+-- Gather Parts button - positioned first in Controls tab
+controlsTab:Button("Gather Parts", function()
+    toggleGatherParts()
+end)
+
+-- Script loader buttons
+controlsTab:Button("Load Player List Script", function()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/Jlchris1/Udklol/refs/heads/main/Playerlistv6"))()
+end)
+
+controlsTab:Button("Telekinesis/Fix Target", function()
+    loadstring(game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true))()
+end)
+
+controlsTab:Button("Reset Cycle", function()
+    resetCycleNow()
+end)
+
+-- ===== TAB 2: TOGGLES (All toggles here - second section) =====
+local togglesTab = window:Tab("Toggles")
+
+-- Main BH toggles
+togglesTab:Toggle("Unanchored Target All", false, function(Value) setTargetAll(Value) end)
+togglesTab:Toggle("Target Selected Players", false, function(Value) setTargetSelected(Value) end)
 
 -- Individual Parts toggle
-window:Toggle("Individual Parts", false, function(Value)
+togglesTab:Toggle("Individual Parts", false, function(Value)
     IndividualPartsEnabled = Value
     if IndividualPartsEnabled then
         if not targetAllActive and not targetSelectedActive then
@@ -2025,7 +2088,7 @@ window:Toggle("Individual Parts", false, function(Value)
 end)
 
 -- Cycle toggle
-window:Toggle("Cycle", false, function(Value)
+togglesTab:Toggle("Cycle", false, function(Value)
     CycleMode = Value
     if CycleMode then
         tryStartCycleIfNeeded()
@@ -2034,39 +2097,8 @@ window:Toggle("Cycle", false, function(Value)
     end
 end)
 
-window:Button("Reset Cycle", function()
-    resetCycleNow()
-end)
-
-window:Button("Load Player List Script", function()
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/Jlchris1/Udklol/refs/heads/main/Playerlistv6"))()
-end)
-
-window:Button("telekinesis/fix target", function()
-    loadstring(game:HttpGet(('https://raw.githubusercontent.com/SAZXHUB/Control-update/main/README.md'), true))()
-end)
-
--- ====== GATHER PARTS BUTTON ======
-window:Button("Gather Parts", function()
-    if gatherPartsActive then
-        stopGatherParts()
-    else
-        -- Enable anti-tamper
-        antiTamperActive = true
-        startGatherParts()
-        
-        -- Auto-stop after 3 seconds to prevent infinite gathering
-        spawn(function()
-            wait(3)
-            if gatherPartsActive then
-                stopGatherParts()
-            end
-        end)
-    end
-end)
-
--- ====== TWEEN + WELD + SPIN TOGGLE ======
-window:Toggle("Tween/Weld/Spin Parts", false, function(Value)
+-- Tween/Weld/Spin toggle
+togglesTab:Toggle("Tween/Weld/Spin Parts", false, function(Value)
     tweenWeldSpinActive = Value
     if tweenWeldSpinActive then
         -- Apply to all currently processed parts attached to BH
@@ -2096,8 +2128,8 @@ window:Toggle("Tween/Weld/Spin Parts", false, function(Value)
     end
 end)
 
-local loopCheckActive = false
-window:Toggle("Continuous Loop Check", false, function(Value)
+-- Continuous Loop Check toggle
+togglesTab:Toggle("Continuous Loop Check", false, function(Value)
     loopCheckActive = Value
     if loopCheckActive then
         spawn(function()
@@ -2118,7 +2150,7 @@ window:Toggle("Continuous Loop Check", false, function(Value)
 end)
 
 -- PAA toggle
-window:Toggle("PAA/unPAA (player amount BHs)", false, function(Value)
+togglesTab:Toggle("PAA/unPAA (player amount BHs)", false, function(Value)
     PAAEnabled = Value
     if PAAEnabled then
         PAA_isUsingSelected = false
@@ -2133,7 +2165,7 @@ window:Toggle("PAA/unPAA (player amount BHs)", false, function(Value)
 end)
 
 -- Skidding toggle
-window:Toggle("Skidding (0.1s forward/back)", SkiddingEnabled, function(Value)
+togglesTab:Toggle("Skidding (0.1s forward/back)", SkiddingEnabled, function(Value)
     SkiddingEnabled = Value
     if not SkiddingEnabled then
         for _, bh in ipairs(extraBlackHoles) do
@@ -2145,6 +2177,9 @@ window:Toggle("Skidding (0.1s forward/back)", SkiddingEnabled, function(Value)
         end
     end
 end)
+
+-- Keep the loop check variable accessible
+local loopCheckActive = false
 
 spawn(function()
     while true do
