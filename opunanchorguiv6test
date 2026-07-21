@@ -1,4 +1,4 @@
--- Full updated script (client) - Custom 2-tab GUI
+-- Full updated script (client) - Custom 2-tab GUI with persistent settings
 -- Tab 1: Toggles (main BH controls)
 -- Tab 2: Buttons (Gather Parts, Reset Cycle, Load Scripts, Tween/Weld/Spin)
 -- Notes:
@@ -6,10 +6,10 @@
 -- * Skidding stays off when toggled off and is accurate / ping-aware
 -- * Cycle behavior preserved
 -- * PAA only for BH creation; chat commands removed
--- * NEW: Gather Parts button - reusable, rapidly teleports to far parts, returns to origin
--- * NEW: Anti-tamper system - nullifies non-BH property adjustments
--- * NEW: Tween + Weld + Spin when BH attachments are active
--- * NEW: Custom 2-tab GUI (no external library dependencies)
+-- * Gather Parts - teleports to groups of unanchored parts closer to other players, force collects them
+-- * Anti-tamper system - nullifies non-BH property adjustments
+-- * Tween + Weld + Spin when BH attachments are active
+-- * Custom 2-tab GUI with persistent settings & reopen button
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -427,14 +427,15 @@ local function predictTargetPosition(pl, pos, vel, now)
     return predicted, leadTime, accel_est, ping
 end
 
--- ====== GATHER PARTS SYSTEM ======
+-- ====== GATHER PARTS SYSTEM (FIXED - single use, teleports to groups) ======
 
-local function findFarthestPart()
-    local candidates = {}
+local function findPartGroups()
+    -- Find groups of unanchored parts that are closer to other players than to local
     local localChar = localPlayer.Character
-    if not localChar or not localChar:FindFirstChild("HumanoidRootPart") then return nil end
+    if not localChar or not localChar:FindFirstChild("HumanoidRootPart") then return {} end
     local localPos = localChar.HumanoidRootPart.Position
     
+    -- Get other player positions
     local otherPlayers = {}
     for _, pl in ipairs(Players:GetPlayers()) do
         if pl ~= localPlayer and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
@@ -445,157 +446,184 @@ local function findFarthestPart()
         end
     end
     
+    -- Find all candidate parts
+    local allCandidates = {}
     for _, v in ipairs(Workspace:GetDescendants()) do
         pcall(function()
-            if v:IsA("BasePart") and v.Anchored == false and v.Name ~= "Handle"
+            if v:IsA("BasePart") and not v.Anchored and v.Name ~= "Handle"
                 and not isPartPlayerCharacter(v)
                 and not (localChar and v:IsDescendantOf(localChar))
-                and v.CanCollide ~= false then
+                and v.Transparency < 1 then
                 
                 local partPos = v.Position
                 local distToLocal = (partPos - localPos).Magnitude
                 
-                local isFurtherFromLocal = true
+                -- Check if closer to any other player than to local
                 for _, op in ipairs(otherPlayers) do
                     local distToOther = (partPos - op.position).Magnitude
-                    if distToOther >= distToLocal then
-                        isFurtherFromLocal = false
+                    if distToOther < distToLocal and distToLocal > 15 then
+                        table.insert(allCandidates, {
+                            part = v,
+                            position = partPos,
+                            distance = distToLocal,
+                            closestPlayerDist = distToOther
+                        })
                         break
                     end
-                end
-                
-                if isFurtherFromLocal and distToLocal > 10 then
-                    table.insert(candidates, {
-                        part = v,
-                        distance = distToLocal
-                    })
                 end
             end
         end)
     end
     
-    if #candidates == 0 then return nil end
-    table.sort(candidates, function(a, b) return a.distance > b.distance end)
-    return candidates[1].part
+    -- Group by proximity (within 30 studs = same group)
+    local groups = {}
+    local processed = {}
+    
+    for i, candidate in ipairs(allCandidates) do
+        if not processed[i] then
+            local group = {candidate}
+            processed[i] = true
+            
+            for j = i+1, #allCandidates do
+                if not processed[j] then
+                    local dist = (candidate.position - allCandidates[j].position).Magnitude
+                    if dist < 30 then
+                        table.insert(group, allCandidates[j])
+                        processed[j] = true
+                    end
+                end
+            end
+            
+            table.insert(groups, group)
+        end
+    end
+    
+    -- Sort groups by size (largest first)
+    table.sort(groups, function(a, b) return #a > #b end)
+    
+    return groups
 end
 
-local function gatherPart(part)
-    if not part or not part.Parent then return end
+local function forceCollectGroup(group)
+    -- Teleport to the group center and force collect all parts
+    if #group == 0 then return end
     
-    if not gatheredPartsList[part] then
-        gatheredPartsList[part] = {
-            originalCF = part.CFrame,
-            originalPos = part.Position,
-            originalAnchored = part.Anchored,
-            originalCanCollide = part.CanCollide,
-            originalVelocity = part.Velocity,
-            originalRotVelocity = part.RotVelocity
-        }
+    -- Calculate group center
+    local center = Vector3.new(0, 0, 0)
+    for _, item in ipairs(group) do
+        center = center + item.position
+    end
+    center = center / #group
+    
+    -- Teleport local player to group center
+    local char = localPlayer.Character
+    if char and char:FindFirstChild("HumanoidRootPart") then
+        local hrp = char.HumanoidRootPart
+        pcall(function()
+            hrp.CFrame = CFrame.new(center + Vector3.new(0, 5, 0))
+        end)
     end
     
-    local localChar = localPlayer.Character
-    if localChar and localChar:FindFirstChild("HumanoidRootPart") then
-        local hrp = localChar.HumanoidRootPart
-        local offset = Vector3.new(
-            math.random(-15, 15),
-            math.random(0, 20),
-            math.random(-15, 15)
-        )
-        part.CFrame = hrp.CFrame * CFrame.new(offset)
-        part.Velocity = Vector3.new(0, 0, 0)
-        part.RotVelocity = Vector3.new(0, 0, 0)
-    end
-end
-
-local function stopGatherParts(returnToOrigin)
-    if returnToOrigin == nil then returnToOrigin = true end
-    
-    gatherPartsActive = false
-    gatherPartsRunning = false
-    
-    if gatherPartsHeartbeat then
-        gatherPartsHeartbeat:Disconnect()
-        gatherPartsHeartbeat = nil
-    end
-    
-    if gatherTimerThread then
-        gatherTimerThread = nil
-    end
-    
-    for part, data in pairs(gatheredPartsList) do
+    -- Force collect each part in the group
+    for _, item in ipairs(group) do
+        local part = item.part
         if part and part.Parent then
-            local tweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-            local tween = TweenService:Create(part, tweenInfo, {
-                CFrame = data.originalCF,
-                Velocity = Vector3.new(0,0,0),
-                RotVelocity = Vector3.new(0,0,0)
-            })
-            tween:Play()
-            Debris:AddItem(tween, 2)
-        end
-    end
-    
-    if returnToOrigin then
-        local char = localPlayer.Character
-        if char and char:FindFirstChild("HumanoidRootPart") and gatherPartsOriginalCF then
-            local hrp = char.HumanoidRootPart
-            local tweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-            local tween = TweenService:Create(hrp, tweenInfo, {
-                CFrame = gatherPartsOriginalCF
-            })
-            tween:Play()
-        end
-    end
-    
-    wait(1)
-    gatheredPartsList = {}
-    gatherPartsOriginalPos = nil
-    gatherPartsOriginalCF = nil
-    
-    if not targetAllActive and not targetSelectedActive and not IndividualPartsEnabled then
-        antiTamperActive = false
-    end
-end
-
-local function startGatherParts()
-    if gatherPartsActive then
-        stopGatherParts(true)
-        wait(1.5)
-    end
-    
-    gatherPartsActive = true
-    antiTamperActive = true
-    
-    local localChar = localPlayer.Character
-    if localChar and localChar:FindFirstChild("HumanoidRootPart") then
-        gatherPartsOriginalPos = localChar.HumanoidRootPart.Position
-        gatherPartsOriginalCF = localChar.HumanoidRootPart.CFrame
-    end
-    
-    gatheredPartsList = {}
-    gatherPartsRunning = true
-    
-    gatherPartsHeartbeat = RunService.Heartbeat:Connect(function()
-        if not gatherPartsActive or not gatherPartsRunning then return end
-        
-        local targetPart = findFarthestPart()
-        if targetPart then
+            -- Save original state
+            if not gatheredPartsList[part] then
+                gatheredPartsList[part] = {
+                    originalCF = part.CFrame,
+                    originalPos = part.Position,
+                    originalAnchored = part.Anchored,
+                    originalCanCollide = part.CanCollide
+                }
+            end
+            
+            -- Teleport part to local player
             local char = localPlayer.Character
             if char and char:FindFirstChild("HumanoidRootPart") then
                 local hrp = char.HumanoidRootPart
-                local partPos = targetPart.Position
-                pcall(function()
-                    hrp.CFrame = CFrame.new(partPos + Vector3.new(0, 3, 0))
-                end)
-                gatherPart(targetPart)
+                local offset = Vector3.new(
+                    math.random(-8, 8),
+                    math.random(0, 10),
+                    math.random(-8, 8)
+                )
+                part.CFrame = hrp.CFrame * CFrame.new(offset)
+                part.Velocity = Vector3.new(0, 0, 0)
+                part.RotVelocity = Vector3.new(0, 0, 0)
             end
         end
-    end)
+    end
+end
+
+local function runGatherParts()
+    if gatherPartsActive then return end
+    gatherPartsActive = true
+    antiTamperActive = true
     
-    gatherTimerThread = spawn(function()
-        while gatherPartsActive do
-            wait(0.01)
+    -- Save original position
+    local char = localPlayer.Character
+    if char and char:FindFirstChild("HumanoidRootPart") then
+        gatherPartsOriginalPos = char.HumanoidRootPart.Position
+        gatherPartsOriginalCF = char.HumanoidRootPart.CFrame
+    end
+    
+    gatheredPartsList = {}
+    
+    -- Single-use: find groups and collect them
+    spawn(function()
+        local groups = findPartGroups()
+        
+        if #groups == 0 then
+            -- No groups found, try scanning one more time
+            wait(0.1)
+            groups = findPartGroups()
+        end
+        
+        -- Process each group
+        for i, group in ipairs(groups) do
             if not gatherPartsActive then break end
+            forceCollectGroup(group)
+            wait(0.08) -- Small delay between groups for server to catch up
+        end
+        
+        -- Wait a moment then return to origin
+        wait(0.5)
+        
+        -- Return parts to original positions
+        for part, data in pairs(gatheredPartsList) do
+            if part and part.Parent then
+                local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+                local tween = TweenService:Create(part, tweenInfo, {
+                    CFrame = data.originalCF,
+                    Velocity = Vector3.new(0,0,0),
+                    RotVelocity = Vector3.new(0,0,0)
+                })
+                tween:Play()
+                Debris:AddItem(tween, 2)
+            end
+        end
+        
+        -- Return local player to original position
+        if gatherPartsOriginalCF then
+            local char = localPlayer.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                local hrp = char.HumanoidRootPart
+                local tweenInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+                local tween = TweenService:Create(hrp, tweenInfo, {
+                    CFrame = gatherPartsOriginalCF
+                })
+                tween:Play()
+            end
+        end
+        
+        wait(1)
+        gatheredPartsList = {}
+        gatherPartsOriginalPos = nil
+        gatherPartsOriginalCF = nil
+        gatherPartsActive = false
+        
+        if not targetAllActive and not targetSelectedActive and not IndividualPartsEnabled then
+            antiTamperActive = false
         end
     end)
 end
@@ -1958,15 +1986,28 @@ local globalTamperConn = Workspace.DescendantAdded:Connect(function(instance)
     end
 end)
 
--- ====== CUSTOM GUI (no external dependencies) ======
+-- ====== PERSISTENT TOGGLE STATE ======
+local toggleStates = {}
 
--- Create ScreenGui
+local function getToggleState(name, default)
+    if toggleStates[name] == nil then
+        toggleStates[name] = default
+    end
+    return toggleStates[name]
+end
+
+local function setToggleState(name, value)
+    toggleStates[name] = value
+end
+
+-- ====== CUSTOM GUI ======
+
+-- Main GUI container
 local gui = Instance.new("ScreenGui")
 gui.Name = "BlackHoleGUI"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
--- Try to parent to CoreGui, fallback to PlayerGui
 local success, err = pcall(function()
     gui.Parent = CoreGui
 end)
@@ -1988,7 +2029,38 @@ local COLORS = {
     TextDim = Color3.fromRGB(150, 150, 170),
     Accent = Color3.fromRGB(100, 150, 255),
     SectionHeader = Color3.fromRGB(50, 50, 70),
+    ReopenBtn = Color3.fromRGB(40, 60, 120),
 }
+
+-- Reopen button (tiny draggable button at top)
+local reopenBtn = Instance.new("TextButton")
+reopenBtn.Name = "ReopenBtn"
+reopenBtn.Size = UDim2.new(0, 50, 0, 20)
+reopenBtn.Position = UDim2.new(0.5, -25, 0, 0)
+reopenBtn.BackgroundColor3 = COLORS.ReopenBtn
+reopenBtn.Text = "☰ BH"
+reopenBtn.TextColor3 = COLORS.Text
+reopenBtn.Font = Enum.Font.GothamBold
+reopenBtn.TextSize = 11
+reopenBtn.BorderSizePixel = 0
+reopenBtn.BackgroundTransparency = 0.3
+reopenBtn.Active = true
+reopenBtn.Draggable = true
+reopenBtn.Visible = false  -- Hidden by default since GUI starts open
+reopenBtn.Parent = gui
+
+local reopenCorner = Instance.new("UICorner")
+reopenCorner.CornerRadius = UDim.new(0, 4)
+reopenCorner.Parent = reopenBtn
+
+reopenBtn.MouseEnter:Connect(function()
+    reopenBtn.BackgroundTransparency = 0
+end)
+reopenBtn.MouseLeave:Connect(function()
+    reopenBtn.BackgroundTransparency = 0.3
+end)
+
+-- ====== MAIN GUI CONSTRUCTION ======
 
 -- Main frame
 local mainFrame = Instance.new("Frame")
@@ -2012,7 +2084,6 @@ shadow.BorderSizePixel = 0
 shadow.ZIndex = -1
 shadow.Parent = mainFrame
 
--- Main corner
 local mainCorner = Instance.new("UICorner")
 mainCorner.CornerRadius = UDim.new(0, 6)
 mainCorner.Parent = mainFrame
@@ -2029,11 +2100,6 @@ local headerCorner = Instance.new("UICorner")
 headerCorner.CornerRadius = UDim.new(0, 6)
 headerCorner.Parent = header
 
--- Header top rounded only
-local headerTopRound = Instance.new("UICorner")
-headerTopRound.CornerRadius = UDim.new(0, 6)
-headerTopRound.Parent = header
--- Overlap bottom
 local headerBottomRect = Instance.new("Frame")
 headerBottomRect.Size = UDim2.new(1, 0, 0, 6)
 headerBottomRect.Position = UDim2.new(0, 0, 1, -6)
@@ -2071,7 +2137,14 @@ closeCorner.CornerRadius = UDim.new(0, 4)
 closeCorner.Parent = closeBtn
 
 closeBtn.MouseButton1Click:Connect(function()
-    gui:Destroy()
+    mainFrame.Visible = false
+    reopenBtn.Visible = true
+end)
+
+-- Reopen button logic
+reopenBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = true
+    reopenBtn.Visible = false
 end)
 
 -- Tab buttons container
@@ -2139,7 +2212,6 @@ local function createTabButton(name, icon)
     
     tabBtn.MouseButton1Click:Connect(function()
         currentTab = name
-        -- Update all tab visuals
         for _, btn in ipairs(tabButtons) do
             btn.BackgroundColor3 = COLORS.TabInactive
             btn.TextColor3 = COLORS.TextDim
@@ -2147,14 +2219,13 @@ local function createTabButton(name, icon)
         tabBtn.BackgroundColor3 = COLORS.TabActive
         tabBtn.TextColor3 = COLORS.Text
         
-        -- Clear content
+        -- Clear and rebuild
         for _, child in ipairs(scrollingFrame:GetChildren()) do
             if child ~= uiListLayout and child ~= uiPadding then
                 child:Destroy()
             end
         end
         
-        -- Rebuild content for this tab
         if name == "Toggles" then
             buildTogglesTab()
         else
@@ -2166,16 +2237,13 @@ local function createTabButton(name, icon)
     return tabBtn
 end
 
--- Create "Toggle" tab button
 createTabButton("Toggles", "⚙")
--- Create "Actions" tab button
 createTabButton("Actions", "⚡")
 
--- Set initial active tab
 tabButtons[1].BackgroundColor3 = COLORS.TabActive
 tabButtons[1].TextColor3 = COLORS.Text
 
--- Helper: Create a section label
+-- Create section label
 local function createSectionLabel(name)
     local sectionFrame = Instance.new("Frame")
     sectionFrame.Name = "Section_" .. name
@@ -2202,8 +2270,11 @@ local function createSectionLabel(name)
     return sectionFrame
 end
 
--- Helper: Create a toggle
-local function createToggle(name, defaultValue, callback)
+-- Create toggle (with persistent state)
+local function createToggle(name, defaultVal, callback)
+    local stateKey = name
+    local initialState = getToggleState(stateKey, defaultVal)
+    
     local toggleFrame = Instance.new("Frame")
     toggleFrame.Name = "Toggle_" .. name
     toggleFrame.Size = UDim2.new(1, -10, 0, 32)
@@ -2231,7 +2302,7 @@ local function createToggle(name, defaultValue, callback)
     toggleBtn.Name = "ToggleBtn"
     toggleBtn.Size = UDim2.new(0, 36, 0, 20)
     toggleBtn.Position = UDim2.new(1, -44, 0.5, -10)
-    toggleBtn.BackgroundColor3 = defaultValue and COLORS.ToggleOn or COLORS.ToggleOff
+    toggleBtn.BackgroundColor3 = initialState and COLORS.ToggleOn or COLORS.ToggleOff
     toggleBtn.Text = ""
     toggleBtn.BorderSizePixel = 0
     toggleBtn.Parent = toggleFrame
@@ -2243,7 +2314,7 @@ local function createToggle(name, defaultValue, callback)
     local toggleIndicator = Instance.new("Frame")
     toggleIndicator.Name = "Indicator"
     toggleIndicator.Size = UDim2.new(0, 16, 0, 16)
-    toggleIndicator.Position = UDim2.new(defaultValue and 1 or 0, defaultValue and -18 or 2, 0.5, -8)
+    toggleIndicator.Position = UDim2.new(initialState and 1 or 0, initialState and -18 or 2, 0.5, -8)
     toggleIndicator.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     toggleIndicator.BorderSizePixel = 0
     toggleIndicator.Parent = toggleBtn
@@ -2252,7 +2323,7 @@ local function createToggle(name, defaultValue, callback)
     indicatorCorner.CornerRadius = UDim.new(0, 8)
     indicatorCorner.Parent = toggleIndicator
     
-    local toggled = defaultValue
+    local toggled = initialState
     
     local function updateVisual()
         toggleBtn.BackgroundColor3 = toggled and COLORS.ToggleOn or COLORS.ToggleOff
@@ -2267,21 +2338,28 @@ local function createToggle(name, defaultValue, callback)
     
     toggleBtn.MouseButton1Click:Connect(function()
         toggled = not toggled
+        setToggleState(stateKey, toggled)
         updateVisual()
         pcall(callback, toggled)
     end)
+    
+    -- Fire initial callback with restored state
+    if initialState ~= defaultVal then
+        pcall(callback, initialState)
+    end
     
     return {
         frame = toggleFrame,
         set = function(val)
             toggled = val
+            setToggleState(stateKey, val)
             updateVisual()
         end,
         get = function() return toggled end
     }
 end
 
--- Helper: Create a button
+-- Create button
 local function createActionButton(name, callback, color)
     local btnFrame = Instance.new("Frame")
     btnFrame.Name = "Btn_" .. name
@@ -2407,17 +2485,7 @@ function buildActionsTab()
     createSectionLabel("Gathering")
     
     createActionButton("Gather Parts", function()
-        if gatherPartsActive then
-            stopGatherParts(true)
-        else
-            startGatherParts()
-            spawn(function()
-                wait(3)
-                if gatherPartsActive then
-                    stopGatherParts(false) -- keep parts, don't return
-                end
-            end)
-        end
+        runGatherParts()
     end, Color3.fromRGB(50, 180, 80))
     
     createSectionLabel("Tween / Weld / Spin")
@@ -2466,7 +2534,7 @@ function buildActionsTab()
     end, Color3.fromRGB(100, 80, 180))
 end
 
--- Initialize with Toggles tab
+-- Initial build
 buildTogglesTab()
 
 -- ====== BACKGROUND LOOPS ======
