@@ -150,7 +150,7 @@ end
 -- Security target rule shared by global and selected-NPC controls:
 -- include NPCs only when the local player is strictly closer than every other
 -- living player. Process nearest-to-local targets first, then group nearby NPCs.
-local function isCloserToAnotherPlayer(model, localPosition)
+function Sec.isCloserToAnotherPlayer(model, localPosition)
     local npcPart = getBestPartForModel(model)
     if not npcPart or not localPosition then return false end
     local localDistance = (npcPart.Position - localPosition).Magnitude
@@ -174,7 +174,7 @@ function Sec.getSecurityNPCsFromList(models)
     local localPosition = Sec.getLocalPlayerPosition()
     if not localPosition then return result end
     for _, model in ipairs(models or {}) do
-        if model and model.Parent and isNPC(model) and isCloserToAnotherPlayer(model, localPosition) then
+        if model and model.Parent and isNPC(model) and Sec.isCloserToAnotherPlayer(model, localPosition) then
             table.insert(result, model)
         end
     end
@@ -261,14 +261,14 @@ local function flingModel(model, power)
 end
 
 local anchored = setmetatable({}, { __mode = "k" })
-local anchorScopeModels = {}
+Sec.anchorScopeModels = {}
 -- Tracks the intended state per button/type scope, not just the last NPCs seen.
 -- This lets loop-anchor include newly spawned NPCs and makes the next manual
 -- click reliably unanchor the entire remembered scope.
-local anchorScopeEnabled = {}
+Sec.anchorScopeEnabled = {}
 
 -- Idempotent anchoring: loop-anchor always sets true instead of flipping state.
-local function setModelAnchored(model, shouldAnchor)
+function Sec.setModelAnchored(model, shouldAnchor)
     if not model or not model.Parent or not isAllowed(model, "Anchor") then return end
     local foundPart = false
     iterateParts(model, function(part)
@@ -278,21 +278,21 @@ local function setModelAnchored(model, shouldAnchor)
     if foundPart then anchored[model] = shouldAnchor else anchored[model] = nil end
 end
 
-local function getAnchorScope(scopeKey)
+function Sec.getAnchorScope(scopeKey)
     scopeKey = scopeKey or "default"
-    if not anchorScopeModels[scopeKey] then
-        anchorScopeModels[scopeKey] = setmetatable({}, { __mode = "k" })
+    if not Sec.anchorScopeModels[scopeKey] then
+        Sec.anchorScopeModels[scopeKey] = setmetatable({}, { __mode = "k" })
     end
-    return anchorScopeModels[scopeKey]
+    return Sec.anchorScopeModels[scopeKey]
 end
 
 function Sec.setAnchorList(models, shouldAnchor, scopeKey)
     scopeKey = scopeKey or "default"
-    local scope = getAnchorScope(scopeKey)
-    anchorScopeEnabled[scopeKey] = shouldAnchor == true
+    local scope = Sec.getAnchorScope(scopeKey)
+    Sec.anchorScopeEnabled[scopeKey] = shouldAnchor == true
     for _, model in ipairs(models or {}) do
         if model and model.Parent and isAllowed(model, "Anchor") then
-            setModelAnchored(model, shouldAnchor == true)
+            Sec.setModelAnchored(model, shouldAnchor == true)
             if shouldAnchor then
                 scope[model] = true
             else
@@ -304,9 +304,9 @@ end
 
 function Sec.toggleAnchorForList(models, scopeKey)
     scopeKey = scopeKey or "default"
-    local scope = getAnchorScope(scopeKey)
-    local isCurrentlyOn = anchorScopeEnabled[scopeKey] == true
-    if anchorScopeEnabled[scopeKey] == nil then
+    local scope = Sec.getAnchorScope(scopeKey)
+    local isCurrentlyOn = Sec.anchorScopeEnabled[scopeKey] == true
+    if Sec.anchorScopeEnabled[scopeKey] == nil then
         for model in pairs(scope) do
             if model and model.Parent and anchored[model] == true then
                 isCurrentlyOn = true
@@ -326,21 +326,21 @@ function Sec.toggleAnchorForList(models, scopeKey)
     if isCurrentlyOn then
         -- Toggle OFF: unanchor every NPC this scope ever anchored, plus the
         -- currently eligible list, including newly spawned models.
-        anchorScopeEnabled[scopeKey] = false
+        Sec.anchorScopeEnabled[scopeKey] = false
         for model in pairs(scope) do
-            if model and model.Parent then setModelAnchored(model, false) end
+            if model and model.Parent then Sec.setModelAnchored(model, false) end
             scope[model] = nil
         end
         for _, model in ipairs(models or {}) do
-            if model and model.Parent then setModelAnchored(model, false) end
+            if model and model.Parent then Sec.setModelAnchored(model, false) end
         end
     else
         -- Toggle ON: remember the whole current set. The loop handler will add
         -- new NPCs to this same scope on each pass while the loop is enabled.
-        anchorScopeEnabled[scopeKey] = true
+        Sec.anchorScopeEnabled[scopeKey] = true
         for _, model in ipairs(models or {}) do
             if model and model.Parent and isAllowed(model, "Anchor") then
-                setModelAnchored(model, true)
+                Sec.setModelAnchored(model, true)
                 scope[model] = true
             end
         end
@@ -795,12 +795,12 @@ smallEquipToggle.MouseButton1Click:Connect(function()
     if sg and sg:IsA("ScreenGui") then
         sg.Enabled = not sg.Enabled
         if sg.Enabled then
-            smallEquipToggle.Text = "Ã—"
+            smallEquipToggle.Text = "×"
         else
             smallEquipToggle.Text = "+"
         end
     else
-        smallEquipToggle.Text = "Ã—"
+        smallEquipToggle.Text = "×"
     end
 end)
 
@@ -1098,8 +1098,8 @@ end
 
 -- Controls & Utilities (compact rows)
 local killBtn, killLoopBtn = makeRow(ctrlScroll, "Kill All")
-local secureKillBtn, secureKillLoopBtn = makeRow(ctrlScroll, "Secure Kill All NPCs")
-secureKillBtn.TextSize = 10 -- fit the longer label in the compact GUI
+Sec.secureKillBtn, Sec.secureKillLoopBtn = makeRow(ctrlScroll, "Secure Kill All NPCs")
+Sec.secureKillBtn.TextSize = 10 -- fit the longer label in the compact GUI
 local flingBoxRow = Instance.new("Frame"); flingBoxRow.Size = UDim2.new(1,0,0,BTN_H); flingBoxRow.BackgroundTransparency = 1; flingBoxRow.Parent = ctrlScroll; flingBoxRow.ZIndex = 100000
 local flingBox = Instance.new("TextBox"); flingBox.Size = UDim2.new(0.56,0,1,0); flingBox.Position = UDim2.new(0,0,0,0); flingBox.PlaceholderText = "Fling"; flingBox.Text = "200"; flingBox.BackgroundColor3 = Color3.fromRGB(50,50,50); flingBox.TextColor3 = Color3.new(1,1,1); flingBox.BorderSizePixel = 0; flingBox.Font = Enum.Font.Gotham; flingBox.TextSize = SMALL_FONT; flingBox.Parent = flingBoxRow; flingBox.ZIndex = 100000
 local flingBtn = Instance.new("TextButton"); flingBtn.Size = UDim2.new(0.42, -6, 1, 0); flingBtn.Position = UDim2.new(0.56, 6, 0, 0); flingBtn.BackgroundColor3 = Color3.fromRGB(100,50,50); flingBtn.BorderSizePixel = 0; flingBtn.Font = Enum.Font.Gotham; flingBtn.TextSize = SMALL_FONT; flingBtn.TextColor3 = Color3.new(1,1,1); flingBtn.Text = "Fling"; flingBtn.Parent = flingBoxRow; flingBtn.ZIndex = 100000
@@ -1125,21 +1125,21 @@ local jumpBtn, jumpLoopBtn = makeRow(utilScroll, "Jump")
 
 -- Security actions use grouped CFrame teleports and prioritize NPCs for which the local player is the nearest living player.
 -- Speed, JumpPower, HipHeight, and Tracker intentionally have no secure row.
-local secureUI = {}
-secureUI.flingBtn, secureUI.flingLoopBtn = makeRow(ctrlScroll, "Secure Fling")
-secureUI.killFlingBtn, secureUI.killFlingLoopBtn = makeRow(ctrlScroll, "Secure Kill+Fling")
-secureUI.psBtn, secureUI.psLoopBtn = makeRow(ctrlScroll, "Secure PlatformStand")
-secureUI.sitBtn, secureUI.sitLoopBtn = makeRow(ctrlScroll, "Secure Sit")
-secureUI.anchorBtn, secureUI.anchorLoopBtn = makeRow(ctrlScroll, "Secure Anchor")
-secureUI.cancelChaseBtn, secureUI.cancelChaseLoopBtn = makeRow(ctrlScroll, "Secure Cancel-Chase")
-secureUI.v4Btn, secureUI.v4LoopBtn = makeRow(ctrlScroll, "Secure Void v4")
-secureUI.getRidBtn, secureUI.getRidLoopBtn = makeRow(utilScroll, "Secure Get Rid")
-secureUI.eraseBtn, secureUI.eraseLoopBtn = makeRow(utilScroll, "Secure Erase")
-secureUI.spasmBtn, secureUI.spasmLoopBtn = makeRow(utilScroll, "Secure Spasm")
-secureUI.jumpBtn, secureUI.jumpLoopBtn = makeRow(utilScroll, "Secure Jump")
+Sec.secureUI = {}
+Sec.secureUI.flingBtn, Sec.secureUI.flingLoopBtn = makeRow(ctrlScroll, "Secure Fling")
+Sec.secureUI.killFlingBtn, Sec.secureUI.killFlingLoopBtn = makeRow(ctrlScroll, "Secure Kill+Fling")
+Sec.secureUI.psBtn, Sec.secureUI.psLoopBtn = makeRow(ctrlScroll, "Secure PlatformStand")
+Sec.secureUI.sitBtn, Sec.secureUI.sitLoopBtn = makeRow(ctrlScroll, "Secure Sit")
+Sec.secureUI.anchorBtn, Sec.secureUI.anchorLoopBtn = makeRow(ctrlScroll, "Secure Anchor")
+Sec.secureUI.cancelChaseBtn, Sec.secureUI.cancelChaseLoopBtn = makeRow(ctrlScroll, "Secure Cancel-Chase")
+Sec.secureUI.v4Btn, Sec.secureUI.v4LoopBtn = makeRow(ctrlScroll, "Secure Void v4")
+Sec.secureUI.getRidBtn, Sec.secureUI.getRidLoopBtn = makeRow(utilScroll, "Secure Get Rid")
+Sec.secureUI.eraseBtn, Sec.secureUI.eraseLoopBtn = makeRow(utilScroll, "Secure Erase")
+Sec.secureUI.spasmBtn, Sec.secureUI.spasmLoopBtn = makeRow(utilScroll, "Secure Spasm")
+Sec.secureUI.jumpBtn, Sec.secureUI.jumpLoopBtn = makeRow(utilScroll, "Secure Jump")
 for _, secureButton in ipairs({
-    secureUI.flingBtn, secureUI.killFlingBtn, secureUI.psBtn, secureUI.sitBtn, secureUI.anchorBtn,
-    secureUI.cancelChaseBtn, secureUI.v4Btn, secureUI.getRidBtn, secureUI.eraseBtn, secureUI.spasmBtn, secureUI.jumpBtn
+    Sec.secureUI.flingBtn, Sec.secureUI.killFlingBtn, Sec.secureUI.psBtn, Sec.secureUI.sitBtn, Sec.secureUI.anchorBtn,
+    Sec.secureUI.cancelChaseBtn, Sec.secureUI.v4Btn, Sec.secureUI.getRidBtn, Sec.secureUI.eraseBtn, Sec.secureUI.spasmBtn, Sec.secureUI.jumpBtn
 }) do
     secureButton.TextSize = 10
 end
@@ -2366,12 +2366,12 @@ end)
 -- kill each group together, and restore the original character CFrame.
 -- This remains a LocalScript; server-authoritative NPCs may require server-side
 -- authorization for Humanoid health changes to replicate.
-local SECURE_KILL_GROUP_RADIUS = 55
-local SECURE_KILL_GROUP_DELAY = 0.12
-local secureKillRunToken = 0
-local secureKillBusy = false
+Sec.SECURE_KILL_GROUP_RADIUS = 55
+Sec.SECURE_KILL_GROUP_DELAY = 0.12
+Sec.secureKillRunToken = 0
+Sec.secureKillBusy = false
 
-local function getCharacterRoot()
+function Sec.getCharacterRoot()
     local character = player.Character
     if not character then return nil end
     return character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
@@ -2381,7 +2381,7 @@ end
 -- without putting HumanoidRootPart exactly at the requested position (especially
 -- on rigs whose model pivot is offset), so calculate the character-wide delta,
 -- then verify/fallback to the root CFrame after physics has had a frame to update.
-local function secureTeleportRootTo(targetRootCFrame)
+function Sec.secureTeleportRootTo(targetRootCFrame)
     local character = player.Character
     local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
     if not character or not root or not targetRootCFrame then return false end
@@ -2412,7 +2412,7 @@ local function secureTeleportRootTo(targetRootCFrame)
     return true
 end
 
-local function secureRestoreCharacter(savedPivot, savedRootCFrame)
+function Sec.secureRestoreCharacter(savedPivot, savedRootCFrame)
     local character = player.Character
     local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
     if not character then return end
@@ -2429,7 +2429,7 @@ end
 
 -- Greedy spatial grouping: each batch contains NPCs within the radius of its
 -- anchor NPC, so the character visits groups rather than every individual NPC.
-local function makeSecureKillGroups(targets)
+function Sec.makeSecureKillGroups(targets)
     local remaining = {}
     for _, model in ipairs(targets) do
         local part = getBestPartForModel(model)
@@ -2446,7 +2446,7 @@ local function makeSecureKillGroups(targets)
         local count = 1
         local i = 1
         while i <= #remaining do
-            if (remaining[i].position - seed.position).Magnitude <= SECURE_KILL_GROUP_RADIUS then
+            if (remaining[i].position - seed.position).Magnitude <= Sec.SECURE_KILL_GROUP_RADIUS then
                 local entry = table.remove(remaining, i)
                 table.insert(group, entry.model)
                 totalPosition += entry.position
@@ -2485,9 +2485,9 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
     -- Decide Anchor's click state once for the entire run, not once per group.
     local anchorShouldSet = true
     if effect == "Anchor" and not isLoopPass then
-        local scope = getAnchorScope(scopeKey)
-        local currentlyOn = anchorScopeEnabled[scopeKey] == true
-        if anchorScopeEnabled[scopeKey] == nil then
+        local scope = Sec.getAnchorScope(scopeKey)
+        local currentlyOn = Sec.anchorScopeEnabled[scopeKey] == true
+        if Sec.anchorScopeEnabled[scopeKey] == nil then
             for model in pairs(scope) do
                 if model and model.Parent and anchored[model] == true then
                     currentlyOn = true
@@ -2498,19 +2498,19 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
         anchorShouldSet = not currentlyOn
         if currentlyOn then
             -- Toggle OFF the entire previous scope before visiting current groups.
-            anchorScopeEnabled[scopeKey] = false
+            Sec.anchorScopeEnabled[scopeKey] = false
             for model in pairs(scope) do
-                if model and model.Parent then setModelAnchored(model, false) end
+                if model and model.Parent then Sec.setModelAnchored(model, false) end
                 scope[model] = nil
             end
         else
-            anchorScopeEnabled[scopeKey] = true
+            Sec.anchorScopeEnabled[scopeKey] = true
         end
     elseif effect == "Anchor" and isLoopPass then
-        anchorScopeEnabled[scopeKey] = true
+        Sec.anchorScopeEnabled[scopeKey] = true
     end
     -- The security provider already sorts by distance from the local player.
-    local groups = makeSecureKillGroups(targets)
+    local groups = Sec.makeSecureKillGroups(targets)
     local ok, err = pcall(function()
         for _, group in ipairs(groups) do
             if keepRunning and not keepRunning() then break end
@@ -2528,7 +2528,7 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
                 local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startRootCFrame - startRootCFrame.Position)
                 -- Use the same verified root teleport for every Secure effect,
                 -- including utility effects that previously appeared not to move.
-                if not secureTeleportRootTo(targetCFrame) then break end
+                if not Sec.secureTeleportRootTo(targetCFrame) then break end
                 if effect == "Kill" then
                     killAllSimultaneousForList(live)
                 elseif effect == "KillFling" then
@@ -2546,21 +2546,21 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
                         Sec.applySingleAction(effect, model, power)
                     end
                 end
-                task.wait(SECURE_KILL_GROUP_DELAY)
+                task.wait(Sec.SECURE_KILL_GROUP_DELAY)
             end
         end
     end)
-    secureRestoreCharacter(startPivot, startRootCFrame)
+    Sec.secureRestoreCharacter(startPivot, startRootCFrame)
     if not ok then warn("Secure grouped action failed (" .. tostring(effect) .. "): " .. tostring(err)) end
 end
 
 local function secureKillAllNPCs(runToken, isLoopRun)
-    if secureKillBusy then return end
-    secureKillBusy = true
+    if Sec.secureKillBusy then return end
+    Sec.secureKillBusy = true
 
-    local startingRoot = getCharacterRoot()
+    local startingRoot = Sec.getCharacterRoot()
     if not startingRoot then
-        secureKillBusy = false
+        Sec.secureKillBusy = false
         return
     end
 
@@ -2575,9 +2575,9 @@ local function secureKillAllNPCs(runToken, isLoopRun)
         end
     end
 
-    local groups = makeSecureKillGroups(targets)
+    local groups = Sec.makeSecureKillGroups(targets)
     for _, group in ipairs(groups) do
-        if runToken ~= secureKillRunToken or (isLoopRun and not loops.secureKillAll) then
+        if runToken ~= Sec.secureKillRunToken or (isLoopRun and not loops.secureKillAll) then
             break
         end
 
@@ -2591,11 +2591,11 @@ local function secureKillAllNPCs(runToken, isLoopRun)
 
         if #liveGroup > 0 then
             local currentCharacter = player.Character
-            local currentRoot = getCharacterRoot()
+            local currentRoot = Sec.getCharacterRoot()
             if not currentCharacter or not currentRoot then break end
             local ok = pcall(function()
                 local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startingCFrame - startingCFrame.Position)
-                if not secureTeleportRootTo(targetCFrame) then error("Secure teleport failed") end
+                if not Sec.secureTeleportRootTo(targetCFrame) then error("Secure teleport failed") end
                 for _, model in ipairs(liveGroup) do
                     local hum = model:FindFirstChildOfClass("Humanoid")
                     if hum then
@@ -2610,35 +2610,35 @@ local function secureKillAllNPCs(runToken, isLoopRun)
             if not ok then
                 -- A bad NPC should not stop the remaining groups from being processed.
             end
-            task.wait(SECURE_KILL_GROUP_DELAY)
+            task.wait(Sec.SECURE_KILL_GROUP_DELAY)
         end
     end
 
-    secureRestoreCharacter(startingPivot, startingCFrame)
-    secureKillBusy = false
+    Sec.secureRestoreCharacter(startingPivot, startingCFrame)
+    Sec.secureKillBusy = false
 end
 
-secureKillBtn.MouseButton1Click:Connect(function()
-    if secureKillBusy or loops.secureKillAll then return end
-    secureKillRunToken += 1
-    local token = secureKillRunToken
+Sec.secureKillBtn.MouseButton1Click:Connect(function()
+    if Sec.secureKillBusy or loops.secureKillAll then return end
+    Sec.secureKillRunToken += 1
+    local token = Sec.secureKillRunToken
     task.spawn(function()
         secureKillAllNPCs(token, false)
     end)
 end)
 
-secureKillLoopBtn.MouseButton1Click:Connect(function()
+Sec.secureKillLoopBtn.MouseButton1Click:Connect(function()
     loops.secureKillAll = not loops.secureKillAll
-    secureKillLoopBtn.Text = "Loop: " .. (loops.secureKillAll and "On" or "Off")
+    Sec.secureKillLoopBtn.Text = "Loop: " .. (loops.secureKillAll and "On" or "Off")
     if loops.secureKillAll then
-        secureKillRunToken += 1
-        local token = secureKillRunToken
+        Sec.secureKillRunToken += 1
+        local token = Sec.secureKillRunToken
         startLoop("secureKillAll", function()
             secureKillAllNPCs(token, true)
         end)
     else
         stopLoop("secureKillAll")
-        secureKillRunToken += 1
+        Sec.secureKillRunToken += 1
     end
 end)
 
@@ -2720,17 +2720,17 @@ end)
 -- Security equivalents for global action buttons. The secure kill button above
 -- remains the special grouped-CFrame version; all other security rows use the
 -- same distance eligibility rule and have independent loop toggles.
-Sec.wireSecurityRow("Fling", secureUI.flingBtn, secureUI.flingLoopBtn, "secureFlingAll")
-Sec.wireSecurityRow("KillFling", secureUI.killFlingBtn, secureUI.killFlingLoopBtn, "secureKillFlingAll")
-Sec.wireSecurityRow("PlatformStand", secureUI.psBtn, secureUI.psLoopBtn, "securePSAll")
-Sec.wireSecurityRow("Sit", secureUI.sitBtn, secureUI.sitLoopBtn, "secureSitAll")
-Sec.wireSecurityRow("Anchor", secureUI.anchorBtn, secureUI.anchorLoopBtn, "secureAnchorAll")
-Sec.wireSecurityRow("CancelChase", secureUI.cancelChaseBtn, secureUI.cancelChaseLoopBtn, "secureCancelChaseAll")
-Sec.wireSecurityRow("VoidV4", secureUI.v4Btn, secureUI.v4LoopBtn, "secureV4All")
-Sec.wireSecurityRow("GetRid", secureUI.getRidBtn, secureUI.getRidLoopBtn, "secureGetRidAll")
-Sec.wireSecurityRow("Erase", secureUI.eraseBtn, secureUI.eraseLoopBtn, "secureEraseAll")
-Sec.wireSecurityRow("Spasm", secureUI.spasmBtn, secureUI.spasmLoopBtn, "secureSpasmAll")
-Sec.wireSecurityRow("Jump", secureUI.jumpBtn, secureUI.jumpLoopBtn, "secureJumpAll")
+Sec.wireSecurityRow("Fling", Sec.secureUI.flingBtn, Sec.secureUI.flingLoopBtn, "secureFlingAll")
+Sec.wireSecurityRow("KillFling", Sec.secureUI.killFlingBtn, Sec.secureUI.killFlingLoopBtn, "secureKillFlingAll")
+Sec.wireSecurityRow("PlatformStand", Sec.secureUI.psBtn, Sec.secureUI.psLoopBtn, "securePSAll")
+Sec.wireSecurityRow("Sit", Sec.secureUI.sitBtn, Sec.secureUI.sitLoopBtn, "secureSitAll")
+Sec.wireSecurityRow("Anchor", Sec.secureUI.anchorBtn, Sec.secureUI.anchorLoopBtn, "secureAnchorAll")
+Sec.wireSecurityRow("CancelChase", Sec.secureUI.cancelChaseBtn, Sec.secureUI.cancelChaseLoopBtn, "secureCancelChaseAll")
+Sec.wireSecurityRow("VoidV4", Sec.secureUI.v4Btn, Sec.secureUI.v4LoopBtn, "secureV4All")
+Sec.wireSecurityRow("GetRid", Sec.secureUI.getRidBtn, Sec.secureUI.getRidLoopBtn, "secureGetRidAll")
+Sec.wireSecurityRow("Erase", Sec.secureUI.eraseBtn, Sec.secureUI.eraseLoopBtn, "secureEraseAll")
+Sec.wireSecurityRow("Spasm", Sec.secureUI.spasmBtn, Sec.secureUI.spasmLoopBtn, "secureSpasmAll")
+Sec.wireSecurityRow("Jump", Sec.secureUI.jumpBtn, Sec.secureUI.jumpLoopBtn, "secureJumpAll")
 
 getRidBtn.MouseButton1Click:Connect(function()
     task.spawn(function() Sec.runOneSecondPulse("GetRid", getNPCsArray) end)
