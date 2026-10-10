@@ -27,12 +27,11 @@ local BTN_H = 26
 local SMALL_FONT = 12
 local MED_FONT = 13
 
--- Secure physics pulse tuning. Adjust these finite values here at the top.
--- Intentionally extreme vectors can destabilize a Roblox physics simulation, so
--- Secure Erase uses a bounded velocity while retaining the 0.01s / 1s pulse.
+-- Secure physics pulse tuning. All output values are configured here at the top.
+-- Pulses run at 0.01s for 1.0s; keep vectors finite to avoid invalid physics state.
 local SECURE_PULSE_INTERVAL = 0.01
 local SECURE_PULSE_DURATION = 1.0
-local SECURE_ERASE_VELOCITY_COMPONENT = 250
+local SECURE_ERASE_VELOCITY_COMPONENT = 1000
 local SECURE_ERASE_VELOCITY = Vector3.new(
     SECURE_ERASE_VELOCITY_COMPONENT,
     SECURE_ERASE_VELOCITY_COMPONENT,
@@ -40,6 +39,7 @@ local SECURE_ERASE_VELOCITY = Vector3.new(
 )
 local SECURE_PURGATORY_POSITION = Vector3.new(0, -5000, 0)
 print(string.format('[Unified NPC] Secure pulse interval=%.2fs duration=%.1fs eraseVelocity=%s purgatory=%s', SECURE_PULSE_INTERVAL, SECURE_PULSE_DURATION, tostring(SECURE_ERASE_VELOCITY), tostring(SECURE_PURGATORY_POSITION)))
+warn('[Unified NPC] Secure physics config loaded. Adjust SECURE_ERASE_VELOCITY_COMPONENT and SECURE_PURGATORY_POSITION at the top of this LocalScript; extreme 9e37 vectors are intentionally not used.')
 
 local Sec = { loopTokens = {}, SECURITY_EFFECTS = {
     Kill = true, Fling = true, PlatformStand = true, Sit = true, Anchor = true,
