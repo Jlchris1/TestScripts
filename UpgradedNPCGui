@@ -147,8 +147,9 @@ function Sec.getLocalPlayerPosition()
     return root and root.Position or nil
 end
 
--- Security target rule shared by the global and selected-NPC controls:
--- only NPCs closer to another living player than to the local player.
+-- Security target rule shared by global and selected-NPC controls:
+-- include NPCs only when the local player is strictly closer than every other
+-- living player. NPCs are sorted nearest-to-local first before group processing.
 local function isCloserToAnotherPlayer(model, localPosition)
     local npcPart = getBestPartForModel(model)
     if not npcPart or not localPosition then return false end
@@ -159,13 +160,13 @@ local function isCloserToAnotherPlayer(model, localPosition)
             local otherRoot = otherCharacter and (otherCharacter:FindFirstChild("HumanoidRootPart") or otherCharacter.PrimaryPart)
             local otherHumanoid = otherCharacter and otherCharacter:FindFirstChildOfClass("Humanoid")
             if otherRoot and otherHumanoid and otherHumanoid.Health > 0 then
-                if (npcPart.Position - otherRoot.Position).Magnitude < localDistance then
-                    return true
+                if localDistance >= (npcPart.Position - otherRoot.Position).Magnitude then
+                    return false
                 end
             end
         end
     end
-    return false
+    return true
 end
 
 function Sec.getSecurityNPCsFromList(models)
@@ -177,6 +178,12 @@ function Sec.getSecurityNPCsFromList(models)
             table.insert(result, model)
         end
     end
+    table.sort(result, function(a, b)
+        local pa, pb = getBestPartForModel(a), getBestPartForModel(b)
+        if not pa then return false end
+        if not pb then return true end
+        return (pa.Position - localPosition).Magnitude < (pb.Position - localPosition).Magnitude
+    end)
     return result
 end
 
@@ -254,6 +261,7 @@ local function flingModel(model, power)
 end
 
 local anchored = setmetatable({}, { __mode = "k" })
+local anchorScopeModels = {}
 
 -- Idempotent anchoring: loop-anchor always sets true instead of flipping state.
 local function setModelAnchored(model, shouldAnchor)
@@ -266,20 +274,50 @@ local function setModelAnchored(model, shouldAnchor)
     if foundPart then anchored[model] = shouldAnchor else anchored[model] = nil end
 end
 
+local function getAnchorScope(scopeKey)
+    scopeKey = scopeKey or "default"
+    if not anchorScopeModels[scopeKey] then
+        anchorScopeModels[scopeKey] = setmetatable({}, { __mode = "k" })
+    end
+    return anchorScopeModels[scopeKey]
+end
 
 function Sec.setAnchorList(models, shouldAnchor, scopeKey)
+    local scope = getAnchorScope(scopeKey)
     for _, model in ipairs(models or {}) do
-        setModelAnchored(model, shouldAnchor)
+        if model and model.Parent then
+            setModelAnchored(model, shouldAnchor)
+            if shouldAnchor then scope[model] = true else scope[model] = nil end
+        end
     end
 end
 
 function Sec.toggleAnchorForList(models, scopeKey)
-    -- Toggle each NPC's own recorded state. Loop Anchor uses setModelAnchored(true)
-    -- so its pass never flips state; after stopping, manual Anchor correctly
-    -- unanchors loop-anchored NPCs and anchors newly discovered/unanchored NPCs.
-    for _, model in ipairs(models or {}) do
-        if model and model.Parent and isAllowed(model, "Anchor") then
-            setModelAnchored(model, not (anchored[model] == true))
+    -- A second click unanchors the complete previous scope, including NPCs that
+    -- no longer match the security-distance filter. It won't accidentally anchor
+    -- only newly discovered NPCs while leaving old loop-anchored NPCs stuck.
+    local scope = getAnchorScope(scopeKey)
+    local shouldUnanchor = false
+    for model, _ in pairs(scope) do
+        if model and model.Parent and anchored[model] == true then
+            shouldUnanchor = true
+            break
+        end
+    end
+    if shouldUnanchor then
+        for model, _ in pairs(scope) do
+            if model and model.Parent then setModelAnchored(model, false) end
+            scope[model] = nil
+        end
+        for _, model in ipairs(models or {}) do
+            if model and model.Parent then setModelAnchored(model, false) end
+        end
+    else
+        for _, model in ipairs(models or {}) do
+            if model and model.Parent and isAllowed(model, "Anchor") then
+                setModelAnchored(model, true)
+                scope[model] = true
+            end
         end
     end
 end
@@ -1061,7 +1099,7 @@ local eraseBtn, eraseLoopBtn = makeRow(utilScroll, "Erase")
 local spasmBtn, spasmLoopBtn = makeRow(utilScroll, "Spasm")
 local jumpBtn, jumpLoopBtn = makeRow(utilScroll, "Jump")
 
--- Security actions use the same player-distance rule as Secure Kill All NPCs.
+-- Security actions use grouped CFrame teleports and prioritize NPCs for which the local player is the nearest living player.
 -- Speed, JumpPower, HipHeight, and Tracker intentionally have no secure row.
 local secureUI = {}
 secureUI.flingBtn, secureUI.flingLoopBtn = makeRow(ctrlScroll, "Secure Fling")
@@ -1757,7 +1795,6 @@ trackerToggleBtn.MouseButton1Click:Connect(function()
 end)
 
 -- Common action runners used by the global secure buttons and the selected-NPC page.
-local getCharacterRoot, makeSecureKillGroups, runSecureGroupedAction
 function Sec.getRidModel(model)
     if not model or not model.Parent or not isAllowed(model, "GetRid") then return end
     local part = getBestPartForModel(model)
@@ -1861,10 +1898,7 @@ function Sec.killAndFlingSimultaneousForList(models, power)
     end
 end
 
-function Sec.runActionForProvider(effect, provider, isLoopPass, keepRunning, power, anchorScopeKey, isSecure)
-    if isSecure then
-        return runSecureGroupedAction(effect, provider, isLoopPass, keepRunning, power, anchorScopeKey)
-    end
+function Sec.runActionForProvider(effect, provider, isLoopPass, keepRunning, power, anchorScopeKey)
     if effect == "Erase" or effect == "GetRid" then
         return Sec.runOneSecondPulse(effect, provider, keepRunning, power)
     end
@@ -1893,7 +1927,7 @@ function Sec.wireSecurityRow(effect, button, loopButton, loopKey)
     if not button or not loopButton then return end
     button.MouseButton1Click:Connect(function()
         task.spawn(function()
-            Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, false, nil, tonumber(flingBox.Text) or 200, loopKey, true)
+            Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, false, nil, tonumber(flingBox.Text) or 200, loopKey)
         end)
     end)
     loopButton.MouseButton1Click:Connect(function()
@@ -1903,7 +1937,7 @@ function Sec.wireSecurityRow(effect, button, loopButton, loopKey)
             startLoop(loopKey, function(loopToken)
                 Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, true, function()
                     return loops[loopKey] and Sec.loopTokens[loopKey] == loopToken
-                end, tonumber(flingBox.Text) or 200, loopKey, true)
+                end, tonumber(flingBox.Text) or 200, loopKey)
             end)
         else
             stopLoop(loopKey)
@@ -2182,7 +2216,7 @@ local function ensureTypeFeaturePage(typeName)
             end
             secureBtn.MouseButton1Click:Connect(function()
                 if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
-                task.spawn(function() Sec.runActionForProvider(eff, secureProvider, false, nil, getSecurePower(), "secure_type_" .. typeName, true) end)
+                task.spawn(function() Sec.runActionForProvider(eff, secureProvider, false, nil, getSecurePower(), "secure_type_" .. typeName) end)
             end)
             local secureKey = "secure_" .. eff .. "_" .. typeName
             secureLoop.MouseButton1Click:Connect(function()
@@ -2193,7 +2227,7 @@ local function ensureTypeFeaturePage(typeName)
                         if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
                         Sec.runActionForProvider(eff, secureProvider, true, function()
                             return loops[secureKey] and Sec.loopTokens[secureKey] == loopToken and selectedType == typeName
-                        end, getSecurePower(), "secure_type_" .. typeName, true)
+                        end, getSecurePower(), "secure_type_" .. typeName)
                     end)
                 else
                     stopLoop(secureKey)
@@ -2311,7 +2345,7 @@ local SECURE_KILL_GROUP_DELAY = 0.12
 local secureKillRunToken = 0
 local secureKillBusy = false
 
-getCharacterRoot = function()
+local function getCharacterRoot()
     local character = player.Character
     if not character then return nil end
     return character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
@@ -2320,7 +2354,7 @@ end
 
 -- Greedy spatial grouping: each batch contains NPCs within the radius of its
 -- anchor NPC, so the character visits groups rather than every individual NPC.
-makeSecureKillGroups = function(targets)
+local function makeSecureKillGroups(targets)
     local remaining = {}
     for _, model in ipairs(targets) do
         local part = getBestPartForModel(model)
@@ -2354,57 +2388,6 @@ makeSecureKillGroups = function(targets)
     return groups
 end
 
-runSecureGroupedAction = function(effect, provider, isLoopPass, keepRunning, power, anchorScopeKey)
-    local startingRoot = getCharacterRoot()
-    if not startingRoot then return end
-    local startingCFrame = startingRoot.CFrame
-    local models = provider and provider() or {}
-    local groups = makeSecureKillGroups(models)
-
-    local function stillRunning()
-        return not keepRunning or keepRunning()
-    end
-
-    for _, group in ipairs(groups) do
-        if not stillRunning() then break end
-        local root = getCharacterRoot()
-        if not root then break end
-        local liveGroup = {}
-        for _, model in ipairs(group.models) do
-            if model and model.Parent and isNPC(model) and isAllowed(model, effect == "KillFling" and "Kill" or effect) then
-                table.insert(liveGroup, model)
-            end
-        end
-        if #liveGroup > 0 then
-            pcall(function()
-                root.CFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startingCFrame - startingCFrame.Position)
-            end)
-            if effect == "Kill" then
-                killAllSimultaneousForList(liveGroup)
-            elseif effect == "KillFling" then
-                Sec.killAndFlingSimultaneousForList(liveGroup, power)
-            elseif effect == "Anchor" then
-                if isLoopPass then
-                    Sec.setAnchorList(liveGroup, true, anchorScopeKey)
-                else
-                    Sec.toggleAnchorForList(liveGroup, anchorScopeKey)
-                end
-            elseif effect == "Erase" or effect == "GetRid" then
-                -- Preserve the one-second pulse behavior for each secure group.
-                Sec.runOneSecondPulse(effect, function() return liveGroup end, keepRunning, power)
-            else
-                for _, model in ipairs(liveGroup) do
-                    if not stillRunning() then break end
-                    Sec.applySingleAction(effect, model, power)
-                end
-            end
-            task.wait(0.12)
-        end
-    end
-    local finalRoot = getCharacterRoot()
-    if finalRoot then pcall(function() finalRoot.CFrame = startingCFrame end) end
-end
-
 local function secureKillAllNPCs(runToken, isLoopRun)
     if secureKillBusy then return end
     secureKillBusy = true
@@ -2418,10 +2401,10 @@ local function secureKillAllNPCs(runToken, isLoopRun)
     local startingCFrame = startingRoot.CFrame
     local startingPosition = startingCFrame.Position
     local targets = {}
-    for _, model in ipairs(getNPCsArray()) do
+    -- Provider returns eligible NPCs sorted by distance from the local player.
+    for _, model in ipairs(Sec.getSecurityNPCsFromList(getNPCsArray())) do
         local hum = model:FindFirstChildOfClass("Humanoid")
-        if hum and hum.Health > 0 and isAllowed(model, "Kill")
-            and isCloserToAnotherPlayer(model, startingPosition) then
+        if hum and hum.Health > 0 and isAllowed(model, "Kill") then
             table.insert(targets, model)
         end
     end
@@ -2522,23 +2505,13 @@ psLoopBtn.MouseButton1Click:Connect(function() loops.ps = not loops.ps; psLoopBt
 sitBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do makeSit(m) end end)
 sitLoopBtn.MouseButton1Click:Connect(function() loops.sit = not loops.sit; sitLoopBtn.Text = "Loop: " .. (loops.sit and "On" or "Off"); if loops.sit then startLoop("sit", function() for _,m in ipairs(getNPCsArray()) do makeSit(m) end end) else stopLoop("sit") end end)
 
-local globalAnchorState = false
 anchorBtn.MouseButton1Click:Connect(function()
-    globalAnchorState = not globalAnchorState
-    Sec.setAnchorList(getNPCsArray(), globalAnchorState, "global")
-    if not globalAnchorState and loops.anchor then
-        loops.anchor = false
-        anchorLoopBtn.Text = "Loop: Off"
-        stopLoop("anchor")
-    end
-    anchorBtn.Text = globalAnchorState and "Unanchor All" or "Anchor"
+    Sec.toggleAnchorForList(getNPCsArray(), "global")
 end)
 anchorLoopBtn.MouseButton1Click:Connect(function()
     loops.anchor = not loops.anchor
     anchorLoopBtn.Text = "Loop: " .. (loops.anchor and "On" or "Off")
     if loops.anchor then
-        globalAnchorState = true
-        anchorBtn.Text = "Unanchor All"
         startLoop("anchor", function()
             Sec.setAnchorList(getNPCsArray(), true, "global")
         end)
