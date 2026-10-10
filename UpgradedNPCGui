@@ -1757,6 +1757,7 @@ trackerToggleBtn.MouseButton1Click:Connect(function()
 end)
 
 -- Common action runners used by the global secure buttons and the selected-NPC page.
+local getCharacterRoot, makeSecureKillGroups, runSecureGroupedAction
 function Sec.getRidModel(model)
     if not model or not model.Parent or not isAllowed(model, "GetRid") then return end
     local part = getBestPartForModel(model)
@@ -1860,7 +1861,10 @@ function Sec.killAndFlingSimultaneousForList(models, power)
     end
 end
 
-function Sec.runActionForProvider(effect, provider, isLoopPass, keepRunning, power, anchorScopeKey)
+function Sec.runActionForProvider(effect, provider, isLoopPass, keepRunning, power, anchorScopeKey, isSecure)
+    if isSecure then
+        return runSecureGroupedAction(effect, provider, isLoopPass, keepRunning, power, anchorScopeKey)
+    end
     if effect == "Erase" or effect == "GetRid" then
         return Sec.runOneSecondPulse(effect, provider, keepRunning, power)
     end
@@ -1889,7 +1893,7 @@ function Sec.wireSecurityRow(effect, button, loopButton, loopKey)
     if not button or not loopButton then return end
     button.MouseButton1Click:Connect(function()
         task.spawn(function()
-            Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, false, nil, tonumber(flingBox.Text) or 200, loopKey)
+            Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, false, nil, tonumber(flingBox.Text) or 200, loopKey, true)
         end)
     end)
     loopButton.MouseButton1Click:Connect(function()
@@ -1899,7 +1903,7 @@ function Sec.wireSecurityRow(effect, button, loopButton, loopKey)
             startLoop(loopKey, function(loopToken)
                 Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, true, function()
                     return loops[loopKey] and Sec.loopTokens[loopKey] == loopToken
-                end, tonumber(flingBox.Text) or 200, loopKey)
+                end, tonumber(flingBox.Text) or 200, loopKey, true)
             end)
         else
             stopLoop(loopKey)
@@ -2178,7 +2182,7 @@ local function ensureTypeFeaturePage(typeName)
             end
             secureBtn.MouseButton1Click:Connect(function()
                 if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
-                task.spawn(function() Sec.runActionForProvider(eff, secureProvider, false, nil, getSecurePower(), "secure_type_" .. typeName) end)
+                task.spawn(function() Sec.runActionForProvider(eff, secureProvider, false, nil, getSecurePower(), "secure_type_" .. typeName, true) end)
             end)
             local secureKey = "secure_" .. eff .. "_" .. typeName
             secureLoop.MouseButton1Click:Connect(function()
@@ -2189,7 +2193,7 @@ local function ensureTypeFeaturePage(typeName)
                         if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
                         Sec.runActionForProvider(eff, secureProvider, true, function()
                             return loops[secureKey] and Sec.loopTokens[secureKey] == loopToken and selectedType == typeName
-                        end, getSecurePower(), "secure_type_" .. typeName)
+                        end, getSecurePower(), "secure_type_" .. typeName, true)
                     end)
                 else
                     stopLoop(secureKey)
@@ -2307,7 +2311,7 @@ local SECURE_KILL_GROUP_DELAY = 0.12
 local secureKillRunToken = 0
 local secureKillBusy = false
 
-local function getCharacterRoot()
+getCharacterRoot = function()
     local character = player.Character
     if not character then return nil end
     return character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
@@ -2316,7 +2320,7 @@ end
 
 -- Greedy spatial grouping: each batch contains NPCs within the radius of its
 -- anchor NPC, so the character visits groups rather than every individual NPC.
-local function makeSecureKillGroups(targets)
+makeSecureKillGroups = function(targets)
     local remaining = {}
     for _, model in ipairs(targets) do
         local part = getBestPartForModel(model)
@@ -2348,6 +2352,57 @@ local function makeSecureKillGroups(targets)
         })
     end
     return groups
+end
+
+runSecureGroupedAction = function(effect, provider, isLoopPass, keepRunning, power, anchorScopeKey)
+    local startingRoot = getCharacterRoot()
+    if not startingRoot then return end
+    local startingCFrame = startingRoot.CFrame
+    local models = provider and provider() or {}
+    local groups = makeSecureKillGroups(models)
+
+    local function stillRunning()
+        return not keepRunning or keepRunning()
+    end
+
+    for _, group in ipairs(groups) do
+        if not stillRunning() then break end
+        local root = getCharacterRoot()
+        if not root then break end
+        local liveGroup = {}
+        for _, model in ipairs(group.models) do
+            if model and model.Parent and isNPC(model) and isAllowed(model, effect == "KillFling" and "Kill" or effect) then
+                table.insert(liveGroup, model)
+            end
+        end
+        if #liveGroup > 0 then
+            pcall(function()
+                root.CFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startingCFrame - startingCFrame.Position)
+            end)
+            if effect == "Kill" then
+                killAllSimultaneousForList(liveGroup)
+            elseif effect == "KillFling" then
+                Sec.killAndFlingSimultaneousForList(liveGroup, power)
+            elseif effect == "Anchor" then
+                if isLoopPass then
+                    Sec.setAnchorList(liveGroup, true, anchorScopeKey)
+                else
+                    Sec.toggleAnchorForList(liveGroup, anchorScopeKey)
+                end
+            elseif effect == "Erase" or effect == "GetRid" then
+                -- Preserve the one-second pulse behavior for each secure group.
+                Sec.runOneSecondPulse(effect, function() return liveGroup end, keepRunning, power)
+            else
+                for _, model in ipairs(liveGroup) do
+                    if not stillRunning() then break end
+                    Sec.applySingleAction(effect, model, power)
+                end
+            end
+            task.wait(0.12)
+        end
+    end
+    local finalRoot = getCharacterRoot()
+    if finalRoot then pcall(function() finalRoot.CFrame = startingCFrame end) end
 end
 
 local function secureKillAllNPCs(runToken, isLoopRun)
@@ -2467,13 +2522,23 @@ psLoopBtn.MouseButton1Click:Connect(function() loops.ps = not loops.ps; psLoopBt
 sitBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do makeSit(m) end end)
 sitLoopBtn.MouseButton1Click:Connect(function() loops.sit = not loops.sit; sitLoopBtn.Text = "Loop: " .. (loops.sit and "On" or "Off"); if loops.sit then startLoop("sit", function() for _,m in ipairs(getNPCsArray()) do makeSit(m) end end) else stopLoop("sit") end end)
 
+local globalAnchorState = false
 anchorBtn.MouseButton1Click:Connect(function()
-    Sec.toggleAnchorForList(getNPCsArray(), "global")
+    globalAnchorState = not globalAnchorState
+    Sec.setAnchorList(getNPCsArray(), globalAnchorState, "global")
+    if not globalAnchorState and loops.anchor then
+        loops.anchor = false
+        anchorLoopBtn.Text = "Loop: Off"
+        stopLoop("anchor")
+    end
+    anchorBtn.Text = globalAnchorState and "Unanchor All" or "Anchor"
 end)
 anchorLoopBtn.MouseButton1Click:Connect(function()
     loops.anchor = not loops.anchor
     anchorLoopBtn.Text = "Loop: " .. (loops.anchor and "On" or "Off")
     if loops.anchor then
+        globalAnchorState = true
+        anchorBtn.Text = "Unanchor All"
         startLoop("anchor", function()
             Sec.setAnchorList(getNPCsArray(), true, "global")
         end)
