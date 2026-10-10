@@ -2482,6 +2482,58 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
             return (pa.Position - localPosition).Magnitude < (pb.Position - localPosition).Magnitude
         end)
     end
+    -- Secure Get Rid: move the full eligible set to a bounded quarantine area first,
+    -- then move the local character there and anchor the NPCs. Avoid astronomical
+    -- coordinates, which can overflow physics and destabilize the simulation.
+    if effect == "GetRid" then
+        local savedGravity = Workspace.Gravity
+        local quarantineCenter = Vector3.new(0, 10000, 0)
+        local movedModels = {}
+        local ok, err = pcall(function()
+            Workspace.Gravity = 0
+            -- Move every eligible NPC before moving the local character.
+            local spacing = 10
+            local columns = math.max(1, math.ceil(math.sqrt(#targets)))
+            for index, model in ipairs(targets) do
+                if keepRunning and not keepRunning() then break end
+                if model and model.Parent and isNPC(model) and isAllowed(model, "GetRid") then
+                    local zeroIndex = index - 1
+                    local col = zeroIndex % columns
+                    local row = math.floor(zeroIndex / columns)
+                    local destination = quarantineCenter + Vector3.new(col * spacing, 0, row * spacing)
+                    pcall(function()
+                        model:PivotTo(CFrame.new(destination))
+                        for _, part in ipairs(model:GetDescendants()) do
+                            if part:IsA("BasePart") then
+                                part.AssemblyLinearVelocity = Vector3.zero
+                                part.AssemblyAngularVelocity = Vector3.zero
+                            end
+                        end
+                    end)
+                    table.insert(movedModels, model)
+                end
+            end
+            -- Only teleport the player after all NPCs have been moved.
+            if #movedModels > 0 and (not keepRunning or keepRunning()) then
+                Sec.secureTeleportRootTo(CFrame.new(quarantineCenter + Vector3.new(0, 4, -12)) * (startRootCFrame - startRootCFrame.Position))
+                -- Anchor after arrival so NPCs remain in the quarantine area.
+                for _, model in ipairs(movedModels) do
+                    if model and model.Parent then
+                        for _, part in ipairs(model:GetDescendants()) do
+                            if part:IsA("BasePart") then part.Anchored = true end
+                        end
+                        anchored[model] = true
+                    end
+                end
+            end
+        end)
+        -- Always restore both the character position and gravity, even if one NPC fails.
+        Sec.secureRestoreCharacter(startPivot, startRootCFrame)
+        pcall(function() Workspace.Gravity = savedGravity end)
+        if not ok then warn("Secure Get Rid failed: " .. tostring(err)) end
+        return
+    end
+
     -- Decide Anchor's click state once for the entire run, not once per group.
     local anchorShouldSet = true
     if effect == "Anchor" and not isLoopPass then
@@ -2537,9 +2589,21 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
                     -- One click-state per scope; loop passes always anchor newly
                     -- eligible NPCs, while manual toggle-off clears the old scope.
                     Sec.setAnchorList(live, isLoopPass or anchorShouldSet, scopeKey)
-                elseif effect == "Erase" or effect == "GetRid" then
-                    local fixedGroup = live
-                    Sec.runOneSecondPulse(effect, function() return fixedGroup end, keepRunning, power)
+                elseif effect == "Erase" then
+                    -- Bounded secure-erase impulse. Astronomical velocities (e.g. 9e37)
+                    -- can overflow physics and destabilize the whole simulation.
+                    for _, model in ipairs(live) do
+                        if model and model.Parent and isAllowed(model, "Erase") then
+                            iterateParts(model, function(part)
+                                if part and not part.Anchored then
+                                    pcall(function()
+                                        part.AssemblyLinearVelocity = Vector3.new(250, 250, 250)
+                                        part.AssemblyAngularVelocity = Vector3.zero
+                                    end)
+                                end
+                            end)
+                        end
+                    end
                 else
                     for _, model in ipairs(live) do
                         if keepRunning and not keepRunning() then break end
