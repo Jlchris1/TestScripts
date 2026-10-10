@@ -1927,7 +1927,7 @@ function Sec.wireSecurityRow(effect, button, loopButton, loopKey)
     if not button or not loopButton then return end
     button.MouseButton1Click:Connect(function()
         task.spawn(function()
-            Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, false, nil, tonumber(flingBox.Text) or 200, loopKey)
+            Sec.runGroupedSecureAction(effect, Sec.getSecurityNPCsArray, false, nil, tonumber(flingBox.Text) or 200, loopKey)
         end)
     end)
     loopButton.MouseButton1Click:Connect(function()
@@ -1935,7 +1935,7 @@ function Sec.wireSecurityRow(effect, button, loopButton, loopKey)
         loopButton.Text = "Loop: " .. (loops[loopKey] and "On" or "Off")
         if loops[loopKey] then
             startLoop(loopKey, function(loopToken)
-                Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, true, function()
+                Sec.runGroupedSecureAction(effect, Sec.getSecurityNPCsArray, true, function()
                     return loops[loopKey] and Sec.loopTokens[loopKey] == loopToken
                 end, tonumber(flingBox.Text) or 200, loopKey)
             end)
@@ -2216,7 +2216,7 @@ local function ensureTypeFeaturePage(typeName)
             end
             secureBtn.MouseButton1Click:Connect(function()
                 if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
-                task.spawn(function() Sec.runActionForProvider(eff, secureProvider, false, nil, getSecurePower(), "secure_type_" .. typeName) end)
+                task.spawn(function() Sec.runGroupedSecureAction(eff, secureProvider, false, nil, getSecurePower(), "secure_type_" .. typeName) end)
             end)
             local secureKey = "secure_" .. eff .. "_" .. typeName
             secureLoop.MouseButton1Click:Connect(function()
@@ -2225,7 +2225,7 @@ local function ensureTypeFeaturePage(typeName)
                 if loops[secureKey] then
                     startLoop(secureKey, function(loopToken)
                         if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
-                        Sec.runActionForProvider(eff, secureProvider, true, function()
+                        Sec.runGroupedSecureAction(eff, secureProvider, true, function()
                             return loops[secureKey] and Sec.loopTokens[secureKey] == loopToken and selectedType == typeName
                         end, getSecurePower(), "secure_type_" .. typeName)
                     end)
@@ -2386,6 +2386,78 @@ local function makeSecureKillGroups(targets)
         })
     end
     return groups
+end
+
+-- Shared grouped executor for every Secure action. It selects NPCs for which
+-- the local player is strictly closer than every other living player, groups
+-- nearby NPCs, visits each group's center once, and restores the starting CFrame.
+function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, power, scopeKey)
+    local character = player.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if not root then return end
+    local startCFrame = root.CFrame
+    local targets = provider and provider() or {}
+    -- Decide Anchor's click state once for the entire run, not once per group.
+    local anchorShouldSet = true
+    if effect == "Anchor" and not isLoopPass then
+        local scope = getAnchorScope(scopeKey)
+        for model in pairs(scope) do
+            if model and model.Parent and anchored[model] == true then
+                anchorShouldSet = false
+                break
+            end
+        end
+        if not anchorShouldSet then
+            -- Unanchor the full previous scope, including NPCs that no longer
+            -- qualify for the current player-distance filter.
+            for model in pairs(scope) do
+                if model and model.Parent then setModelAnchored(model, false) end
+                scope[model] = nil
+            end
+        end
+    end
+    -- The security provider already sorts by distance from the local player.
+    local groups = makeSecureKillGroups(targets)
+    local ok, err = pcall(function()
+        for _, group in ipairs(groups) do
+            if keepRunning and not keepRunning() then break end
+            local live = {}
+            for _, model in ipairs(group.models) do
+                local allowed = effect == "KillFling" and (isAllowed(model, "Kill") or isAllowed(model, "Fling")) or isAllowed(model, effect)
+                if model and model.Parent and isNPC(model) and allowed then
+                    table.insert(live, model)
+                end
+            end
+            if #live > 0 then
+                local currentCharacter = player.Character
+                local currentRoot = currentCharacter and (currentCharacter:FindFirstChild("HumanoidRootPart") or currentCharacter.PrimaryPart)
+                if not currentRoot then break end
+                currentRoot.CFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startCFrame - startCFrame.Position)
+                if effect == "Kill" then
+                    killAllSimultaneousForList(live)
+                elseif effect == "KillFling" then
+                    Sec.killAndFlingSimultaneousForList(live, power)
+                elseif effect == "Anchor" then
+                    -- Repeated secure groups share one click state. The second
+                    -- manual click unanchors the entire remembered scope.
+                    Sec.setAnchorList(live, isLoopPass or anchorShouldSet, scopeKey)
+                elseif effect == "Erase" or effect == "GetRid" then
+                    local fixedGroup = live
+                    Sec.runOneSecondPulse(effect, function() return fixedGroup end, keepRunning, power)
+                else
+                    for _, model in ipairs(live) do
+                        if keepRunning and not keepRunning() then break end
+                        Sec.applySingleAction(effect, model, power)
+                    end
+                end
+                task.wait(SECURE_KILL_GROUP_DELAY)
+            end
+        end
+    end)
+    local finalCharacter = player.Character
+    local finalRoot = finalCharacter and (finalCharacter:FindFirstChild("HumanoidRootPart") or finalCharacter.PrimaryPart)
+    if finalRoot then pcall(function() finalRoot.CFrame = startCFrame end) end
+    if not ok then warn("Secure grouped action failed (" .. tostring(effect) .. "): " .. tostring(err)) end
 end
 
 local function secureKillAllNPCs(runToken, isLoopRun)
