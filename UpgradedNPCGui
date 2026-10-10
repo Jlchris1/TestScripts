@@ -2388,34 +2388,9 @@ local function makeSecureKillGroups(targets)
     return groups
 end
 
--- Shared CFrame mover used by every Secure action (global and selected-type).
--- PivotTo moves the whole rig; assigning the root CFrame as a fallback helps
--- custom character rigs. A short retry handles character/PrimaryPart changes.
-local function securePivotCharacter(character, root, targetCFrame)
-    if not character or not root or not targetCFrame then return false end
-    local ok = pcall(function() character:PivotTo(targetCFrame) end)
-    if not ok then
-        ok = pcall(function() root.CFrame = targetCFrame end)
-    end
-    if not ok then return false end
-    RunService.Heartbeat:Wait()
-    -- Reacquire the root after PivotTo in case the character was respawned/rebuilt.
-    local currentCharacter = player.Character
-    local currentRoot = currentCharacter and (currentCharacter:FindFirstChild("HumanoidRootPart") or currentCharacter.PrimaryPart)
-    if currentCharacter == character and currentRoot then
-        local closeEnough = (currentRoot.Position - targetCFrame.Position).Magnitude <= 8
-        if not closeEnough then
-            pcall(function() currentCharacter:PivotTo(targetCFrame) end)
-            pcall(function() currentRoot.CFrame = targetCFrame end)
-            RunService.Heartbeat:Wait()
-        end
-    end
-    return true
-end
-
--- Shared grouped executor for every Secure action. It selects eligible NPCs,
--- groups nearby targets, moves with the same CFrame helper for every Secure
--- button, applies the action to the batch, and restores the starting CFrame.
+-- Shared grouped executor for every Secure action. It selects NPCs for which
+-- the local player is strictly closer than every other living player, groups
+-- nearby NPCs, visits each group's center once, and restores the starting CFrame.
 function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, power, scopeKey)
     local character = player.Character
     local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
@@ -2458,11 +2433,14 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
                 local currentRoot = currentCharacter and (currentCharacter:FindFirstChild("HumanoidRootPart") or currentCharacter.PrimaryPart)
                 if not currentRoot then break end
                 local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startCFrame - startCFrame.Position)
-                -- All Secure button types use this exact movement path.
-                if not securePivotCharacter(currentCharacter, currentRoot, targetCFrame) then
-                    warn("Secure action could not move character to group for " .. tostring(effect))
-                    break
+                -- Pivot the whole character model, not just HumanoidRootPart;
+                -- this is more reliable for rigs with custom assemblies/PrimaryParts.
+                local moved = pcall(function() currentCharacter:PivotTo(targetCFrame) end)
+                if not moved then
+                    pcall(function() currentRoot.CFrame = targetCFrame end)
                 end
+                -- Let the character model/physics register the move before applying the action.
+                RunService.Heartbeat:Wait()
                 if effect == "Kill" then
                     killAllSimultaneousForList(live)
                 elseif effect == "KillFling" then
@@ -2486,9 +2464,10 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
     end)
     local finalCharacter = player.Character
     local finalRoot = finalCharacter and (finalCharacter:FindFirstChild("HumanoidRootPart") or finalCharacter.PrimaryPart)
-    if finalCharacter and finalRoot then
-        -- Restore through the same robust CFrame path after every Secure action.
-        securePivotCharacter(finalCharacter, finalRoot, startCFrame)
+    if finalCharacter then
+        local restored = pcall(function() finalCharacter:PivotTo(startCFrame) end)
+        if not restored and finalRoot then pcall(function() finalRoot.CFrame = startCFrame end) end
+        RunService.Heartbeat:Wait()
     end
     if not ok then warn("Secure grouped action failed (" .. tostring(effect) .. "): " .. tostring(err)) end
 end
@@ -2534,7 +2513,9 @@ local function secureKillAllNPCs(runToken, isLoopRun)
             if not currentCharacter or not currentRoot then break end
             local ok = pcall(function()
                 local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startingCFrame - startingCFrame.Position)
-                if not securePivotCharacter(currentCharacter, currentRoot, targetCFrame) then break end
+                local moved = pcall(function() currentCharacter:PivotTo(targetCFrame) end)
+                if not moved then pcall(function() currentRoot.CFrame = targetCFrame end) end
+                RunService.Heartbeat:Wait()
                 for _, model in ipairs(liveGroup) do
                     local hum = model:FindFirstChildOfClass("Humanoid")
                     if hum then
@@ -2555,8 +2536,10 @@ local function secureKillAllNPCs(runToken, isLoopRun)
 
     local finalCharacter = player.Character
     local currentRoot = getCharacterRoot()
-    if finalCharacter and currentRoot then
-        securePivotCharacter(finalCharacter, currentRoot, startingCFrame)
+    if finalCharacter then
+        local restored = pcall(function() finalCharacter:PivotTo(startingCFrame) end)
+        if not restored and currentRoot then pcall(function() currentRoot.CFrame = startingCFrame end) end
+        RunService.Heartbeat:Wait()
     end
     secureKillBusy = false
 end
