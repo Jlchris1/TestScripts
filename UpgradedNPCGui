@@ -1993,23 +1993,80 @@ killLoopBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- Secure Kill All: GUI-only control that reuses the script's existing NPC filter,
--- exclusion rules, and batched kill helper. No teleporting or player-target selection.
-local function secureKillAllNPCs()
-    local list = getNPCsArray()
-    for _, model in ipairs(list) do
-        local hum = model:FindFirstChildOfClass("Humanoid")
-        if hum and hum.Health > 0 then
-            pcall(function()
-                hum.BreakJointsOnDeath = true
-            end)
+-- Secure Kill All: process eligible NPCs one at a time, using CFrame to visit
+-- each target and always restoring the character to the saved starting CFrame.
+-- This remains a LocalScript; server-authoritative NPCs may require server-side
+-- authorization for Humanoid health changes to replicate.
+local SECURE_KILL_STEP_DELAY = 0.12
+local secureKillRunToken = 0
+
+local function getCharacterRoot()
+    local character = player.Character
+    if not character then return nil end
+    return character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+end
+
+local function isCloserToAnotherPlayer(model, localPosition)
+    local npcPart = getBestPartForModel(model)
+    if not npcPart then return false end
+    local localDistance = (npcPart.Position - localPosition).Magnitude
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer ~= player then
+            local otherCharacter = otherPlayer.Character
+            local otherRoot = otherCharacter and (otherCharacter:FindFirstChild("HumanoidRootPart") or otherCharacter.PrimaryPart)
+            local otherHumanoid = otherCharacter and otherCharacter:FindFirstChildOfClass("Humanoid")
+            if otherRoot and otherHumanoid and otherHumanoid.Health > 0 then
+                if (npcPart.Position - otherRoot.Position).Magnitude < localDistance then
+                    return true
+                end
+            end
         end
     end
-    killAllSimultaneousForList(list)
+    return false
+end
+
+local function secureKillAllNPCs()
+    local root = getCharacterRoot()
+    if not root then return end
+
+    local startingCFrame = root.CFrame
+    local startingPosition = startingCFrame.Position
+    local targets = {}
+    for _, model in ipairs(getNPCsArray()) do
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 and isAllowed(model, "Kill") and isCloserToAnotherPlayer(model, startingPosition) then
+            table.insert(targets, model)
+        end
+    end
+
+    for _, model in ipairs(targets) do
+        if not model.Parent then continue end
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        local npcPart = getBestPartForModel(model)
+        if hum and hum.Health > 0 and npcPart then
+            local currentRoot = getCharacterRoot()
+            if not currentRoot then break end
+            local ok = pcall(function()
+                currentRoot.CFrame = npcPart.CFrame * CFrame.new(0, 0, 3)
+                hum.BreakJointsOnDeath = true
+                killAllSimultaneousForList({model})
+            end)
+            task.wait(SECURE_KILL_STEP_DELAY)
+            if not ok then
+                -- Continue to the next valid target; restoration happens below.
+            end
+        end
+    end
+
+    local currentRoot = getCharacterRoot()
+    if currentRoot then
+        pcall(function() currentRoot.CFrame = startingCFrame end)
+    end
 end
 
 secureKillBtn.MouseButton1Click:Connect(function()
-    secureKillAllNPCs()
+    if loops.secureKillAll then return end -- avoid overlapping a loop batch
+    task.spawn(secureKillAllNPCs)
 end)
 
 secureKillLoopBtn.MouseButton1Click:Connect(function()
@@ -2017,10 +2074,12 @@ secureKillLoopBtn.MouseButton1Click:Connect(function()
     secureKillLoopBtn.Text = "Loop: " .. (loops.secureKillAll and "On" or "Off")
     if loops.secureKillAll then
         startLoop("secureKillAll", function()
+            secureKillRunToken += 1
             secureKillAllNPCs()
         end)
     else
         stopLoop("secureKillAll")
+        secureKillRunToken += 1
     end
 end)
 
