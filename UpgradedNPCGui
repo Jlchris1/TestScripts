@@ -26,6 +26,11 @@ local BTN_H = 26
 local SMALL_FONT = 12
 local MED_FONT = 13
 
+local Sec = { loopTokens = {}, SECURITY_EFFECTS = {
+    Kill = true, Fling = true, PlatformStand = true, Sit = true, Anchor = true,
+    CancelChase = true, GetRid = true, Erase = true, Spasm = true, Jump = true, VoidV4 = true
+} }
+
 -- STATE
 local NPCs = {}
 local trackedNPCs = {}
@@ -82,11 +87,13 @@ local function cleanNPCs()
     end
 end
 
+-- Forward declaration: Workspace removal events can fire before tracker helpers
+-- are defined later in the script.
+local removeTrackerFromModel
+
 Workspace.DescendantAdded:Connect(function(obj)
-    if obj:IsA("Humanoid") and obj.Parent and obj.Parent:IsA("Model") then
-        local model = obj.Parent
-        if isNPC(model) then NPCs[model] = true end
-    end
+    local model = obj:IsA("Model") and obj or obj:FindFirstAncestorOfClass("Model")
+    if model and isNPC(model) then NPCs[model] = true end
 end)
 
 Workspace.DescendantRemoving:Connect(function(obj)
@@ -132,6 +139,53 @@ local function isAllowed(model, effectName)
     if not model or not effectName then return true end
     local t = model.Name
     return not (excluded[t] and excluded[t][effectName])
+end
+
+function Sec.getLocalPlayerPosition()
+    local character = player.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    return root and root.Position or nil
+end
+
+-- Security target rule shared by the global and selected-NPC controls:
+-- only NPCs closer to another living player than to the local player.
+local function isCloserToAnotherPlayer(model, localPosition)
+    local npcPart = getBestPartForModel(model)
+    if not npcPart or not localPosition then return false end
+    local localDistance = (npcPart.Position - localPosition).Magnitude
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer ~= player then
+            local otherCharacter = otherPlayer.Character
+            local otherRoot = otherCharacter and (otherCharacter:FindFirstChild("HumanoidRootPart") or otherCharacter.PrimaryPart)
+            local otherHumanoid = otherCharacter and otherCharacter:FindFirstChildOfClass("Humanoid")
+            if otherRoot and otherHumanoid and otherHumanoid.Health > 0 then
+                if (npcPart.Position - otherRoot.Position).Magnitude < localDistance then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+function Sec.getSecurityNPCsFromList(models)
+    local result = {}
+    local localPosition = Sec.getLocalPlayerPosition()
+    if not localPosition then return result end
+    for _, model in ipairs(models or {}) do
+        if model and model.Parent and isNPC(model) and isCloserToAnotherPlayer(model, localPosition) then
+            table.insert(result, model)
+        end
+    end
+    return result
+end
+
+function Sec.getSecurityNPCsArray()
+    return Sec.getSecurityNPCsFromList(getNPCsArray())
+end
+
+function Sec.getSecurityNPCsByName(typeName)
+    return Sec.getSecurityNPCsFromList(getNPCsByName(typeName))
 end
 
 -- ACTIONS
@@ -199,18 +253,37 @@ local function flingModel(model, power)
     end)
 end
 
-local anchored = {}
-local function toggleAnchor(model)
-    if not isAllowed(model, "Anchor") then return end
-    if not model then return end
-    if anchored[model] then
-        iterateParts(model, function(p) p.Anchored = false end)
-        anchored[model] = nil
-    else
-        iterateParts(model, function(p) p.Anchored = true end)
-        anchored[model] = true
+local anchored = setmetatable({}, { __mode = "k" })
+
+-- Idempotent anchoring: loop-anchor always sets true instead of flipping state.
+local function setModelAnchored(model, shouldAnchor)
+    if not model or not model.Parent or not isAllowed(model, "Anchor") then return end
+    local foundPart = false
+    iterateParts(model, function(part)
+        foundPart = true
+        part.Anchored = shouldAnchor
+    end)
+    if foundPart then anchored[model] = shouldAnchor else anchored[model] = nil end
+end
+
+
+function Sec.setAnchorList(models, shouldAnchor, scopeKey)
+    for _, model in ipairs(models or {}) do
+        setModelAnchored(model, shouldAnchor)
     end
 end
+
+function Sec.toggleAnchorForList(models, scopeKey)
+    -- Toggle each NPC's own recorded state. Loop Anchor uses setModelAnchored(true)
+    -- so its pass never flips state; after stopping, manual Anchor correctly
+    -- unanchors loop-anchored NPCs and anchors newly discovered/unanchored NPCs.
+    for _, model in ipairs(models or {}) do
+        if model and model.Parent and isAllowed(model, "Anchor") then
+            setModelAnchored(model, not (anchored[model] == true))
+        end
+    end
+end
+
 
 local function platformStand(model)
     if not isAllowed(model, "PlatformStand") then return end
@@ -431,7 +504,7 @@ local function voidV4Model(model, yVel)
 end
 
 -- TRACKER & HIGHLIGHT
-local function removeTrackerFromModel(model)
+removeTrackerFromModel = function(model)
     if not model then return end
     local data = trackedNPCs[model]
     -- Destroy objects referenced in trackedNPCs table
@@ -573,25 +646,31 @@ local function updateAllTrackers()
     end
 end
 
--- LOOP helpers
+-- LOOP helpers. Generation tokens guarantee a stopped loop cannot become active
+-- again if it is toggled off and back on before its previous coroutine resumes.
 local function startLoop(key, fn)
     if loopRunners[key] then return end
     loops[key] = true
+    local token = (Sec.loopTokens[key] or 0) + 1
+    Sec.loopTokens[key] = token
+    loopRunners[key] = token
     local co = coroutine.create(function()
-        while loops[key] do
-            pcall(fn)
-            task.wait(LOOP_DELAY)
+        while loops[key] and Sec.loopTokens[key] == token do
+            pcall(fn, token)
+            if loops[key] and Sec.loopTokens[key] == token then task.wait(LOOP_DELAY) end
         end
-        loopRunners[key] = nil
+        if Sec.loopTokens[key] == token then loopRunners[key] = nil end
     end)
-    loopRunners[key] = co
-    coroutine.resume(co)
+    local ok, err = coroutine.resume(co)
+    if not ok then
+        warn("NPC GUI loop failed (" .. tostring(key) .. "): " .. tostring(err))
+        if Sec.loopTokens[key] == token then loopRunners[key] = nil; loops[key] = false end
+    end
 end
 local function stopLoop(key)
     loops[key] = false
-    if loopRunners[key] then
-        loopRunners[key] = nil
-    end
+    Sec.loopTokens[key] = (Sec.loopTokens[key] or 0) + 1
+    loopRunners[key] = nil
 end
 
 local function stopAllTypeLoops(typeName)
@@ -599,6 +678,7 @@ local function stopAllTypeLoops(typeName)
     for _,eff in ipairs(EFFECTS) do
         local key = eff .. "_" .. typeName
         stopLoop(key)
+        stopLoop("secure_" .. key)
     end
     stopLoop("speed_"..typeName)
     stopLoop("jp_"..typeName)
@@ -653,12 +733,12 @@ smallEquipToggle.MouseButton1Click:Connect(function()
     if sg and sg:IsA("ScreenGui") then
         sg.Enabled = not sg.Enabled
         if sg.Enabled then
-            smallEquipToggle.Text = "Ã—"
+            smallEquipToggle.Text = "×"
         else
             smallEquipToggle.Text = "+"
         end
     else
-        smallEquipToggle.Text = "Ã—"
+        smallEquipToggle.Text = "×"
     end
 end)
 
@@ -980,6 +1060,27 @@ local getRidBtn, getRidLoop = makeRow(utilScroll, "Get Rid")
 local eraseBtn, eraseLoopBtn = makeRow(utilScroll, "Erase")
 local spasmBtn, spasmLoopBtn = makeRow(utilScroll, "Spasm")
 local jumpBtn, jumpLoopBtn = makeRow(utilScroll, "Jump")
+
+-- Security actions use the same player-distance rule as Secure Kill All NPCs.
+-- Speed, JumpPower, HipHeight, and Tracker intentionally have no secure row.
+local secureUI = {}
+secureUI.flingBtn, secureUI.flingLoopBtn = makeRow(ctrlScroll, "Secure Fling")
+secureUI.killFlingBtn, secureUI.killFlingLoopBtn = makeRow(ctrlScroll, "Secure Kill+Fling")
+secureUI.psBtn, secureUI.psLoopBtn = makeRow(ctrlScroll, "Secure PlatformStand")
+secureUI.sitBtn, secureUI.sitLoopBtn = makeRow(ctrlScroll, "Secure Sit")
+secureUI.anchorBtn, secureUI.anchorLoopBtn = makeRow(ctrlScroll, "Secure Anchor")
+secureUI.cancelChaseBtn, secureUI.cancelChaseLoopBtn = makeRow(ctrlScroll, "Secure Cancel-Chase")
+secureUI.v4Btn, secureUI.v4LoopBtn = makeRow(ctrlScroll, "Secure Void v4")
+secureUI.getRidBtn, secureUI.getRidLoopBtn = makeRow(utilScroll, "Secure Get Rid")
+secureUI.eraseBtn, secureUI.eraseLoopBtn = makeRow(utilScroll, "Secure Erase")
+secureUI.spasmBtn, secureUI.spasmLoopBtn = makeRow(utilScroll, "Secure Spasm")
+secureUI.jumpBtn, secureUI.jumpLoopBtn = makeRow(utilScroll, "Secure Jump")
+for _, secureButton in ipairs({
+    secureUI.flingBtn, secureUI.killFlingBtn, secureUI.psBtn, secureUI.sitBtn, secureUI.anchorBtn,
+    secureUI.cancelChaseBtn, secureUI.v4Btn, secureUI.getRidBtn, secureUI.eraseBtn, secureUI.spasmBtn, secureUI.jumpBtn
+}) do
+    secureButton.TextSize = 10
+end
 
 -- Advanced global controls (compact)
 local speedGlobalFrame = Instance.new("Frame"); speedGlobalFrame.Size = UDim2.new(1,0,0,BTN_H); speedGlobalFrame.BackgroundTransparency = 1; speedGlobalFrame.Parent = advScroll; speedGlobalFrame.ZIndex = 100000
@@ -1655,6 +1756,157 @@ trackerToggleBtn.MouseButton1Click:Connect(function()
     end
 end)
 
+-- Common action runners used by the global secure buttons and the selected-NPC page.
+function Sec.getRidModel(model)
+    if not model or not model.Parent or not isAllowed(model, "GetRid") then return end
+    local part = getBestPartForModel(model)
+    if part then pcall(function() part.CFrame = CFrame.new(9e37, 9e37, 9e37) end) end
+end
+
+function Sec.applySingleAction(effect, model, power)
+    if not model or not model.Parent or not isAllowed(model, effect) then return end
+    if effect == "Fling" then
+        flingModel(model, power)
+    elseif effect == "PlatformStand" then
+        platformStand(model)
+    elseif effect == "Sit" then
+        makeSit(model)
+    elseif effect == "CancelChase" then
+        cancelChaseForModel(model)
+    elseif effect == "GetRid" then
+        Sec.getRidModel(model)
+    elseif effect == "Erase" then
+        eraseModel(model)
+    elseif effect == "Spasm" then
+        spasmModel(model)
+    elseif effect == "Jump" then
+        jumpModel(model)
+    elseif effect == "VoidV4" then
+        voidV4Model(model)
+    end
+end
+
+function Sec.runOneSecondPulse(effect, provider, keepRunning, power)
+    -- Each click starts a one-second window. Refresh the NPC list every 0.01s
+    -- so newly spawned NPCs are included while the window is active.
+    local deadline = os.clock() + 1.0
+    repeat
+        if keepRunning and not keepRunning() then break end
+        local current = provider and provider() or {}
+        for _, model in ipairs(current) do
+            if os.clock() >= deadline or (keepRunning and not keepRunning()) then break end
+            if effect == "GetRid" then
+                Sec.getRidModel(model)
+            elseif effect == "Erase" then
+                if model and model.Parent and isAllowed(model, "Erase") then eraseModel(model) end
+            end
+        end
+        local remaining = deadline - os.clock()
+        if remaining > 0 and (not keepRunning or keepRunning()) then
+            task.wait(math.min(0.01, remaining))
+        end
+    until os.clock() >= deadline or (keepRunning and not keepRunning())
+end
+
+function Sec.killAndFlingSimultaneousForList(models, power)
+    power = tonumber(power) or 200
+    local humanoids = {}
+    local validModels = {}
+    local delayedRestore = tonumber(breakRestoreDelay) or 1
+
+    -- Prepare every model first, without per-NPC waits.
+    for _, model in ipairs(models or {}) do
+        if model and model.Parent then
+            table.insert(validModels, model)
+            if isAllowed(model, "Kill") then
+                local hum = model:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    pcall(function()
+                        if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end
+                        hum.Health = 100
+                    end)
+                    table.insert(humanoids, hum)
+                end
+            end
+            if isAllowed(model, "Fling") then
+                iterateParts(model, function(part)
+                    pcall(function() if part.Massless ~= nil then part.Massless = true end end)
+                end)
+            end
+        end
+    end
+
+    task.wait(0.04) -- one shared preparation delay for the whole batch
+    for _, hum in ipairs(humanoids) do
+        pcall(function()
+            local ok = pcall(function() hum:TakeDamage(math.huge) end)
+            if not ok then pcall(function() hum.Health = -math.huge end) else pcall(function() hum.Health = 0 end) end
+        end)
+    end
+    -- Fling each eligible NPC immediately after the whole kill batch, with no per-NPC waits.
+    for _, model in ipairs(validModels) do
+        pcall(function() flingModel(model, power) end)
+    end
+
+    for _, model in ipairs(validModels) do
+        local modelRef = model
+        task.delay(delayedRestore, function()
+            if modelRef and modelRef.Parent then
+                iterateParts(modelRef, function(part)
+                    pcall(function() if part.Massless ~= nil then part.Massless = false end end)
+                end)
+            end
+        end)
+    end
+end
+
+function Sec.runActionForProvider(effect, provider, isLoopPass, keepRunning, power, anchorScopeKey)
+    if effect == "Erase" or effect == "GetRid" then
+        return Sec.runOneSecondPulse(effect, provider, keepRunning, power)
+    end
+
+    local models = provider and provider() or {}
+    if effect == "Kill" then
+        killAllSimultaneousForList(models)
+    elseif effect == "KillFling" then
+        Sec.killAndFlingSimultaneousForList(models, power)
+    elseif effect == "Anchor" then
+        local scopeKey = anchorScopeKey or "default"
+        if isLoopPass then
+            Sec.setAnchorList(models, true, scopeKey)
+        else
+            Sec.toggleAnchorForList(models, scopeKey)
+        end
+    else
+        for _, model in ipairs(models) do
+            if keepRunning and not keepRunning() then break end
+            Sec.applySingleAction(effect, model, power)
+        end
+    end
+end
+
+function Sec.wireSecurityRow(effect, button, loopButton, loopKey)
+    if not button or not loopButton then return end
+    button.MouseButton1Click:Connect(function()
+        task.spawn(function()
+            Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, false, nil, tonumber(flingBox.Text) or 200, loopKey)
+        end)
+    end)
+    loopButton.MouseButton1Click:Connect(function()
+        loops[loopKey] = not loops[loopKey]
+        loopButton.Text = "Loop: " .. (loops[loopKey] and "On" or "Off")
+        if loops[loopKey] then
+            startLoop(loopKey, function(loopToken)
+                Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, true, function()
+                    return loops[loopKey] and Sec.loopTokens[loopKey] == loopToken
+                end, tonumber(flingBox.Text) or 200, loopKey)
+            end)
+        else
+            stopLoop(loopKey)
+        end
+    end)
+end
+
 -- per-type page builders (cached)
 local function ensureTypeLeftPage(typeName)
     if typeLeftPages[typeName] then return typeLeftPages[typeName] end
@@ -1710,7 +1962,8 @@ local function ensureTypeLeftPage(typeName)
     btnErase.MouseButton1Click:Connect(function()
         if not selectedType then return end
         if excluded[selectedType] and excluded[selectedType]["Erase"] then return end
-        for _,m in ipairs(getNPCsByName(selectedType)) do pcall(function() eraseModel(m) end) end
+        local typeNameForErase = selectedType
+        task.spawn(function() Sec.runOneSecondPulse("Erase", function() return getNPCsByName(typeNameForErase) end) end)
     end)
 
     btnV4.MouseButton1Click:Connect(function()
@@ -1722,7 +1975,7 @@ local function ensureTypeLeftPage(typeName)
     btnAnchor.MouseButton1Click:Connect(function()
         if not selectedType then return end
         if excluded[selectedType] and excluded[selectedType]["Anchor"] then return end
-        for _,m in ipairs(getNPCsByName(selectedType)) do pcall(function() toggleAnchor(m) end) end
+        Sec.toggleAnchorForList(getNPCsByName(selectedType), "type_" .. selectedType)
     end)
 
     btnWhitelist.MouseButton1Click:Connect(function()
@@ -1778,7 +2031,7 @@ end
 local function ensureTypeFeaturePage(typeName)
     if typeFeaturePages[typeName] then return typeFeaturePages[typeName] end
     local page = Instance.new("Frame")
-    page.Size = UDim2.new(1,0,0, 40 + (#EFFECTS * (BTN_H + 6)))
+    page.Size = UDim2.new(1,0,0, 40 + ((#EFFECTS + 11) * (BTN_H + 6)))
     page.BackgroundTransparency = 1
     page.Visible = false
     page.Parent = featScroll
@@ -1815,63 +2068,54 @@ local function ensureTypeFeaturePage(typeName)
 
         btn.MouseButton1Click:Connect(function()
             if not selectedType then return end
-            local list = getNPCsByName(selectedType)
-            if eff == "Kill" then
-                for _,m in ipairs(list) do
-                    local hum = m:FindFirstChildOfClass("Humanoid")
-                    if hum then pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end) end
-                end
-                killAllSimultaneousForList(list)
-            elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
-            elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
-            elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
-            elseif eff == "Anchor" then for _,m in ipairs(list) do toggleAnchor(m) end
-            elseif eff == "CancelChase" then for _,m in ipairs(list) do cancelChaseForModel(m) end
-            elseif eff == "GetRid" then for _,m in ipairs(list) do local p = getBestPartForModel(m) if p then p.CFrame = CFrame.new(9e37,9e37,9e37) end end
-            elseif eff == "Erase" then for _,m in ipairs(list) do eraseModel(m) end
-            elseif eff == "Spasm" then for _,m in ipairs(list) do spasmModel(m) end
-            elseif eff == "Jump" then for _,m in ipairs(list) do jumpModel(m) end
-            elseif eff == "VoidV4" then for _,m in ipairs(list) do voidV4Model(m) end
-            elseif eff == "Speed" then local v = tonumber(input and input.Text) or 16 for _,m in ipairs(list) do setSpeed(m, v) end
-            elseif eff == "JumpPower" then local v = tonumber(input and input.Text) or 50 for _,m in ipairs(list) do setJumpPower(m, v) end
-            elseif eff == "HipHeight" then local v = tonumber(input and input.Text) or 2 for _,m in ipairs(list) do setHipHeight(m, v) end
+            local typeNameForClick = selectedType
+            if excluded[typeNameForClick] and excluded[typeNameForClick][eff] then return end
+            local provider = function() return getNPCsByName(typeNameForClick) end
+            if eff == "Speed" then
+                local v = tonumber(input and input.Text) or 16
+                for _, model in ipairs(provider()) do setSpeed(model, v) end
+            elseif eff == "JumpPower" then
+                local v = tonumber(input and input.Text) or 50
+                for _, model in ipairs(provider()) do setJumpPower(model, v) end
+            elseif eff == "HipHeight" then
+                local v = tonumber(input and input.Text) or 2
+                for _, model in ipairs(provider()) do setHipHeight(model, v) end
             elseif eff == "Tracker" then
-                if excluded[selectedType] and excluded[selectedType]["Tracker"] then return end
-                for _,m in ipairs(list) do
-                    if trackedNPCs[m] then removeTrackerFromModel(m) else addTrackerToModel(m) end
+                if excluded[typeNameForClick] and excluded[typeNameForClick]["Tracker"] then return end
+                for _, model in ipairs(provider()) do
+                    if trackedNPCs[model] then removeTrackerFromModel(model) else addTrackerToModel(model) end
                 end
+            else
+                local power = tonumber(input and input.Text) or tonumber(flingBox.Text) or 200
+                task.spawn(function() Sec.runActionForProvider(eff, provider, false, nil, power, "type_" .. typeNameForClick) end)
             end
         end)
 
         if small and small:IsA("TextButton") then
             small.MouseButton1Click:Connect(function()
                 if not selectedType then return end
-                local key = string.format("%s_%s", eff, selectedType)
+                local typeNameForLoop = selectedType
+                local key = string.format("%s_%s", eff, typeNameForLoop)
                 loops[key] = not loops[key]
                 small.Text = "Loop: " .. (loops[key] and "On" or "Off")
                 if loops[key] then
-                    startLoop(key, function()
-                        if excluded[selectedType] and excluded[selectedType][eff] then return end
-                        local list = getNPCsByName(selectedType)
-                        if eff == "Kill" then
-                            for _,m in ipairs(list) do
-                                local hum = m:FindFirstChildOfClass("Humanoid")
-                                if hum then pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end) end
-                            end
-                            killAllSimultaneousForList(list)
-                        elseif eff == "Fling" then local p = tonumber((input and input.Text) or flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m,p) end) end
-                        elseif eff == "PlatformStand" then for _,m in ipairs(list) do platformStand(m) end
-                        elseif eff == "Sit" then for _,m in ipairs(list) do makeSit(m) end
-                        elseif eff == "Anchor" then for _,m in ipairs(list) do toggleAnchor(m) end
-                        elseif eff == "CancelChase" then for _,m in ipairs(list) do cancelChaseForModel(m) end
-                        elseif eff == "GetRid" then for _,m in ipairs(list) do local p = getBestPartForModel(m) if p then p.CFrame = CFrame.new(9e37,9e37,9e37) end end
-                        elseif eff == "Erase" then for _,m in ipairs(list) do eraseModel(m) end
-                        elseif eff == "Spasm" then for _,m in ipairs(list) do spasmModel(m) end
-                        elseif eff == "Jump" then for _,m in ipairs(list) do jumpModel(m) end
-                        elseif eff == "VoidV4" then for _,m in ipairs(list) do voidV4Model(m) end
-                        elseif eff == "Speed" then local v = tonumber(input and input.Text) or 16 for _,m in ipairs(list) do setSpeed(m, v) end
-                        elseif eff == "JumpPower" then local v = tonumber(input and input.Text) or 50 for _,m in ipairs(list) do setJumpPower(m, v) end
-                        elseif eff == "HipHeight" then local v = tonumber(input and input.Text) or 2 for _,m in ipairs(list) do setHipHeight(m, v) end
+                    startLoop(key, function(loopToken)
+                        if selectedType ~= typeNameForLoop or (excluded[typeNameForLoop] and excluded[typeNameForLoop][eff]) then return end
+                        local provider = function() return getNPCsByName(typeNameForLoop) end
+                        if eff == "Speed" then
+                            local v = tonumber(input and input.Text) or 16
+                            for _, model in ipairs(provider()) do setSpeed(model, v) end
+                        elseif eff == "JumpPower" then
+                            local v = tonumber(input and input.Text) or 50
+                            for _, model in ipairs(provider()) do setJumpPower(model, v) end
+                        elseif eff == "HipHeight" then
+                            local v = tonumber(input and input.Text) or 2
+                            for _, model in ipairs(provider()) do setHipHeight(model, v) end
+                        elseif eff ~= "Tracker" then
+                            local power = tonumber(input and input.Text) or tonumber(flingBox.Text) or 200
+                            Sec.runActionForProvider(eff, provider, true, function()
+                                return loops[key] and Sec.loopTokens[key] == loopToken and selectedType == typeNameForLoop
+                            end, power, "type_" .. typeNameForLoop)
                         end
                     end)
                 else
@@ -1883,11 +2127,72 @@ local function ensureTypeFeaturePage(typeName)
         if input then
             input.FocusLost:Connect(function()
                 if not selectedType then return end
-                local list = getNPCsByName(selectedType)
-                if eff == "Speed" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["Speed"]) then for _,m in ipairs(list) do setSpeed(m, v) end end
-                elseif eff == "JumpPower" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["JumpPower"]) then for _,m in ipairs(list) do setJumpPower(m, v) end end
-                elseif eff == "HipHeight" then local v = tonumber(input.Text) if v and not (excluded[selectedType] and excluded[selectedType]["HipHeight"]) then for _,m in ipairs(list) do setHipHeight(m, v) end end
+                local typeNameForInput = selectedType
+                local list = getNPCsByName(typeNameForInput)
+                if eff == "Speed" then local v = tonumber(input.Text) if v and not (excluded[typeNameForInput] and excluded[typeNameForInput]["Speed"]) then for _,m in ipairs(list) do setSpeed(m, v) end end
+                elseif eff == "JumpPower" then local v = tonumber(input.Text) if v and not (excluded[typeNameForInput] and excluded[typeNameForInput]["JumpPower"]) then for _,m in ipairs(list) do setJumpPower(m, v) end end
+                elseif eff == "HipHeight" then local v = tonumber(input.Text) if v and not (excluded[typeNameForInput] and excluded[typeNameForInput]["HipHeight"]) then for _,m in ipairs(list) do setHipHeight(m, v) end end
                 elseif eff == "Fling" then local p = tonumber(input.Text) or tonumber(flingBox.Text) or 200 for _,m in ipairs(list) do pcall(function() flingModel(m, p) end) end
+                end
+            end)
+        end
+
+        -- One extra selected-type action row for every eligible security effect.
+        -- The provider reevaluates player distance each pass and includes newly spawned NPCs.
+        if Sec.SECURITY_EFFECTS[eff] then
+            local secureRow = Instance.new("Frame")
+            secureRow.Size = UDim2.new(1,0,0,BTN_H)
+            secureRow.BackgroundTransparency = 1
+            secureRow.Parent = page
+            secureRow.ZIndex = 100000
+
+            local secureBtn = Instance.new("TextButton")
+            secureBtn.Size = UDim2.new(0.5,0,1,0)
+            secureBtn.Position = UDim2.new(0,0,0,0)
+            secureBtn.BackgroundColor3 = Color3.fromRGB(64,72,88)
+            secureBtn.BorderSizePixel = 0
+            secureBtn.Font = Enum.Font.Gotham
+            secureBtn.TextSize = 10
+            secureBtn.TextColor3 = Color3.new(1,1,1)
+            secureBtn.Text = "Secure " .. eff
+            secureBtn.Parent = secureRow
+            secureBtn.ZIndex = 100000
+
+            local secureLoop = Instance.new("TextButton")
+            secureLoop.Size = UDim2.new(0.48,0,1,0)
+            secureLoop.Position = UDim2.new(0.52,6,0,0)
+            secureLoop.BackgroundColor3 = Color3.fromRGB(40,40,40)
+            secureLoop.BorderSizePixel = 0
+            secureLoop.Font = Enum.Font.Gotham
+            secureLoop.TextSize = 10
+            secureLoop.TextColor3 = Color3.new(1,1,1)
+            secureLoop.Text = "Loop: Off"
+            secureLoop.Parent = secureRow
+            secureLoop.ZIndex = 100000
+
+            local function secureProvider()
+                return Sec.getSecurityNPCsByName(typeName)
+            end
+            local function getSecurePower()
+                return tonumber(input and input.Text) or tonumber(flingBox.Text) or 200
+            end
+            secureBtn.MouseButton1Click:Connect(function()
+                if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
+                task.spawn(function() Sec.runActionForProvider(eff, secureProvider, false, nil, getSecurePower(), "secure_type_" .. typeName) end)
+            end)
+            local secureKey = "secure_" .. eff .. "_" .. typeName
+            secureLoop.MouseButton1Click:Connect(function()
+                loops[secureKey] = not loops[secureKey]
+                secureLoop.Text = "Loop: " .. (loops[secureKey] and "On" or "Off")
+                if loops[secureKey] then
+                    startLoop(secureKey, function(loopToken)
+                        if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
+                        Sec.runActionForProvider(eff, secureProvider, true, function()
+                            return loops[secureKey] and Sec.loopTokens[secureKey] == loopToken and selectedType == typeName
+                        end, getSecurePower(), "secure_type_" .. typeName)
+                    end)
+                else
+                    stopLoop(secureKey)
                 end
             end)
         end
@@ -2008,24 +2313,6 @@ local function getCharacterRoot()
     return character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
 end
 
-local function isCloserToAnotherPlayer(model, localPosition)
-    local npcPart = getBestPartForModel(model)
-    if not npcPart then return false end
-    local localDistance = (npcPart.Position - localPosition).Magnitude
-    for _, otherPlayer in ipairs(Players:GetPlayers()) do
-        if otherPlayer ~= player then
-            local otherCharacter = otherPlayer.Character
-            local otherRoot = otherCharacter and (otherCharacter:FindFirstChild("HumanoidRootPart") or otherCharacter.PrimaryPart)
-            local otherHumanoid = otherCharacter and otherCharacter:FindFirstChildOfClass("Humanoid")
-            if otherRoot and otherHumanoid and otherHumanoid.Health > 0 then
-                if (npcPart.Position - otherRoot.Position).Magnitude < localDistance then
-                    return true
-                end
-            end
-        end
-    end
-    return false
-end
 
 -- Greedy spatial grouping: each batch contains NPCs within the radius of its
 -- anchor NPC, so the character visits groups rather than every individual NPC.
@@ -2155,86 +2442,19 @@ end)
 flingBtn.MouseButton1Click:Connect(function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end)
 flingLoopBtn.MouseButton1Click:Connect(function() loops.flingAll = not loops.flingAll; flingLoopBtn.Text = "Loop: " .. (loops.flingAll and "On" or "Off"); if loops.flingAll then startLoop("flingAll", function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end) else stopLoop("flingAll") end end)
 
--- Kill+Fling behavior: kills and then flings all NPCs using flingBox value
+-- Kill+Fling processes the whole NPC batch together: shared preparation delay,
+-- all kill requests, then all flings without per-NPC waits.
 killFlingBtn.MouseButton1Click:Connect(function()
-    local p = tonumber(flingBox.Text) or 200
-    for _,m in ipairs(getNPCsArray()) do
-        if isAllowed(m, "Kill") then
-            local hum = m:FindFirstChildOfClass("Humanoid")
-            if hum then
-                pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end)
-                -- perform 0 -> 1 -> heavy kill sequence each time
-                applyDamageSequence(hum)
-            end
-        end
-
-        -- Make NPC massless before fling (defensive)
-        iterateParts(m, function(p)
-            pcall(function() if p.Massless ~= nil then p.Massless = true end end)
-        end)
-
-        pcall(function() flingModel(m, p) end)
-
-        -- re-enable BreakJointsOnDeath and restore mass after configured delay
-        local humRef = m and m:FindFirstChildOfClass("Humanoid")
-        local modelRef = m
-        local delaySec = tonumber(breakRestoreDelay) or 1
-        if humRef or modelRef then
-            task.delay(delaySec, function()
-                pcall(function()
-                    if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil then
-                        humRef.BreakJointsOnDeath = true
-                    end
-                end)
-                if modelRef then
-                    iterateParts(modelRef, function(p2)
-                        pcall(function()
-                            if p2.Massless ~= nil then p2.Massless = false end
-                        end)
-                    end)
-                end
-            end)
-        end
-    end
+    task.spawn(function()
+        Sec.runActionForProvider("KillFling", getNPCsArray, false, nil, tonumber(flingBox.Text) or 200)
+    end)
 end)
 killFlingLoopBtn.MouseButton1Click:Connect(function()
     loops.killFlingAll = not loops.killFlingAll
     killFlingLoopBtn.Text = "Loop: " .. (loops.killFlingAll and "On" or "Off")
     if loops.killFlingAll then
         startLoop("killFlingAll", function()
-            local p = tonumber(flingBox.Text) or 200
-            for _,m in ipairs(getNPCsArray()) do
-                pcall(function()
-                    if isAllowed(m, "Kill") then
-                        local hum = m:FindFirstChildOfClass("Humanoid")
-                        if hum then
-                            pcall(function() if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end end)
-                            applyDamageSequence(hum)
-                        end
-                    end
-                    -- Make massless defensively
-                    iterateParts(m, function(pp) pcall(function() if pp.Massless ~= nil then pp.Massless = true end end) end)
-                    flingModel(m, p)
-                end)
-                -- schedule re-enable for each humanoid instance (capture current hum and model)
-                local humRef = m and m:FindFirstChildOfClass("Humanoid")
-                local modelRef = m
-                local delaySec = tonumber(breakRestoreDelay) or 1
-                if humRef or modelRef then
-                    task.delay(delaySec, function()
-                        pcall(function()
-                            if humRef and humRef.Parent and humRef.BreakJointsOnDeath ~= nil then
-                                humRef.BreakJointsOnDeath = true
-                            end
-                        end)
-                        if modelRef then
-                            iterateParts(modelRef, function(pp)
-                                pcall(function() if pp.Massless ~= nil then pp.Massless = false end end)
-                            end)
-                        end
-                    end)
-                end
-            end
+            Sec.runActionForProvider("KillFling", getNPCsArray, true, function() return loops.killFlingAll end, tonumber(flingBox.Text) or 200)
         end)
     else
         stopLoop("killFlingAll")
@@ -2247,10 +2467,36 @@ psLoopBtn.MouseButton1Click:Connect(function() loops.ps = not loops.ps; psLoopBt
 sitBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do makeSit(m) end end)
 sitLoopBtn.MouseButton1Click:Connect(function() loops.sit = not loops.sit; sitLoopBtn.Text = "Loop: " .. (loops.sit and "On" or "Off"); if loops.sit then startLoop("sit", function() for _,m in ipairs(getNPCsArray()) do makeSit(m) end end) else stopLoop("sit") end end)
 
-anchorBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do toggleAnchor(m) end end)
-anchorLoopBtn.MouseButton1Click:Connect(function() loops.anchor = not loops.anchor; anchorLoopBtn.Text = "Loop: " .. (loops.anchor and "On" or "Off"); if loops.anchor then startLoop("anchor", function() for _,m in ipairs(getNPCsArray()) do toggleAnchor(m) end end) else stopLoop("anchor") end end)
+anchorBtn.MouseButton1Click:Connect(function()
+    Sec.toggleAnchorForList(getNPCsArray(), "global")
+end)
+anchorLoopBtn.MouseButton1Click:Connect(function()
+    loops.anchor = not loops.anchor
+    anchorLoopBtn.Text = "Loop: " .. (loops.anchor and "On" or "Off")
+    if loops.anchor then
+        startLoop("anchor", function()
+            Sec.setAnchorList(getNPCsArray(), true, "global")
+        end)
+    else
+        stopLoop("anchor")
+    end
+end)
 
-cancelChaseBtn.MouseButton1Click:Connect(function() cancelChaseEnabled = not cancelChaseEnabled; cancelChaseBtn.Text = "Cancel-Chase: "..tostring(cancelChaseEnabled) end)
+cancelChaseBtn.MouseButton1Click:Connect(function()
+    cancelChaseEnabled = not cancelChaseEnabled
+    cancelChaseBtn.Text = "Cancel-Chase: " .. tostring(cancelChaseEnabled)
+end)
+cancelChaseLoopBtn.MouseButton1Click:Connect(function()
+    loops.cancelChaseAll = not loops.cancelChaseAll
+    cancelChaseLoopBtn.Text = "Loop: " .. (loops.cancelChaseAll and "On" or "Off")
+    if loops.cancelChaseAll then
+        startLoop("cancelChaseAll", function()
+            for _, model in ipairs(getNPCsArray()) do cancelChaseForModel(model) end
+        end)
+    else
+        stopLoop("cancelChaseAll")
+    end
+end)
 
 -- Void v4 handlers (global)
 v4Btn.MouseButton1Click:Connect(function()
@@ -2268,29 +2514,54 @@ v4LoopBtn.MouseButton1Click:Connect(function()
     end
 end)
 
+-- Security equivalents for global action buttons. The secure kill button above
+-- remains the special grouped-CFrame version; all other security rows use the
+-- same distance eligibility rule and have independent loop toggles.
+Sec.wireSecurityRow("Fling", secureUI.flingBtn, secureUI.flingLoopBtn, "secureFlingAll")
+Sec.wireSecurityRow("KillFling", secureUI.killFlingBtn, secureUI.killFlingLoopBtn, "secureKillFlingAll")
+Sec.wireSecurityRow("PlatformStand", secureUI.psBtn, secureUI.psLoopBtn, "securePSAll")
+Sec.wireSecurityRow("Sit", secureUI.sitBtn, secureUI.sitLoopBtn, "secureSitAll")
+Sec.wireSecurityRow("Anchor", secureUI.anchorBtn, secureUI.anchorLoopBtn, "secureAnchorAll")
+Sec.wireSecurityRow("CancelChase", secureUI.cancelChaseBtn, secureUI.cancelChaseLoopBtn, "secureCancelChaseAll")
+Sec.wireSecurityRow("VoidV4", secureUI.v4Btn, secureUI.v4LoopBtn, "secureV4All")
+Sec.wireSecurityRow("GetRid", secureUI.getRidBtn, secureUI.getRidLoopBtn, "secureGetRidAll")
+Sec.wireSecurityRow("Erase", secureUI.eraseBtn, secureUI.eraseLoopBtn, "secureEraseAll")
+Sec.wireSecurityRow("Spasm", secureUI.spasmBtn, secureUI.spasmLoopBtn, "secureSpasmAll")
+Sec.wireSecurityRow("Jump", secureUI.jumpBtn, secureUI.jumpLoopBtn, "secureJumpAll")
+
 getRidBtn.MouseButton1Click:Connect(function()
-    for _,m in ipairs(getNPCsArray()) do
-        if isAllowed(m, "GetRid") then
-            local hrp = getBestPartForModel(m)
-            if hrp and player.Character and player.Character.PrimaryPart then
-                local playerPos = player.Character.PrimaryPart.Position
-                local dist = (hrp.Position - playerPos).Magnitude
-                local closer = true
-                for _,plr in ipairs(Players:GetPlayers()) do
-                    if plr ~= player and plr.Character and plr.Character.PrimaryPart then
-                        local d = (hrp.Position - plr.Character.PrimaryPart.Position).Magnitude
-                        if d < dist then closer = false break end
-                    end
-                end
-                if closer then pcall(function() hrp.CFrame = CFrame.new(9e37,9e37,9e37) end) end
-            end
-        end
+    task.spawn(function() Sec.runOneSecondPulse("GetRid", getNPCsArray) end)
+end)
+getRidLoop.MouseButton1Click:Connect(function()
+    loops.getRid = not loops.getRid
+    getRidLoop.Text = "Loop: " .. (loops.getRid and "On" or "Off")
+    if loops.getRid then
+        startLoop("getRid", function(loopToken)
+            Sec.runOneSecondPulse("GetRid", getNPCsArray, function()
+                return loops.getRid and Sec.loopTokens["getRid"] == loopToken
+            end)
+        end)
+    else
+        stopLoop("getRid")
     end
 end)
-getRidLoop.MouseButton1Click:Connect(function() loops.getRid = not loops.getRid; getRidLoop.Text = "Loop: "..(loops.getRid and "On" or "Off"); if loops.getRid then startLoop("getRid", function() for _,m in ipairs(getNPCsArray()) do pcall(function() if isAllowed(m,"GetRid") then local hrp = getBestPartForModel(m) if hrp then hrp.CFrame = CFrame.new(9e37,9e37,9e37) end end end) end end) else stopLoop("getRid") end end)
 
-eraseBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do eraseModel(m) end end)
-eraseLoopBtn.MouseButton1Click:Connect(function() loops.erase = not loops.erase; eraseLoopBtn.Text = "Loop: "..(loops.erase and "On" or "Off"); if loops.erase then startLoop("erase", function() for _,m in ipairs(getNPCsArray()) do eraseModel(m) end end) else stopLoop("erase") end end)
+eraseBtn.MouseButton1Click:Connect(function()
+    task.spawn(function() Sec.runOneSecondPulse("Erase", getNPCsArray) end)
+end)
+eraseLoopBtn.MouseButton1Click:Connect(function()
+    loops.erase = not loops.erase
+    eraseLoopBtn.Text = "Loop: " .. (loops.erase and "On" or "Off")
+    if loops.erase then
+        startLoop("erase", function(loopToken)
+            Sec.runOneSecondPulse("Erase", getNPCsArray, function()
+                return loops.erase and Sec.loopTokens["erase"] == loopToken
+            end)
+        end)
+    else
+        stopLoop("erase")
+    end
+end)
 
 spasmBtn.MouseButton1Click:Connect(function() for _,m in ipairs(getNPCsArray()) do spasmModel(m) end end)
 spasmLoopBtn.MouseButton1Click:Connect(function() loops.spasm = not loops.spasm; spasmLoopBtn.Text = "Loop: "..(loops.spasm and "On" or "Off"); if loops.spasm then startLoop("spasm", function() for _,m in ipairs(getNPCsArray()) do spasmModel(m) end end) else stopLoop("spasm") end end)
