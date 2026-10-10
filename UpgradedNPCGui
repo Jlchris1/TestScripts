@@ -2351,6 +2351,55 @@ local function getCharacterRoot()
     return character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
 end
 
+-- Reliable shared teleport helper for every Secure action. PivotTo can succeed
+-- without putting HumanoidRootPart exactly at the requested position (especially
+-- on rigs whose model pivot is offset), so calculate the character-wide delta,
+-- then verify/fallback to the root CFrame after physics has had a frame to update.
+local function secureTeleportRootTo(targetRootCFrame)
+    local character = player.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if not character or not root or not targetRootCFrame then return false end
+
+    local ok = pcall(function()
+        local delta = targetRootCFrame * root.CFrame:Inverse()
+        character:PivotTo(delta * character:GetPivot())
+        root.CFrame = targetRootCFrame
+        pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+        pcall(function() root.AssemblyAngularVelocity = Vector3.zero end)
+    end)
+    if not ok then
+        pcall(function() root.CFrame = targetRootCFrame end)
+    end
+
+    RunService.Heartbeat:Wait()
+    character = player.Character
+    root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if not root then return false end
+    if (root.Position - targetRootCFrame.Position).Magnitude > 3 then
+        pcall(function()
+            root.CFrame = targetRootCFrame
+            pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+            pcall(function() root.AssemblyAngularVelocity = Vector3.zero end)
+        end)
+        RunService.Heartbeat:Wait()
+    end
+    return true
+end
+
+local function secureRestoreCharacter(savedPivot, savedRootCFrame)
+    local character = player.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if not character then return end
+    pcall(function() character:PivotTo(savedPivot) end)
+    if root and savedRootCFrame then
+        RunService.Heartbeat:Wait()
+        if (root.Position - savedRootCFrame.Position).Magnitude > 3 then
+            pcall(function() root.CFrame = savedRootCFrame end)
+        end
+    end
+    RunService.Heartbeat:Wait()
+end
+
 
 -- Greedy spatial grouping: each batch contains NPCs within the radius of its
 -- anchor NPC, so the character visits groups rather than every individual NPC.
@@ -2395,7 +2444,8 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
     local character = player.Character
     local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
     if not root then return end
-    local startCFrame = root.CFrame
+    local startRootCFrame = root.CFrame
+    local startPivot = character:GetPivot()
     local targets = provider and provider() or {}
     -- Decide Anchor's click state once for the entire run, not once per group.
     local anchorShouldSet = true
@@ -2432,15 +2482,10 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
                 local currentCharacter = player.Character
                 local currentRoot = currentCharacter and (currentCharacter:FindFirstChild("HumanoidRootPart") or currentCharacter.PrimaryPart)
                 if not currentRoot then break end
-                local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startCFrame - startCFrame.Position)
-                -- Pivot the whole character model, not just HumanoidRootPart;
-                -- this is more reliable for rigs with custom assemblies/PrimaryParts.
-                local moved = pcall(function() currentCharacter:PivotTo(targetCFrame) end)
-                if not moved then
-                    pcall(function() currentRoot.CFrame = targetCFrame end)
-                end
-                -- Let the character model/physics register the move before applying the action.
-                RunService.Heartbeat:Wait()
+                local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startRootCFrame - startRootCFrame.Position)
+                -- Use the same verified root teleport for every Secure effect,
+                -- including utility effects that previously appeared not to move.
+                if not secureTeleportRootTo(targetCFrame) then break end
                 if effect == "Kill" then
                     killAllSimultaneousForList(live)
                 elseif effect == "KillFling" then
@@ -2462,13 +2507,7 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
             end
         end
     end)
-    local finalCharacter = player.Character
-    local finalRoot = finalCharacter and (finalCharacter:FindFirstChild("HumanoidRootPart") or finalCharacter.PrimaryPart)
-    if finalCharacter then
-        local restored = pcall(function() finalCharacter:PivotTo(startCFrame) end)
-        if not restored and finalRoot then pcall(function() finalRoot.CFrame = startCFrame end) end
-        RunService.Heartbeat:Wait()
-    end
+    secureRestoreCharacter(startPivot, startRootCFrame)
     if not ok then warn("Secure grouped action failed (" .. tostring(effect) .. "): " .. tostring(err)) end
 end
 
@@ -2483,7 +2522,7 @@ local function secureKillAllNPCs(runToken, isLoopRun)
     end
 
     local startingCFrame = startingRoot.CFrame
-    local startingPosition = startingCFrame.Position
+    local startingPivot = player.Character and player.Character:GetPivot() or startingCFrame
     local targets = {}
     -- Provider returns eligible NPCs sorted by distance from the local player.
     for _, model in ipairs(Sec.getSecurityNPCsFromList(getNPCsArray())) do
@@ -2513,9 +2552,7 @@ local function secureKillAllNPCs(runToken, isLoopRun)
             if not currentCharacter or not currentRoot then break end
             local ok = pcall(function()
                 local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startingCFrame - startingCFrame.Position)
-                local moved = pcall(function() currentCharacter:PivotTo(targetCFrame) end)
-                if not moved then pcall(function() currentRoot.CFrame = targetCFrame end) end
-                RunService.Heartbeat:Wait()
+                if not secureTeleportRootTo(targetCFrame) then error("Secure teleport failed") end
                 for _, model in ipairs(liveGroup) do
                     local hum = model:FindFirstChildOfClass("Humanoid")
                     if hum then
@@ -2534,13 +2571,7 @@ local function secureKillAllNPCs(runToken, isLoopRun)
         end
     end
 
-    local finalCharacter = player.Character
-    local currentRoot = getCharacterRoot()
-    if finalCharacter then
-        local restored = pcall(function() finalCharacter:PivotTo(startingCFrame) end)
-        if not restored and currentRoot then pcall(function() currentRoot.CFrame = startingCFrame end) end
-        RunService.Heartbeat:Wait()
-    end
+    secureRestoreCharacter(startingPivot, startingCFrame)
     secureKillBusy = false
 end
 
