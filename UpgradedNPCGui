@@ -2538,43 +2538,65 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
                 elseif effect == "KillFling" then
                     Sec.killAndFlingSimultaneousForList(live, power)
                 elseif effect == "GetRid" then
-                    -- Safe quarantine: avoid 9e37 coordinates, which can overflow
-                    -- Roblox physics. Move the full batch first, then move the
-                    -- local character into the same quarantine area.
+                    -- One-second secure pulse: re-apply the bounded quarantine
+                    -- every 0.01s. Move the entire NPC batch first, then move
+                    -- the local character into the quarantine area.
                     local base = Vector3.new(0, -5000, 0)
                     for index, model in ipairs(live) do
                         if model and model.Parent then
                             local offset = Vector3.new((index - 1) * 8, 0, 0)
-                            pcall(function()
-                                model:PivotTo(CFrame.new(base + offset))
-                                iterateParts(model, function(part)
-                                    pcall(function()
-                                        part.AssemblyLinearVelocity = Vector3.zero
-                                        part.AssemblyAngularVelocity = Vector3.zero
-                                        part.Anchored = true
-                                    end)
-                                end)
-                            end)
+                            pcall(function() model:PivotTo(CFrame.new(base + offset)) end)
                         end
                     end
-                    -- All NPCs in this group are moved and anchored before the
-                    -- character is moved to the quarantine area.
                     Sec.secureTeleportRootTo(CFrame.new(base + Vector3.new(-12, 4, 0)))
-                elseif effect == "Erase" then
-                    -- Keep the effect bounded; 9e37 velocity can destabilize
-                    -- the physics solver. Apply a capped velocity to each rig.
-                    local safeVelocity = Vector3.new(250, 250, 250)
-                    for _, model in ipairs(live) do
-                        if model and model.Parent then
-                            local part = getBestPartForModel(model)
-                            if part then
+                    local pulseDeadline = os.clock() + 1.0
+                    repeat
+                        if keepRunning and not keepRunning() then break end
+                        for index, model in ipairs(live) do
+                            if keepRunning and not keepRunning() then break end
+                            if model and model.Parent then
+                                local offset = Vector3.new((index - 1) * 8, 0, 0)
                                 pcall(function()
-                                    part.AssemblyLinearVelocity = safeVelocity
-                                    part.AssemblyAngularVelocity = Vector3.zero
+                                    model:PivotTo(CFrame.new(base + offset))
+                                    iterateParts(model, function(part)
+                                        pcall(function()
+                                            part.AssemblyLinearVelocity = Vector3.zero
+                                            part.AssemblyAngularVelocity = Vector3.zero
+                                            part.Anchored = true
+                                        end)
+                                    end)
                                 end)
                             end
                         end
-                    end
+                        local remaining = pulseDeadline - os.clock()
+                        if remaining > 0 and (not keepRunning or keepRunning()) then
+                            task.wait(math.min(0.01, remaining))
+                        end
+                    until os.clock() >= pulseDeadline or (keepRunning and not keepRunning())
+                elseif effect == "Erase" then
+                    -- Re-apply a bounded velocity every 0.01s for one second.
+                    -- Extremely large values can overflow Roblox physics.
+                    local safeVelocity = Vector3.new(250, 250, 250)
+                    local pulseDeadline = os.clock() + 1.0
+                    repeat
+                        if keepRunning and not keepRunning() then break end
+                        for _, model in ipairs(live) do
+                            if keepRunning and not keepRunning() then break end
+                            if model and model.Parent then
+                                iterateParts(model, function(part)
+                                    pcall(function()
+                                        part.Anchored = false
+                                        part.AssemblyLinearVelocity = safeVelocity
+                                        part.AssemblyAngularVelocity = Vector3.zero
+                                    end)
+                                end)
+                            end
+                        end
+                        local remaining = pulseDeadline - os.clock()
+                        if remaining > 0 and (not keepRunning or keepRunning()) then
+                            task.wait(math.min(0.01, remaining))
+                        end
+                    until os.clock() >= pulseDeadline or (keepRunning and not keepRunning())
                 elseif effect == "Anchor" then
                     -- One click-state per scope; loop passes always anchor newly
                     -- eligible NPCs, while manual toggle-off clears the old scope.
