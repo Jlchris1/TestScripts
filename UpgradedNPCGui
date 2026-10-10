@@ -359,10 +359,17 @@ local function makeSit(model)
 end
 
 local function eraseModel(model)
-    if not isAllowed(model, "Erase") then return end
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if hum then pcall(function() hum.Health = 0 end) end
-    pcall(function() model:Destroy() end)
+    if not model or not model.Parent or not isAllowed(model, "Erase") then return end
+    -- Bounded velocity pulse: intentionally avoid extreme values that can
+    -- destabilize the physics solver. The pulse runner repeats this at 0.01s.
+    local safeVelocity = Sec.SECURE_ERASE_VELOCITY or Vector3.new(250, 250, 250)
+    iterateParts(model, function(part)
+        pcall(function()
+            part.Anchored = false
+            part.AssemblyLinearVelocity = safeVelocity
+            part.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end)
 end
 
 local function spasmModel(model)
@@ -1821,8 +1828,18 @@ end)
 -- Common action runners used by the global secure buttons and the selected-NPC page.
 function Sec.getRidModel(model)
     if not model or not model.Parent or not isAllowed(model, "GetRid") then return end
-    local part = getBestPartForModel(model)
-    if part then pcall(function() part.CFrame = CFrame.new(0, -5000, 0) end) end
+    -- Move the complete NPC model into a bounded quarantine area, without anchoring.
+    local base = Vector3.new(0, -5000, 0)
+    local pivot = model:GetPivot()
+    local rotation = pivot - pivot.Position
+    pcall(function() model:PivotTo(CFrame.new(base) * rotation) end)
+    iterateParts(model, function(part)
+        pcall(function()
+            part.Anchored = false
+            part.AssemblyLinearVelocity = Vector3.zero
+            part.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end)
 end
 
 function Sec.applySingleAction(effect, model, power)
@@ -2368,6 +2385,9 @@ end)
 -- authorization for Humanoid health changes to replicate.
 Sec.SECURE_KILL_GROUP_RADIUS = 55
 Sec.SECURE_KILL_GROUP_DELAY = 0.12
+-- Roblox physics-safe substitutes for intentionally extreme vectors.
+Sec.SECURE_ERASE_VELOCITY = Vector3.new(250, 250, 250)
+Sec.SECURE_PURGATORY_POSITION = Vector3.new(0, -5000, 0)
 Sec.secureKillRunToken = 0
 Sec.secureKillBusy = false
 
@@ -2472,16 +2492,20 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
     if not root then return end
     local startRootCFrame = root.CFrame
     local startPivot = character:GetPivot()
-    local targets = provider and provider() or {}
-    local localPosition = Sec.getLocalPlayerPosition()
-    if localPosition then
-        table.sort(targets, function(a, b)
-            local pa, pb = getBestPartForModel(a), getBestPartForModel(b)
-            if not pa then return false end
-            if not pb then return true end
-            return (pa.Position - localPosition).Magnitude < (pb.Position - localPosition).Magnitude
-        end)
+    local gravityBeforeSecure = workspace.Gravity
+    local processed = setmetatable({}, { __mode = "k" })
+
+    local function running()
+        return not keepRunning or keepRunning()
     end
+
+    local function allowedForEffect(model)
+        if effect == "KillFling" then
+            return isAllowed(model, "Kill") or isAllowed(model, "Fling")
+        end
+        return isAllowed(model, effect)
+    end
+
     -- Decide Anchor's click state once for the entire run, not once per group.
     local anchorShouldSet = true
     if effect == "Anchor" and not isLoopPass then
@@ -2497,7 +2521,6 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
         end
         anchorShouldSet = not currentlyOn
         if currentlyOn then
-            -- Toggle OFF the entire previous scope before visiting current groups.
             Sec.anchorScopeEnabled[scopeKey] = false
             for model in pairs(scope) do
                 if model and model.Parent then Sec.setModelAnchored(model, false) end
@@ -2509,111 +2532,156 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
     elseif effect == "Anchor" and isLoopPass then
         Sec.anchorScopeEnabled[scopeKey] = true
     end
-    -- The security provider already sorts by distance from the local player.
-    local groups = Sec.makeSecureKillGroups(targets)
-    local gravityBeforeSecure = workspace.Gravity
+
     local ok, err = pcall(function()
         if effect == "GetRid" then
             workspace.Gravity = 0
         end
-        for _, group in ipairs(groups) do
-            if keepRunning and not keepRunning() then break end
-            local live = {}
-            for _, model in ipairs(group.models) do
-                local allowed = effect == "KillFling" and (isAllowed(model, "Kill") or isAllowed(model, "Fling")) or isAllowed(model, effect)
-                if model and model.Parent and isNPC(model) and allowed then
-                    table.insert(live, model)
+
+        -- Re-scan after finishing the current set of groups. Each model is
+        -- attempted once per invocation, while newly spawned/previously missed
+        -- eligible models are picked up on the next sweep.
+        while running() do
+            local latest = provider and provider() or {}
+            local localPosition = Sec.getLocalPlayerPosition()
+            local targets = {}
+            for _, model in ipairs(latest) do
+                if model and model.Parent and isNPC(model) and not processed[model] and allowedForEffect(model) then
+                    table.insert(targets, model)
                 end
             end
-            if #live > 0 then
-                local currentCharacter = player.Character
-                local currentRoot = currentCharacter and (currentCharacter:FindFirstChild("HumanoidRootPart") or currentCharacter.PrimaryPart)
-                if not currentRoot then break end
-                local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startRootCFrame - startRootCFrame.Position)
-                -- Use the same verified root teleport for every Secure effect,
-                -- including utility effects that previously appeared not to move.
-                if not Sec.secureTeleportRootTo(targetCFrame) then break end
-                if effect == "Kill" then
-                    killAllSimultaneousForList(live)
-                elseif effect == "KillFling" then
-                    Sec.killAndFlingSimultaneousForList(live, power)
-                elseif effect == "GetRid" then
-                    -- One-second secure pulse: re-apply the bounded quarantine
-                    -- every 0.01s. Move the entire NPC batch first, then move
-                    -- the local character into the quarantine area.
-                    local base = Vector3.new(0, -5000, 0)
-                    for index, model in ipairs(live) do
-                        if model and model.Parent then
-                            local offset = Vector3.new((index - 1) * 8, 0, 0)
-                            pcall(function() model:PivotTo(CFrame.new(base + offset)) end)
-                        end
+            if #targets == 0 then break end
+
+            if localPosition then
+                table.sort(targets, function(a, b)
+                    local pa, pb = getBestPartForModel(a), getBestPartForModel(b)
+                    if not pa then return false end
+                    if not pb then return true end
+                    return (pa.Position - localPosition).Magnitude < (pb.Position - localPosition).Magnitude
+                end)
+            end
+
+            local groups = Sec.makeSecureKillGroups(targets)
+            if #groups == 0 then break end
+
+            for _, group in ipairs(groups) do
+                if not running() then break end
+                local live = {}
+                for _, model in ipairs(group.models) do
+                    if model and model.Parent and isNPC(model) and not processed[model] and allowedForEffect(model) then
+                        table.insert(live, model)
                     end
-                    Sec.secureTeleportRootTo(CFrame.new(base + Vector3.new(-12, 4, 0)))
-                    local pulseDeadline = os.clock() + 1.0
-                    repeat
-                        if keepRunning and not keepRunning() then break end
+                end
+
+                if #live > 0 then
+                    local currentCharacter = player.Character
+                    local currentRoot = currentCharacter and (currentCharacter:FindFirstChild("HumanoidRootPart") or currentCharacter.PrimaryPart)
+                    if not currentRoot then break end
+                    local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startRootCFrame - startRootCFrame.Position)
+                    if not Sec.secureTeleportRootTo(targetCFrame) then break end
+
+                    if effect == "Kill" then
+                        killAllSimultaneousForList(live)
+                        for _, model in ipairs(live) do processed[model] = true end
+                    elseif effect == "KillFling" then
+                        Sec.killAndFlingSimultaneousForList(live, power)
+                        for _, model in ipairs(live) do processed[model] = true end
+                    elseif effect == "GetRid" then
+                        -- Send this group to a bounded purgatory area. Do not anchor;
+                        -- zero speed first, then keep the CFrame/zero-velocity state
+                        -- refreshed every 0.01s for one second.
+                        local base = Vector3.new(0, -5000, 0)
+                        local destinations = {}
                         for index, model in ipairs(live) do
-                            if keepRunning and not keepRunning() then break end
                             if model and model.Parent then
                                 local offset = Vector3.new((index - 1) * 8, 0, 0)
-                                pcall(function()
-                                    model:PivotTo(CFrame.new(base + offset))
-                                    iterateParts(model, function(part)
-                                        pcall(function()
-                                            part.AssemblyLinearVelocity = Vector3.zero
-                                            part.AssemblyAngularVelocity = Vector3.zero
-                                            part.Anchored = true
-                                        end)
+                                local pivot = model:GetPivot()
+                                local destination = CFrame.new(base + offset) * (pivot - pivot.Position)
+                                destinations[model] = destination
+                                pcall(function() model:PivotTo(destination) end)
+                                iterateParts(model, function(part)
+                                    pcall(function()
+                                        part.Anchored = false
+                                        part.AssemblyLinearVelocity = Vector3.zero
+                                        part.AssemblyAngularVelocity = Vector3.zero
                                     end)
                                 end)
+                                processed[model] = true
                             end
                         end
-                        local remaining = pulseDeadline - os.clock()
-                        if remaining > 0 and (not keepRunning or keepRunning()) then
-                            task.wait(math.min(0.01, remaining))
-                        end
-                    until os.clock() >= pulseDeadline or (keepRunning and not keepRunning())
-                elseif effect == "Erase" then
-                    -- Re-apply a bounded velocity every 0.01s for one second.
-                    -- Extremely large values can overflow Roblox physics.
-                    local safeVelocity = Vector3.new(250, 250, 250)
-                    local pulseDeadline = os.clock() + 1.0
-                    repeat
-                        if keepRunning and not keepRunning() then break end
+                        local pulseDeadline = os.clock() + 1.0
+                        repeat
+                            if not running() then break end
+                            for _, model in ipairs(live) do
+                                if not running() then break end
+                                local destination = destinations[model]
+                                if destination and model and model.Parent then
+                                    pcall(function() model:PivotTo(destination) end)
+                                    iterateParts(model, function(part)
+                                        pcall(function()
+                                            part.Anchored = false
+                                            part.AssemblyLinearVelocity = Vector3.zero
+                                            part.AssemblyAngularVelocity = Vector3.zero
+                                        end)
+                                    end)
+                                end
+                            end
+                            local remaining = pulseDeadline - os.clock()
+                            if remaining > 0 and running() then task.wait(math.min(0.01, remaining)) end
+                        until os.clock() >= pulseDeadline or not running()
+                    elseif effect == "Erase" then
+                        -- Stabilize first, then re-apply a finite velocity every
+                        -- 0.01s for one second. Extreme values are deliberately avoided.
+                        local safeVelocity = Sec.SECURE_ERASE_VELOCITY or Vector3.new(250, 250, 250)
                         for _, model in ipairs(live) do
-                            if keepRunning and not keepRunning() then break end
                             if model and model.Parent then
                                 iterateParts(model, function(part)
                                     pcall(function()
                                         part.Anchored = false
-                                        part.AssemblyLinearVelocity = safeVelocity
+                                        part.AssemblyLinearVelocity = Vector3.zero
                                         part.AssemblyAngularVelocity = Vector3.zero
                                     end)
                                 end)
                             end
                         end
-                        local remaining = pulseDeadline - os.clock()
-                        if remaining > 0 and (not keepRunning or keepRunning()) then
-                            task.wait(math.min(0.01, remaining))
+                        local pulseDeadline = os.clock() + 1.0
+                        repeat
+                            if not running() then break end
+                            for _, model in ipairs(live) do
+                                if not running() then break end
+                                if model and model.Parent then
+                                    iterateParts(model, function(part)
+                                        pcall(function()
+                                            part.Anchored = false
+                                            part.AssemblyLinearVelocity = safeVelocity
+                                            part.AssemblyAngularVelocity = Vector3.zero
+                                        end)
+                                    end)
+                                    processed[model] = true
+                                end
+                            end
+                            local remaining = pulseDeadline - os.clock()
+                            if remaining > 0 and running() then task.wait(math.min(0.01, remaining)) end
+                        until os.clock() >= pulseDeadline or not running()
+                    elseif effect == "Anchor" then
+                        Sec.setAnchorList(live, isLoopPass or anchorShouldSet, scopeKey)
+                        for _, model in ipairs(live) do processed[model] = true end
+                    else
+                        for _, model in ipairs(live) do
+                            if not running() then break end
+                            Sec.applySingleAction(effect, model, power)
+                            processed[model] = true
                         end
-                    until os.clock() >= pulseDeadline or (keepRunning and not keepRunning())
-                elseif effect == "Anchor" then
-                    -- One click-state per scope; loop passes always anchor newly
-                    -- eligible NPCs, while manual toggle-off clears the old scope.
-                    Sec.setAnchorList(live, isLoopPass or anchorShouldSet, scopeKey)
-                elseif effect == "Erase" or effect == "GetRid" then
-                    local fixedGroup = live
-                    Sec.runOneSecondPulse(effect, function() return fixedGroup end, keepRunning, power)
-                else
-                    for _, model in ipairs(live) do
-                        if keepRunning and not keepRunning() then break end
-                        Sec.applySingleAction(effect, model, power)
                     end
+                    task.wait(Sec.SECURE_KILL_GROUP_DELAY)
                 end
-                task.wait(Sec.SECURE_KILL_GROUP_DELAY)
             end
+            -- Small yield before rescanning to pick up newly spawned NPCs and
+            -- those that became eligible while the prior groups were processed.
+            if running() then task.wait(0.01) end
         end
     end)
+
     if effect == "GetRid" then
         pcall(function() workspace.Gravity = gravityBeforeSecure end)
     end
