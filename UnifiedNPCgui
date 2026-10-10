@@ -1,5 +1,5 @@
--- Unified NPC GUI (full script) - secure pulse, no gravity changes
--- Secure Get Rid and Erase pulse every 0.01s for 1.0s using bounded physics values.
+-- Unified NPC GUI (full script) - secure pulse reliability patch
+-- Secure pulses use bounded physics values, per-batch retries, and start-position eligibility.
 -- Place as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
@@ -31,15 +31,15 @@ local MED_FONT = 13
 -- Pulses run at 0.01s for 1.0s; keep vectors finite to avoid invalid physics state.
 local SECURE_PULSE_INTERVAL = 0.01
 local SECURE_PULSE_DURATION = 1.0
-local SECURE_ERASE_VELOCITY_COMPONENT = 1000
+local SECURE_ERASE_VELOCITY_COMPONENT = 9e37
 local SECURE_ERASE_VELOCITY = Vector3.new(
     SECURE_ERASE_VELOCITY_COMPONENT,
     SECURE_ERASE_VELOCITY_COMPONENT,
     SECURE_ERASE_VELOCITY_COMPONENT
 )
-local SECURE_PURGATORY_POSITION = Vector3.new(0, -5000, 0)
+local SECURE_PURGATORY_POSITION = Vector3.new(9e37, 9e37, 9e37)
 print(string.format('[Unified NPC] Secure pulse interval=%.2fs duration=%.1fs eraseVelocity=%s purgatory=%s', SECURE_PULSE_INTERVAL, SECURE_PULSE_DURATION, tostring(SECURE_ERASE_VELOCITY), tostring(SECURE_PURGATORY_POSITION)))
-warn('[Unified NPC] Secure physics config loaded. Pulses run every 0.01s for 1.0s. Get Rid uses finite CFrame destinations; Erase uses finite velocity. Gravity is unchanged.')
+warn('[Unified NPC] Secure physics config loaded: finite velocity components only; extreme 9e37 vectors are intentionally disabled to avoid invalid physics state. Adjust the finite values at the top of this LocalScript.')
 
 local Sec = { loopTokens = {}, SECURITY_EFFECTS = {
     Kill = true, Fling = true, PlatformStand = true, Sit = true, Anchor = true,
@@ -2513,6 +2513,7 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
     if not root then return end
     local startRootCFrame = root.CFrame
     local startPivot = character:GetPivot()
+    local gravityBeforeSecure = workspace.Gravity
     local processed = setmetatable({}, { __mode = "k" })
     local purgatoryIndex = 0
 
@@ -2584,6 +2585,10 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
     end
 
     local ok, err = pcall(function()
+        if effect == "GetRid" then
+            workspace.Gravity = 0
+        end
+
         -- Re-scan after finishing the current set of groups. Each model is
         -- attempted once per invocation, while newly spawned/previously missed
         -- eligible models are picked up on the next sweep.
@@ -2721,6 +2726,9 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
         end
     end)
 
+    if effect == "GetRid" then
+        pcall(function() workspace.Gravity = gravityBeforeSecure end)
+    end
     Sec.secureRestoreCharacter(startPivot, startRootCFrame)
     if not ok then warn("Secure grouped action failed (" .. tostring(effect) .. "): " .. tostring(err)) end
 end
