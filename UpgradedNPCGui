@@ -957,6 +957,7 @@ end
 -- Controls & Utilities (compact rows)
 local killBtn, killLoopBtn = makeRow(ctrlScroll, "Kill All")
 local secureKillBtn, secureKillLoopBtn = makeRow(ctrlScroll, "Secure Kill All NPCs")
+secureKillBtn.TextSize = 10 -- fit the longer label in the compact GUI
 local flingBoxRow = Instance.new("Frame"); flingBoxRow.Size = UDim2.new(1,0,0,BTN_H); flingBoxRow.BackgroundTransparency = 1; flingBoxRow.Parent = ctrlScroll; flingBoxRow.ZIndex = 100000
 local flingBox = Instance.new("TextBox"); flingBox.Size = UDim2.new(0.56,0,1,0); flingBox.Position = UDim2.new(0,0,0,0); flingBox.PlaceholderText = "Fling"; flingBox.Text = "200"; flingBox.BackgroundColor3 = Color3.fromRGB(50,50,50); flingBox.TextColor3 = Color3.new(1,1,1); flingBox.BorderSizePixel = 0; flingBox.Font = Enum.Font.Gotham; flingBox.TextSize = SMALL_FONT; flingBox.Parent = flingBoxRow; flingBox.ZIndex = 100000
 local flingBtn = Instance.new("TextButton"); flingBtn.Size = UDim2.new(0.42, -6, 1, 0); flingBtn.Position = UDim2.new(0.56, 6, 0, 0); flingBtn.BackgroundColor3 = Color3.fromRGB(100,50,50); flingBtn.BorderSizePixel = 0; flingBtn.Font = Enum.Font.Gotham; flingBtn.TextSize = SMALL_FONT; flingBtn.TextColor3 = Color3.new(1,1,1); flingBtn.Text = "Fling"; flingBtn.Parent = flingBoxRow; flingBtn.ZIndex = 100000
@@ -1992,16 +1993,35 @@ killLoopBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- GUI-only placeholder for the new secure-kill controls.
--- The action button is intentionally not connected to kill logic yet.
--- The toggle below only changes its displayed state; it does not start a loop.
-local secureKillLoopGuiEnabled = false
+-- Secure Kill All: GUI-only control that reuses the script's existing NPC filter,
+-- exclusion rules, and batched kill helper. No teleporting or player-target selection.
+local function secureKillAllNPCs()
+    local list = getNPCsArray()
+    for _, model in ipairs(list) do
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 then
+            pcall(function()
+                hum.BreakJointsOnDeath = true
+            end)
+        end
+    end
+    killAllSimultaneousForList(list)
+end
+
+secureKillBtn.MouseButton1Click:Connect(function()
+    secureKillAllNPCs()
+end)
+
 secureKillLoopBtn.MouseButton1Click:Connect(function()
-    secureKillLoopGuiEnabled = not secureKillLoopGuiEnabled
-    secureKillLoopBtn.Text = "Loop: " .. (secureKillLoopGuiEnabled and "On" or "Off")
-    secureKillLoopBtn.BackgroundColor3 = secureKillLoopGuiEnabled
-        and Color3.fromRGB(55, 90, 55)
-        or Color3.fromRGB(40, 40, 40)
+    loops.secureKillAll = not loops.secureKillAll
+    secureKillLoopBtn.Text = "Loop: " .. (loops.secureKillAll and "On" or "Off")
+    if loops.secureKillAll then
+        startLoop("secureKillAll", function()
+            secureKillAllNPCs()
+        end)
+    else
+        stopLoop("secureKillAll")
+    end
 end)
 
 flingBtn.MouseButton1Click:Connect(function() local p = tonumber(flingBox.Text) or 200 for _,m in ipairs(getNPCsArray()) do pcall(function() flingModel(m,p) end) end end)
