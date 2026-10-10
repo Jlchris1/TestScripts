@@ -1993,12 +1993,14 @@ killLoopBtn.MouseButton1Click:Connect(function()
     end
 end)
 
--- Secure Kill All: process eligible NPCs one at a time, using CFrame to visit
--- each target and always restoring the character to the saved starting CFrame.
+-- Secure Kill All: batch nearby eligible NPCs, teleport once per group,
+-- kill each group together, and restore the original character CFrame.
 -- This remains a LocalScript; server-authoritative NPCs may require server-side
 -- authorization for Humanoid health changes to replicate.
-local SECURE_KILL_STEP_DELAY = 0.12
+local SECURE_KILL_GROUP_RADIUS = 55
+local SECURE_KILL_GROUP_DELAY = 0.12
 local secureKillRunToken = 0
+local secureKillBusy = false
 
 local function getCharacterRoot()
     local character = player.Character
@@ -2025,36 +2027,97 @@ local function isCloserToAnotherPlayer(model, localPosition)
     return false
 end
 
-local function secureKillAllNPCs()
-    local root = getCharacterRoot()
-    if not root then return end
+-- Greedy spatial grouping: each batch contains NPCs within the radius of its
+-- anchor NPC, so the character visits groups rather than every individual NPC.
+local function makeSecureKillGroups(targets)
+    local remaining = {}
+    for _, model in ipairs(targets) do
+        local part = getBestPartForModel(model)
+        if model and model.Parent and part then
+            table.insert(remaining, {model = model, position = part.Position})
+        end
+    end
 
-    local startingCFrame = root.CFrame
+    local groups = {}
+    while #remaining > 0 do
+        local seed = table.remove(remaining, 1)
+        local group = {seed.model}
+        local totalPosition = seed.position
+        local count = 1
+        local i = 1
+        while i <= #remaining do
+            if (remaining[i].position - seed.position).Magnitude <= SECURE_KILL_GROUP_RADIUS then
+                local entry = table.remove(remaining, i)
+                table.insert(group, entry.model)
+                totalPosition += entry.position
+                count += 1
+            else
+                i += 1
+            end
+        end
+        table.insert(groups, {
+            models = group,
+            center = totalPosition / count,
+        })
+    end
+    return groups
+end
+
+local function secureKillAllNPCs(runToken, isLoopRun)
+    if secureKillBusy then return end
+    secureKillBusy = true
+
+    local startingRoot = getCharacterRoot()
+    if not startingRoot then
+        secureKillBusy = false
+        return
+    end
+
+    local startingCFrame = startingRoot.CFrame
     local startingPosition = startingCFrame.Position
     local targets = {}
     for _, model in ipairs(getNPCsArray()) do
         local hum = model:FindFirstChildOfClass("Humanoid")
-        if hum and hum.Health > 0 and isAllowed(model, "Kill") and isCloserToAnotherPlayer(model, startingPosition) then
+        if hum and hum.Health > 0 and isAllowed(model, "Kill")
+            and isCloserToAnotherPlayer(model, startingPosition) then
             table.insert(targets, model)
         end
     end
 
-    for _, model in ipairs(targets) do
-        if not model.Parent then continue end
-        local hum = model:FindFirstChildOfClass("Humanoid")
-        local npcPart = getBestPartForModel(model)
-        if hum and hum.Health > 0 and npcPart then
+    local groups = makeSecureKillGroups(targets)
+    for _, group in ipairs(groups) do
+        if runToken ~= secureKillRunToken or (isLoopRun and not loops.secureKillAll) then
+            break
+        end
+
+        local liveGroup = {}
+        for _, model in ipairs(group.models) do
+            local hum = model and model.Parent and model:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and isAllowed(model, "Kill") then
+                table.insert(liveGroup, model)
+            end
+        end
+
+        if #liveGroup > 0 then
             local currentRoot = getCharacterRoot()
             if not currentRoot then break end
             local ok = pcall(function()
-                currentRoot.CFrame = npcPart.CFrame * CFrame.new(0, 0, 3)
-                hum.BreakJointsOnDeath = true
-                killAllSimultaneousForList({model})
+                currentRoot.CFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startingCFrame - startingCFrame.Position)
+                for _, model in ipairs(liveGroup) do
+                    local hum = model:FindFirstChildOfClass("Humanoid")
+                    if hum then
+                        pcall(function()
+                            if hum.BreakJointsOnDeath ~= nil then hum.BreakJointsOnDeath = true end
+                        end)
+                    end
+                end
+                -- Pass the whole group in one call instead of killing one NPC at a time.
+                killAllSimultaneousForList(liveGroup)
             end)
-            task.wait(SECURE_KILL_STEP_DELAY)
             if not ok then
-                -- Continue to the next valid target; restoration happens below.
+                -- A bad NPC should not stop the remaining groups from being processed.
             end
+            task.wait(SECURE_KILL_GROUP_DELAY)
         end
     end
 
@@ -2062,20 +2125,26 @@ local function secureKillAllNPCs()
     if currentRoot then
         pcall(function() currentRoot.CFrame = startingCFrame end)
     end
+    secureKillBusy = false
 end
 
 secureKillBtn.MouseButton1Click:Connect(function()
-    if loops.secureKillAll then return end -- avoid overlapping a loop batch
-    task.spawn(secureKillAllNPCs)
+    if secureKillBusy or loops.secureKillAll then return end
+    secureKillRunToken += 1
+    local token = secureKillRunToken
+    task.spawn(function()
+        secureKillAllNPCs(token, false)
+    end)
 end)
 
 secureKillLoopBtn.MouseButton1Click:Connect(function()
     loops.secureKillAll = not loops.secureKillAll
     secureKillLoopBtn.Text = "Loop: " .. (loops.secureKillAll and "On" or "Off")
     if loops.secureKillAll then
+        secureKillRunToken += 1
+        local token = secureKillRunToken
         startLoop("secureKillAll", function()
-            secureKillRunToken += 1
-            secureKillAllNPCs()
+            secureKillAllNPCs(token, true)
         end)
     else
         stopLoop("secureKillAll")
