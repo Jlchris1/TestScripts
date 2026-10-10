@@ -1927,7 +1927,7 @@ function Sec.wireSecurityRow(effect, button, loopButton, loopKey)
     if not button or not loopButton then return end
     button.MouseButton1Click:Connect(function()
         task.spawn(function()
-            Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, false, nil, tonumber(flingBox.Text) or 200, loopKey)
+            Sec.runGroupedSecureAction(effect, Sec.getSecurityNPCsArray, false, nil, tonumber(flingBox.Text) or 200, loopKey)
         end)
     end)
     loopButton.MouseButton1Click:Connect(function()
@@ -1935,7 +1935,7 @@ function Sec.wireSecurityRow(effect, button, loopButton, loopKey)
         loopButton.Text = "Loop: " .. (loops[loopKey] and "On" or "Off")
         if loops[loopKey] then
             startLoop(loopKey, function(loopToken)
-                Sec.runActionForProvider(effect, Sec.getSecurityNPCsArray, true, function()
+                Sec.runGroupedSecureAction(effect, Sec.getSecurityNPCsArray, true, function()
                     return loops[loopKey] and Sec.loopTokens[loopKey] == loopToken
                 end, tonumber(flingBox.Text) or 200, loopKey)
             end)
@@ -2216,7 +2216,7 @@ local function ensureTypeFeaturePage(typeName)
             end
             secureBtn.MouseButton1Click:Connect(function()
                 if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
-                task.spawn(function() Sec.runActionForProvider(eff, secureProvider, false, nil, getSecurePower(), "secure_type_" .. typeName) end)
+                task.spawn(function() Sec.runGroupedSecureAction(eff, secureProvider, false, nil, getSecurePower(), "secure_type_" .. typeName) end)
             end)
             local secureKey = "secure_" .. eff .. "_" .. typeName
             secureLoop.MouseButton1Click:Connect(function()
@@ -2225,7 +2225,7 @@ local function ensureTypeFeaturePage(typeName)
                 if loops[secureKey] then
                     startLoop(secureKey, function(loopToken)
                         if selectedType ~= typeName or (excluded[typeName] and excluded[typeName][eff]) then return end
-                        Sec.runActionForProvider(eff, secureProvider, true, function()
+                        Sec.runGroupedSecureAction(eff, secureProvider, true, function()
                             return loops[secureKey] and Sec.loopTokens[secureKey] == loopToken and selectedType == typeName
                         end, getSecurePower(), "secure_type_" .. typeName)
                     end)
@@ -2388,6 +2388,111 @@ local function makeSecureKillGroups(targets)
     return groups
 end
 
+-- Shared CFrame mover used by every Secure action (global and selected-type).
+-- PivotTo moves the whole rig; assigning the root CFrame as a fallback helps
+-- custom character rigs. A short retry handles character/PrimaryPart changes.
+local function securePivotCharacter(character, root, targetCFrame)
+    if not character or not root or not targetCFrame then return false end
+    local ok = pcall(function() character:PivotTo(targetCFrame) end)
+    if not ok then
+        ok = pcall(function() root.CFrame = targetCFrame end)
+    end
+    if not ok then return false end
+    RunService.Heartbeat:Wait()
+    -- Reacquire the root after PivotTo in case the character was respawned/rebuilt.
+    local currentCharacter = player.Character
+    local currentRoot = currentCharacter and (currentCharacter:FindFirstChild("HumanoidRootPart") or currentCharacter.PrimaryPart)
+    if currentCharacter == character and currentRoot then
+        local closeEnough = (currentRoot.Position - targetCFrame.Position).Magnitude <= 8
+        if not closeEnough then
+            pcall(function() currentCharacter:PivotTo(targetCFrame) end)
+            pcall(function() currentRoot.CFrame = targetCFrame end)
+            RunService.Heartbeat:Wait()
+        end
+    end
+    return true
+end
+
+-- Shared grouped executor for every Secure action. It selects eligible NPCs,
+-- groups nearby targets, moves with the same CFrame helper for every Secure
+-- button, applies the action to the batch, and restores the starting CFrame.
+function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, power, scopeKey)
+    local character = player.Character
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if not root then return end
+    local startCFrame = root.CFrame
+    local targets = provider and provider() or {}
+    -- Decide Anchor's click state once for the entire run, not once per group.
+    local anchorShouldSet = true
+    if effect == "Anchor" and not isLoopPass then
+        local scope = getAnchorScope(scopeKey)
+        for model in pairs(scope) do
+            if model and model.Parent and anchored[model] == true then
+                anchorShouldSet = false
+                break
+            end
+        end
+        if not anchorShouldSet then
+            -- Unanchor the full previous scope, including NPCs that no longer
+            -- qualify for the current player-distance filter.
+            for model in pairs(scope) do
+                if model and model.Parent then setModelAnchored(model, false) end
+                scope[model] = nil
+            end
+        end
+    end
+    -- The security provider already sorts by distance from the local player.
+    local groups = makeSecureKillGroups(targets)
+    local ok, err = pcall(function()
+        for _, group in ipairs(groups) do
+            if keepRunning and not keepRunning() then break end
+            local live = {}
+            for _, model in ipairs(group.models) do
+                local allowed = effect == "KillFling" and (isAllowed(model, "Kill") or isAllowed(model, "Fling")) or isAllowed(model, effect)
+                if model and model.Parent and isNPC(model) and allowed then
+                    table.insert(live, model)
+                end
+            end
+            if #live > 0 then
+                local currentCharacter = player.Character
+                local currentRoot = currentCharacter and (currentCharacter:FindFirstChild("HumanoidRootPart") or currentCharacter.PrimaryPart)
+                if not currentRoot then break end
+                local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startCFrame - startCFrame.Position)
+                -- All Secure button types use this exact movement path.
+                if not securePivotCharacter(currentCharacter, currentRoot, targetCFrame) then
+                    warn("Secure action could not move character to group for " .. tostring(effect))
+                    break
+                end
+                if effect == "Kill" then
+                    killAllSimultaneousForList(live)
+                elseif effect == "KillFling" then
+                    Sec.killAndFlingSimultaneousForList(live, power)
+                elseif effect == "Anchor" then
+                    -- Repeated secure groups share one click state. The second
+                    -- manual click unanchors the entire remembered scope.
+                    Sec.setAnchorList(live, isLoopPass or anchorShouldSet, scopeKey)
+                elseif effect == "Erase" or effect == "GetRid" then
+                    local fixedGroup = live
+                    Sec.runOneSecondPulse(effect, function() return fixedGroup end, keepRunning, power)
+                else
+                    for _, model in ipairs(live) do
+                        if keepRunning and not keepRunning() then break end
+                        Sec.applySingleAction(effect, model, power)
+                    end
+                end
+                task.wait(SECURE_KILL_GROUP_DELAY)
+            end
+        end
+    end)
+    local finalCharacter = player.Character
+    local finalRoot = finalCharacter and (finalCharacter:FindFirstChild("HumanoidRootPart") or finalCharacter.PrimaryPart)
+    if finalCharacter and finalRoot then
+        -- Restore through the same robust CFrame path after every Secure action.
+        securePivotCharacter(finalCharacter, finalRoot, startCFrame)
+    end
+    if not ok then warn("Secure grouped action failed (" .. tostring(effect) .. "): " .. tostring(err)) end
+end
+
 local function secureKillAllNPCs(runToken, isLoopRun)
     if secureKillBusy then return end
     secureKillBusy = true
@@ -2424,10 +2529,12 @@ local function secureKillAllNPCs(runToken, isLoopRun)
         end
 
         if #liveGroup > 0 then
+            local currentCharacter = player.Character
             local currentRoot = getCharacterRoot()
-            if not currentRoot then break end
+            if not currentCharacter or not currentRoot then break end
             local ok = pcall(function()
-                currentRoot.CFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startingCFrame - startingCFrame.Position)
+                local targetCFrame = CFrame.new(group.center + Vector3.new(0, 4, 0)) * (startingCFrame - startingCFrame.Position)
+                if not securePivotCharacter(currentCharacter, currentRoot, targetCFrame) then break end
                 for _, model in ipairs(liveGroup) do
                     local hum = model:FindFirstChildOfClass("Humanoid")
                     if hum then
@@ -2446,9 +2553,10 @@ local function secureKillAllNPCs(runToken, isLoopRun)
         end
     end
 
+    local finalCharacter = player.Character
     local currentRoot = getCharacterRoot()
-    if currentRoot then
-        pcall(function() currentRoot.CFrame = startingCFrame end)
+    if finalCharacter and currentRoot then
+        securePivotCharacter(finalCharacter, currentRoot, startingCFrame)
     end
     secureKillBusy = false
 end
