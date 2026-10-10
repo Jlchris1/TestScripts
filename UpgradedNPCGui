@@ -149,7 +149,7 @@ end
 
 -- Security target rule shared by global and selected-NPC controls:
 -- include NPCs only when the local player is strictly closer than every other
--- living player. NPCs are sorted nearest-to-local first before group processing.
+-- living player. Process nearest-to-local targets first, then group nearby NPCs.
 local function isCloserToAnotherPlayer(model, localPosition)
     local npcPart = getBestPartForModel(model)
     if not npcPart or not localPosition then return false end
@@ -262,6 +262,10 @@ end
 
 local anchored = setmetatable({}, { __mode = "k" })
 local anchorScopeModels = {}
+-- Tracks the intended state per button/type scope, not just the last NPCs seen.
+-- This lets loop-anchor include newly spawned NPCs and makes the next manual
+-- click reliably unanchor the entire remembered scope.
+local anchorScopeEnabled = {}
 
 -- Idempotent anchoring: loop-anchor always sets true instead of flipping state.
 local function setModelAnchored(model, shouldAnchor)
@@ -283,29 +287,47 @@ local function getAnchorScope(scopeKey)
 end
 
 function Sec.setAnchorList(models, shouldAnchor, scopeKey)
+    scopeKey = scopeKey or "default"
     local scope = getAnchorScope(scopeKey)
+    anchorScopeEnabled[scopeKey] = shouldAnchor == true
     for _, model in ipairs(models or {}) do
-        if model and model.Parent then
-            setModelAnchored(model, shouldAnchor)
-            if shouldAnchor then scope[model] = true else scope[model] = nil end
+        if model and model.Parent and isAllowed(model, "Anchor") then
+            setModelAnchored(model, shouldAnchor == true)
+            if shouldAnchor then
+                scope[model] = true
+            else
+                scope[model] = nil
+            end
         end
     end
 end
 
 function Sec.toggleAnchorForList(models, scopeKey)
-    -- A second click unanchors the complete previous scope, including NPCs that
-    -- no longer match the security-distance filter. It won't accidentally anchor
-    -- only newly discovered NPCs while leaving old loop-anchored NPCs stuck.
+    scopeKey = scopeKey or "default"
     local scope = getAnchorScope(scopeKey)
-    local shouldUnanchor = false
-    for model, _ in pairs(scope) do
-        if model and model.Parent and anchored[model] == true then
-            shouldUnanchor = true
-            break
+    local isCurrentlyOn = anchorScopeEnabled[scopeKey] == true
+    if anchorScopeEnabled[scopeKey] == nil then
+        for model in pairs(scope) do
+            if model and model.Parent and anchored[model] == true then
+                isCurrentlyOn = true
+                break
+            end
+        end
+        if not isCurrentlyOn then
+            for _, model in ipairs(models or {}) do
+                if model and model.Parent and anchored[model] == true then
+                    isCurrentlyOn = true
+                    break
+                end
+            end
         end
     end
-    if shouldUnanchor then
-        for model, _ in pairs(scope) do
+
+    if isCurrentlyOn then
+        -- Toggle OFF: unanchor every NPC this scope ever anchored, plus the
+        -- currently eligible list, including newly spawned models.
+        anchorScopeEnabled[scopeKey] = false
+        for model in pairs(scope) do
             if model and model.Parent then setModelAnchored(model, false) end
             scope[model] = nil
         end
@@ -313,6 +335,9 @@ function Sec.toggleAnchorForList(models, scopeKey)
             if model and model.Parent then setModelAnchored(model, false) end
         end
     else
+        -- Toggle ON: remember the whole current set. The loop handler will add
+        -- new NPCs to this same scope on each pass while the loop is enabled.
+        anchorScopeEnabled[scopeKey] = true
         for _, model in ipairs(models or {}) do
             if model and model.Parent and isAllowed(model, "Anchor") then
                 setModelAnchored(model, true)
@@ -321,7 +346,6 @@ function Sec.toggleAnchorForList(models, scopeKey)
         end
     end
 end
-
 
 local function platformStand(model)
     if not isAllowed(model, "PlatformStand") then return end
@@ -771,12 +795,12 @@ smallEquipToggle.MouseButton1Click:Connect(function()
     if sg and sg:IsA("ScreenGui") then
         sg.Enabled = not sg.Enabled
         if sg.Enabled then
-            smallEquipToggle.Text = "×"
+            smallEquipToggle.Text = "Ã—"
         else
             smallEquipToggle.Text = "+"
         end
     else
-        smallEquipToggle.Text = "×"
+        smallEquipToggle.Text = "Ã—"
     end
 end)
 
@@ -1833,10 +1857,12 @@ function Sec.runOneSecondPulse(effect, provider, keepRunning, power)
         local current = provider and provider() or {}
         for _, model in ipairs(current) do
             if os.clock() >= deadline or (keepRunning and not keepRunning()) then break end
-            if effect == "GetRid" then
-                Sec.getRidModel(model)
-            elseif effect == "Erase" then
-                if model and model.Parent and isAllowed(model, "Erase") then eraseModel(model) end
+            if model and model.Parent then
+                if effect == "GetRid" then
+                    Sec.getRidModel(model)
+                elseif effect == "Erase" and isAllowed(model, "Erase") then
+                    eraseModel(model)
+                end
             end
         end
         local remaining = deadline - os.clock()
@@ -2447,24 +2473,41 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
     local startRootCFrame = root.CFrame
     local startPivot = character:GetPivot()
     local targets = provider and provider() or {}
+    local localPosition = Sec.getLocalPlayerPosition()
+    if localPosition then
+        table.sort(targets, function(a, b)
+            local pa, pb = getBestPartForModel(a), getBestPartForModel(b)
+            if not pa then return false end
+            if not pb then return true end
+            return (pa.Position - localPosition).Magnitude < (pb.Position - localPosition).Magnitude
+        end)
+    end
     -- Decide Anchor's click state once for the entire run, not once per group.
     local anchorShouldSet = true
     if effect == "Anchor" and not isLoopPass then
         local scope = getAnchorScope(scopeKey)
-        for model in pairs(scope) do
-            if model and model.Parent and anchored[model] == true then
-                anchorShouldSet = false
-                break
+        local currentlyOn = anchorScopeEnabled[scopeKey] == true
+        if anchorScopeEnabled[scopeKey] == nil then
+            for model in pairs(scope) do
+                if model and model.Parent and anchored[model] == true then
+                    currentlyOn = true
+                    break
+                end
             end
         end
-        if not anchorShouldSet then
-            -- Unanchor the full previous scope, including NPCs that no longer
-            -- qualify for the current player-distance filter.
+        anchorShouldSet = not currentlyOn
+        if currentlyOn then
+            -- Toggle OFF the entire previous scope before visiting current groups.
+            anchorScopeEnabled[scopeKey] = false
             for model in pairs(scope) do
                 if model and model.Parent then setModelAnchored(model, false) end
                 scope[model] = nil
             end
+        else
+            anchorScopeEnabled[scopeKey] = true
         end
+    elseif effect == "Anchor" and isLoopPass then
+        anchorScopeEnabled[scopeKey] = true
     end
     -- The security provider already sorts by distance from the local player.
     local groups = makeSecureKillGroups(targets)
@@ -2491,8 +2534,8 @@ function Sec.runGroupedSecureAction(effect, provider, isLoopPass, keepRunning, p
                 elseif effect == "KillFling" then
                     Sec.killAndFlingSimultaneousForList(live, power)
                 elseif effect == "Anchor" then
-                    -- Repeated secure groups share one click state. The second
-                    -- manual click unanchors the entire remembered scope.
+                    -- One click-state per scope; loop passes always anchor newly
+                    -- eligible NPCs, while manual toggle-off clears the old scope.
                     Sec.setAnchorList(live, isLoopPass or anchorShouldSet, scopeKey)
                 elseif effect == "Erase" or effect == "GetRid" then
                     local fixedGroup = live
